@@ -55,7 +55,7 @@ function tgz_mover {
 
 function deploy {
   MAVEN_OPTS="${mvnopts}" ${mvn} -f pom.xml.$1 clean install -DskipTests -Prelease
-  MAVEN_OPTS="${mvnopts}" ${mvn} -f pom.xml.$1 install -DskipTests site assembly:single -Prelease 
+  MAVEN_OPTS="${mvnopts}" ${mvn} -f pom.xml.$1 install -DskipTests post-site assembly:single -Prelease 
   tgz_mover
   MAVEN_OPTS="${mvnopts}" ${mvn} -f pom.xml.$1 deploy -DskipTests -Papache-release 
 }
@@ -72,6 +72,8 @@ echo "DONE"
 echo "Check the content of ${archivedir}.  If good, sign and push to people.apache.org"
 echo " cd ${archivedir}"
 echo ' for i in *.tar.gz; do echo $i; gpg --print-mds $i > $i.mds ; done'
+echo ' for i in *.tar.gz; do echo $i; gpg --print-md MD5 $i > $i.md5 ; done'
+echo ' for i in *.tar.gz; do echo $i; gpg --print-md SHA512 $i > $i.sha ; done'
 echo ' for i in *.tar.gz; do echo $i; gpg --armor --output $i.asc --detach-sig $i  ; done'
 echo ' rsync -av ${archivedir} people.apache.org:public_html/hbase-VERSION'
 echo "Check the content deployed to maven.  If good, close the repo and record links of temporary staging repo"

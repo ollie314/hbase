@@ -27,9 +27,9 @@ import java.util.Arrays;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.io.crypto.aes.AES;
 
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
@@ -140,11 +140,13 @@ public class TestCipherProvider {
     Configuration conf = HBaseConfiguration.create();
     CipherProvider provider = Encryption.getCipherProvider(conf);
     assertTrue(provider instanceof DefaultCipherProvider);
-    assertTrue(Arrays.asList(provider.getSupportedCiphers()).contains("AES"));
-    Cipher a = Encryption.getCipher(conf, "AES");
+    String algorithm =
+        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.CIPHER_AES);
+    assertTrue(Arrays.asList(provider.getSupportedCiphers()).contains(algorithm));
+    Cipher a = Encryption.getCipher(conf, algorithm);
     assertNotNull(a);
     assertTrue(a.getProvider() instanceof DefaultCipherProvider);
-    assertEquals(a.getName(), "AES");
+    assertEquals(a.getName(), algorithm);
     assertEquals(a.getKeyLength(), AES.KEY_LENGTH);
   }
 

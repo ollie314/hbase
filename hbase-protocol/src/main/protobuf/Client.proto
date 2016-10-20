@@ -254,6 +254,8 @@ message ScanRequest {
   optional uint32 number_of_rows = 4;
   optional bool close_scanner = 5;
   optional uint64 next_call_seq = 6;
+  // index 10 to match later versions
+  optional bool renew = 10 [default = false];
 }
 
 /**
@@ -276,6 +278,11 @@ message ScanResponse {
   // This field is mutually exclusive with cells_per_result (since the Cells will
   // be inside the pb'd Result)
   repeated Result results = 5;
+
+  // A server may choose to limit the number of results returned to the client for
+  // reasons such as the size in bytes or quantity of results accumulated. This field
+  // will true when more results exist in the current region.
+  optional bool more_results_in_region = 8;
 }
 
 /**
@@ -338,6 +345,24 @@ message RegionAction {
   repeated Action action = 3;
 }
 
+/*
+* Statistics about the current load on the region
+*/
+message RegionLoadStats {
+  // Percent load on the memstore. Guaranteed to be positive, between 0 and 100.
+  optional int32 memstoreLoad = 1 [default = 0];
+  // Percent JVM heap occupancy. Guaranteed to be positive, between 0 and 100.
+  // We can move this to "ServerLoadStats" should we develop them.
+  optional int32 heapOccupancy = 2 [default = 0];
+  // Compaction pressure. Guaranteed to be positive, between 0 and 100.
+  optional int32 compactionPressure = 3 [default = 0];
+}
+
+message MultiRegionLoadStats{
+  repeated RegionSpecifier region = 1;
+  repeated RegionLoadStats stat = 2;
+}
+
 /**
  * Either a Result or an Exception NameBytesPair (keyed by
  * exception name whose value is the exception stringified)
@@ -351,6 +376,8 @@ message ResultOrException {
   optional NameBytesPair exception = 3;
   // result if this was a coprocessor service call
   optional CoprocessorServiceResult service_result = 4;
+  // current load on the region
+  optional RegionLoadStats loadStats = 5 [deprecated=true];
 }
 
 /**
@@ -379,6 +406,7 @@ message MultiResponse {
   repeated RegionActionResult regionActionResult = 1;
   // used for mutate to indicate processed only
   optional bool processed = 2;
+  optional MultiRegionLoadStats regionStatistics = 3;
 }
 
 

@@ -22,15 +22,15 @@ import java.util.Collection;
 import java.util.List;
 import java.util.NavigableSet;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
-import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Cell;
-import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.HeapSize;
 import org.apache.hadoop.hbase.io.compress.Compression;
@@ -40,6 +40,8 @@ import org.apache.hadoop.hbase.protobuf.generated.WALProtos.CompactionDescriptor
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionProgress;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;
+import org.apache.hadoop.hbase.security.User;
 
 /**
  * Interface for objects that hold a column family in a Region. Its a memstore and a set of zero or
@@ -154,7 +156,8 @@ public interface Store extends HeapSize, StoreConfigInformation {
 
   FileSystem getFileSystem();
 
-  /*
+
+  /**
    * @param maxKeyCount
    * @param compression Compression algorithm to use
    * @param isCompaction whether we are creating a new file in a compaction
@@ -162,11 +165,47 @@ public interface Store extends HeapSize, StoreConfigInformation {
    * @return Writer for a new StoreFile in the tmp dir.
    */
   StoreFile.Writer createWriterInTmp(
+      long maxKeyCount,
+      Compression.Algorithm compression,
+      boolean isCompaction,
+      boolean includeMVCCReadpoint,
+      boolean includesTags
+  ) throws IOException;
+
+  /**
+   * @param maxKeyCount
+   * @param compression Compression algorithm to use
+   * @param isCompaction whether we are creating a new file in a compaction
+   * @param includeMVCCReadpoint whether we should out the MVCC readpoint
+   * @param shouldDropBehind should the writer drop caches behind writes
+   * @return Writer for a new StoreFile in the tmp dir.
+   */
+  StoreFile.Writer createWriterInTmp(
     long maxKeyCount,
     Compression.Algorithm compression,
     boolean isCompaction,
     boolean includeMVCCReadpoint,
-    boolean includesTags
+    boolean includesTags,
+    boolean shouldDropBehind
+  ) throws IOException;
+
+  /**
+   * @param maxKeyCount
+   * @param compression Compression algorithm to use
+   * @param isCompaction whether we are creating a new file in a compaction
+   * @param includeMVCCReadpoint whether we should out the MVCC readpoint
+   * @param shouldDropBehind should the writer drop caches behind writes
+   * @param trt Ready-made timetracker to use.
+   * @return Writer for a new StoreFile in the tmp dir.
+   */
+  StoreFile.Writer createWriterInTmp(
+    long maxKeyCount,
+    Compression.Algorithm compression,
+    boolean isCompaction,
+    boolean includeMVCCReadpoint,
+    boolean includesTags,
+    boolean shouldDropBehind,
+    final TimeRangeTracker trt
   ) throws IOException;
 
   // Compaction oriented methods
@@ -181,12 +220,27 @@ public interface Store extends HeapSize, StoreConfigInformation {
 
   CompactionContext requestCompaction() throws IOException;
 
+  /**
+   * @deprecated see requestCompaction(int, CompactionRequest, User)
+   */
+  @Deprecated
   CompactionContext requestCompaction(int priority, CompactionRequest baseRequest)
+      throws IOException;
+
+  CompactionContext requestCompaction(int priority, CompactionRequest baseRequest, User user)
       throws IOException;
 
   void cancelRequestedCompaction(CompactionContext compaction);
 
-  List<StoreFile> compact(CompactionContext compaction) throws IOException;
+  /**
+   * @deprecated see compact(CompactionContext, CompactionThroughputController, User)
+   */
+  @Deprecated
+  List<StoreFile> compact(CompactionContext compaction,
+      CompactionThroughputController throughputController) throws IOException;
+
+  List<StoreFile> compact(CompactionContext compaction,
+    CompactionThroughputController throughputController, User user) throws IOException;
 
   /**
    * @return true if we should run a major compaction.
@@ -264,6 +318,11 @@ public interface Store extends HeapSize, StoreConfigInformation {
   HColumnDescriptor getFamily();
 
   /**
+   * @return The maximum sequence id in all store files.
+   */
+  long getMaxSequenceId();
+
+  /**
    * @return The maximum memstoreTS in all store files.
    */
   long getMaxMemstoreTS();
@@ -283,6 +342,31 @@ public interface Store extends HeapSize, StoreConfigInformation {
    * @return Count of store files
    */
   int getStorefilesCount();
+
+  /**
+   * @return Max age of store files in this store
+   */
+  long getMaxStoreFileAge();
+
+  /**
+   * @return Min age of store files in this store
+   */
+  long getMinStoreFileAge();
+
+  /**
+   *  @return Average age of store files in this store, 0 if no store files
+   */
+  long getAvgStoreFileAge();
+
+  /**
+   *  @return Number of reference files in this store
+   */
+  long getNumReferenceFiles();
+
+  /**
+   *  @return Number of HFiles in this store
+   */
+  long getNumHFiles();
 
   /**
    * @return The size of the store files, in bytes, uncompressed.
@@ -386,4 +470,21 @@ public interface Store extends HeapSize, StoreConfigInformation {
    * @return Whether this store has too many store files.
    */
   boolean hasTooManyStoreFiles();
+
+  /**
+   * This value can represent the degree of emergency of compaction for this store. It should be
+   * greater than or equal to 0.0, any value greater than 1.0 means we have too many store files.
+   * <ul>
+   * <li>if getStorefilesCount &lt;= getMinFilesToCompact, return 0.0</li>
+   * <li>return (getStorefilesCount - getMinFilesToCompact) / (blockingFileCount -
+   * getMinFilesToCompact)</li>
+   * </ul>
+   * <p>
+   * And for striped stores, we should calculate this value by the files in each stripe separately
+   * and return the maximum value.
+   * <p>
+   * It is similar to {@link #getCompactPriority()} except that it is more suitable to use in a
+   * linear formula.
+   */
+  double getCompactionPressure();
 }

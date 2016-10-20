@@ -21,9 +21,9 @@ package org.apache.hadoop.hbase.ipc;
 
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.metrics.BaseSourceImpl;
+import org.apache.hadoop.hbase.metrics.Interns;
 import org.apache.hadoop.metrics2.MetricsCollector;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
-import org.apache.hadoop.metrics2.lib.Interns;
 import org.apache.hadoop.metrics2.lib.MutableCounterLong;
 import org.apache.hadoop.metrics2.lib.MutableHistogram;
 
@@ -36,10 +36,23 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
   private final MutableCounterLong authorizationFailures;
   private final MutableCounterLong authenticationSuccesses;
   private final MutableCounterLong authenticationFailures;
+  private final MutableCounterLong authenticationFallbacks;
   private final MutableCounterLong sentBytes;
   private final MutableCounterLong receivedBytes;
+
+  private final MutableCounterLong exceptions;
+  private final MutableCounterLong exceptionsOOO;
+  private final MutableCounterLong exceptionsBusy;
+  private final MutableCounterLong exceptionsUnknown;
+  private final MutableCounterLong exceptionsSanity;
+  private final MutableCounterLong exceptionsNSRE;
+  private final MutableCounterLong exceptionsMoved;
+
   private MutableHistogram queueCallTime;
   private MutableHistogram processCallTime;
+  private MutableHistogram totalCallTime;
+  private MutableHistogram requestSize;
+  private MutableHistogram responseSize;
 
   public MetricsHBaseServerSourceImpl(String metricsName,
                                       String metricsDescription,
@@ -50,22 +63,44 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
     this.wrapper = wrapper;
 
     this.authorizationSuccesses = this.getMetricsRegistry().newCounter(AUTHORIZATION_SUCCESSES_NAME,
-        AUTHORIZATION_SUCCESSES_DESC, 0l);
+        AUTHORIZATION_SUCCESSES_DESC, 0L);
     this.authorizationFailures = this.getMetricsRegistry().newCounter(AUTHORIZATION_FAILURES_NAME,
-        AUTHORIZATION_FAILURES_DESC, 0l);
+        AUTHORIZATION_FAILURES_DESC, 0L);
+
+    this.exceptions = this.getMetricsRegistry().newCounter(EXCEPTIONS_NAME, EXCEPTIONS_DESC, 0L);
+    this.exceptionsOOO = this.getMetricsRegistry()
+        .newCounter(EXCEPTIONS_OOO_NAME, EXCEPTIONS_TYPE_DESC, 0L);
+    this.exceptionsBusy = this.getMetricsRegistry()
+        .newCounter(EXCEPTIONS_BUSY_NAME, EXCEPTIONS_TYPE_DESC, 0L);
+    this.exceptionsUnknown = this.getMetricsRegistry()
+        .newCounter(EXCEPTIONS_UNKNOWN_NAME, EXCEPTIONS_TYPE_DESC, 0L);
+    this.exceptionsSanity = this.getMetricsRegistry()
+        .newCounter(EXCEPTIONS_SANITY_NAME, EXCEPTIONS_TYPE_DESC, 0L);
+    this.exceptionsMoved = this.getMetricsRegistry()
+        .newCounter(EXCEPTIONS_MOVED_NAME, EXCEPTIONS_TYPE_DESC, 0L);
+    this.exceptionsNSRE = this.getMetricsRegistry()
+        .newCounter(EXCEPTIONS_NSRE_NAME, EXCEPTIONS_TYPE_DESC, 0L);
 
     this.authenticationSuccesses = this.getMetricsRegistry().newCounter(
-        AUTHENTICATION_SUCCESSES_NAME, AUTHENTICATION_SUCCESSES_DESC, 0l);
+        AUTHENTICATION_SUCCESSES_NAME, AUTHENTICATION_SUCCESSES_DESC, 0L);
     this.authenticationFailures = this.getMetricsRegistry().newCounter(AUTHENTICATION_FAILURES_NAME,
-        AUTHENTICATION_FAILURES_DESC, 0l);
+        AUTHENTICATION_FAILURES_DESC, 0L);
+    this.authenticationFallbacks = this.getMetricsRegistry().newCounter(
+        AUTHENTICATION_FALLBACKS_NAME, AUTHENTICATION_FALLBACKS_DESC, 0L);
     this.sentBytes = this.getMetricsRegistry().newCounter(SENT_BYTES_NAME,
-        SENT_BYTES_DESC, 0l);
+        SENT_BYTES_DESC, 0L);
     this.receivedBytes = this.getMetricsRegistry().newCounter(RECEIVED_BYTES_NAME,
-        RECEIVED_BYTES_DESC, 0l);
-    this.queueCallTime = this.getMetricsRegistry().newHistogram(QUEUE_CALL_TIME_NAME,
+        RECEIVED_BYTES_DESC, 0L);
+    this.queueCallTime = this.getMetricsRegistry().newTimeHistogram(QUEUE_CALL_TIME_NAME,
         QUEUE_CALL_TIME_DESC);
-    this.processCallTime = this.getMetricsRegistry().newHistogram(PROCESS_CALL_TIME_NAME,
+    this.processCallTime = this.getMetricsRegistry().newTimeHistogram(PROCESS_CALL_TIME_NAME,
         PROCESS_CALL_TIME_DESC);
+    this.totalCallTime = this.getMetricsRegistry().newTimeHistogram(TOTAL_CALL_TIME_NAME,
+        TOTAL_CALL_TIME_DESC);
+    this.requestSize = this.getMetricsRegistry().newSizeHistogram(REQUEST_SIZE_NAME,
+        REQUEST_SIZE_DESC);
+    this.responseSize = this.getMetricsRegistry().newSizeHistogram(RESPONSE_SIZE_NAME,
+        RESPONSE_SIZE_DESC);
   }
 
   @Override
@@ -84,6 +119,46 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
   }
 
   @Override
+  public void authenticationFallback() {
+    authenticationFallbacks.incr();
+  }
+
+  @Override
+  public void exception() {
+    exceptions.incr();
+  }
+
+  @Override
+  public void outOfOrderException() {
+    exceptionsOOO.incr();
+  }
+
+  @Override
+  public void failedSanityException() {
+    exceptionsSanity.incr();
+  }
+
+  @Override
+  public void movedRegionException() {
+    exceptionsMoved.incr();
+  }
+
+  @Override
+  public void notServingRegionException() {
+    exceptionsNSRE.incr();
+  }
+
+  @Override
+  public void unknownScannerException() {
+    exceptionsUnknown.incr();
+  }
+
+  @Override
+  public void tooBusyException() {
+    exceptionsBusy.incr();
+  }
+
+  @Override
   public void authenticationSuccess() {
     authenticationSuccesses.incr();
   }
@@ -99,6 +174,16 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
   }
 
   @Override
+  public void sentResponse(long count) {
+    this.responseSize.add(count);
+  }
+
+  @Override
+  public void receivedRequest(long count) {
+    this.requestSize.add(count);
+  }
+
+  @Override
   public void dequeuedCall(int qTime) {
     queueCallTime.add(qTime);
   }
@@ -109,9 +194,13 @@ public class MetricsHBaseServerSourceImpl extends BaseSourceImpl
   }
 
   @Override
+  public void queuedAndProcessedCall(int totalTime) {
+    totalCallTime.add(totalTime);
+  }
+
+  @Override
   public void getMetrics(MetricsCollector metricsCollector, boolean all) {
-    MetricsRecordBuilder mrb = metricsCollector.addRecord(metricsName)
-        .setContext(metricsContext);
+    MetricsRecordBuilder mrb = metricsCollector.addRecord(metricsName);
 
     if (wrapper != null) {
       mrb.addGauge(Interns.info(QUEUE_SIZE_NAME, QUEUE_SIZE_DESC), wrapper.getTotalQueueSize())

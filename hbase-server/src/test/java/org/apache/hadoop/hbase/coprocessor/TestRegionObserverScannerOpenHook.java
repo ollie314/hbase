@@ -39,7 +39,6 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MediumTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
@@ -60,7 +59,10 @@ import org.apache.hadoop.hbase.regionserver.ScanType;
 import org.apache.hadoop.hbase.regionserver.Store;
 import org.apache.hadoop.hbase.regionserver.StoreScanner;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
+import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
@@ -225,12 +227,22 @@ public class TestRegionObserverScannerOpenHook {
       if (compactionStateChangeLatch == null) compactionStateChangeLatch = new CountDownLatch(1);
       return compactionStateChangeLatch;
     }
+
     @Override
-    public boolean compact(CompactionContext compaction, Store store) throws IOException {
-      boolean ret = super.compact(compaction, store);
+    public boolean compact(CompactionContext compaction, Store store,
+        CompactionThroughputController throughputController) throws IOException {
+      boolean ret = super.compact(compaction, store, throughputController);
       if (ret) compactionStateChangeLatch.countDown();
       return ret;
-    }    
+    }
+
+    @Override
+    public boolean compact(CompactionContext compaction, Store store,
+        CompactionThroughputController throughputController, User user) throws IOException {
+      boolean ret = super.compact(compaction, store, throughputController, user);
+      if (ret) compactionStateChangeLatch.countDown();
+      return ret;
+    }
   }
   
   /**

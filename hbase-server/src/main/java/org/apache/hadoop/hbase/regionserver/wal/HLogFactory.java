@@ -37,6 +37,7 @@ import org.apache.hadoop.hbase.regionserver.wal.HLog.Reader;
 import org.apache.hadoop.hbase.regionserver.wal.HLog.Writer;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.LeaseNotRecoveredException;
 
 @InterfaceAudience.Private
 public class HLogFactory {
@@ -46,12 +47,12 @@ public class HLogFactory {
         final Configuration conf) throws IOException {
       return new FSHLog(fs, root, logName, conf);
     }
-    
+
     public static HLog createHLog(final FileSystem fs, final Path root, final String logName,
         final String oldLogName, final Configuration conf) throws IOException {
       return new FSHLog(fs, root, logName, oldLogName, conf);
 }
-    
+
     public static HLog createHLog(final FileSystem fs, final Path root, final String logName,
         final Configuration conf, final List<WALActionsListener> listeners,
         final String prefix) throws IOException {
@@ -61,7 +62,7 @@ public class HLogFactory {
     public static HLog createMetaHLog(final FileSystem fs, final Path root, final String logName,
         final Configuration conf, final List<WALActionsListener> listeners,
         final String prefix) throws IOException {
-      return new FSHLog(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME, 
+      return new FSHLog(fs, root, logName, HConstants.HREGION_OLDLOGDIR_NAME,
             conf, listeners, false, prefix, true);
     }
 
@@ -107,6 +108,7 @@ public class HLogFactory {
         long startWaiting = EnvironmentEdgeManager.currentTimeMillis();
         long openTimeout = conf.getInt("hbase.hlog.open.timeout", 300000) + startWaiting;
         int nbAttempt = 0;
+        FSDataInputStream stream = null;
         while (true) {
           try {
             if (lrClass != ProtobufLogReader.class) {
@@ -115,7 +117,7 @@ public class HLogFactory {
               reader.init(fs, path, conf, null);
               return reader;
             } else {
-              FSDataInputStream stream = fs.open(path);
+              stream = fs.open(path);
               // Note that zero-length file will fail to read PB magic, and attempt to create
               // a non-PB reader and fail the same way existing code expects it to. If we get
               // rid of the old reader entirely, we need to handle 0-size files differently from
@@ -129,6 +131,14 @@ public class HLogFactory {
               return reader;
             }
           } catch (IOException e) {
+            try {
+              if (stream != null) {
+                stream.close();
+              }
+            } catch (IOException exception) {
+              LOG.warn("Could not close FSDataInputStream" + exception.getMessage());
+              LOG.debug("exception details", exception);
+            }
             String msg = e.getMessage();
             if (msg != null && (msg.contains("Cannot obtain block length")
                 || msg.contains("Could not obtain the last block")
@@ -153,8 +163,10 @@ public class HLogFactory {
                   throw iioe;
                 }
               }
+              throw new LeaseNotRecoveredException(e);
+            } else {
+              throw e;
             }
-            throw e;
           }
         }
       } catch (IOException ie) {

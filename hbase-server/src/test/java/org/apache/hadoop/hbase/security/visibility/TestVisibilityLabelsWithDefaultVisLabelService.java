@@ -18,8 +18,10 @@
 package org.apache.hadoop.hbase.security.visibility;
 
 import static org.apache.hadoop.hbase.security.visibility.VisibilityConstants.LABELS_TABLE_NAME;
+import static org.apache.hadoop.hbase.security.visibility.VisibilityUtils.SYSTEM_LABEL;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
@@ -30,15 +32,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.RegionActionResult;
-import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ResultOrException;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameBytesPair;
+import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.ListLabelsResponse;
 import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.VisibilityLabelsResponse;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -48,6 +51,8 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
+
+import com.google.protobuf.ByteString;
 
 @Category(MediumTests.class)
 public class TestVisibilityLabelsWithDefaultVisLabelService extends TestVisibilityLabels {
@@ -162,5 +167,82 @@ public class TestVisibilityLabelsWithDefaultVisLabelService extends TestVisibili
     }
     // One label is the "system" label.
     Assert.assertEquals("The count should be 13", 13, i);
+  }
+
+  @Test
+  public void testListLabels() throws Throwable {
+    PrivilegedExceptionAction<ListLabelsResponse> action =
+        new PrivilegedExceptionAction<ListLabelsResponse>() {
+      public ListLabelsResponse run() throws Exception {
+        ListLabelsResponse response = null;
+        try {
+          response = VisibilityClient.listLabels(conf, null);
+        } catch (Throwable e) {
+          fail("Should not have thrown exception");
+        }
+        // The addLabels() in setup added:
+        // { SECRET, TOPSECRET, CONFIDENTIAL, PUBLIC, PRIVATE, COPYRIGHT, ACCENT,
+        //  UNICODE_VIS_TAG, UC1, UC2 };
+        // The previous tests added 2 more labels: ABC, XYZ
+        // The 'system' label is excluded.
+        List<ByteString> labels = response.getLabelList();
+        assertEquals(12, labels.size());
+        assertTrue(labels.contains(ByteString.copyFrom(SECRET.getBytes())));
+        assertTrue(labels.contains(ByteString.copyFrom(TOPSECRET.getBytes())));
+        assertTrue(labels.contains(ByteString.copyFrom(CONFIDENTIAL.getBytes())));
+        assertTrue(labels.contains(ByteString.copyFrom("ABC".getBytes())));
+        assertTrue(labels.contains(ByteString.copyFrom("XYZ".getBytes())));
+        assertFalse(labels.contains(ByteString.copyFrom(SYSTEM_LABEL.getBytes())));
+        return null;
+      }
+    };
+    SUPERUSER.runAs(action);
+  }
+
+  @Test
+  public void testListLabelsWithRegEx() throws Throwable {
+    PrivilegedExceptionAction<ListLabelsResponse> action =
+        new PrivilegedExceptionAction<ListLabelsResponse>() {
+      public ListLabelsResponse run() throws Exception {
+        ListLabelsResponse response = null;
+        try {
+          response = VisibilityClient.listLabels(conf, ".*secret");
+        } catch (Throwable e) {
+          fail("Should not have thrown exception");
+        }
+        // Only return the labels that end with 'secret'
+        List<ByteString> labels = response.getLabelList();
+        assertEquals(2, labels.size());
+        assertTrue(labels.contains(ByteString.copyFrom(SECRET.getBytes())));
+        assertTrue(labels.contains(ByteString.copyFrom(TOPSECRET.getBytes())));
+        return null;
+      }
+    };
+    SUPERUSER.runAs(action);
+  }
+
+  @Test(timeout = 60 * 1000)
+  public void testVisibilityLabelsOnWALReplay() throws Exception {
+    final TableName tableName = TableName.valueOf(TEST_NAME.getMethodName());
+    HTable table = null;
+    try {
+      table = createTableAndWriteDataWithLabels(tableName,
+        "(" + SECRET + "|" + CONFIDENTIAL + ")", PRIVATE);
+      List<RegionServerThread> regionServerThreads = TEST_UTIL.getHBaseCluster()
+          .getRegionServerThreads();
+      for (RegionServerThread rsThread : regionServerThreads) {
+        rsThread.getRegionServer().abort("Aborting ");
+      }
+      // Start one new RS
+      RegionServerThread rs = TEST_UTIL.getHBaseCluster().startRegionServer();
+      waitForLabelsRegionAvailability(rs.getRegionServer());
+      Scan s = new Scan();
+      s.setAuthorizations(new Authorizations(SECRET));
+      ResultScanner scanner = table.getScanner(s);
+      Result[] next = scanner.next(3);
+      assertTrue(next.length == 1);
+    } finally {
+      table.close();
+    }
   }
 }

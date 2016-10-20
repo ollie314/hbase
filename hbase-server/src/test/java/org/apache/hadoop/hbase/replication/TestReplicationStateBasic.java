@@ -27,7 +27,8 @@ import java.util.SortedSet;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.ServerName;
-import org.apache.hadoop.hbase.zookeeper.ZKUtil;
+import org.apache.hadoop.hbase.zookeeper.ZKConfig;
+import org.apache.zookeeper.KeeperException;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -66,7 +67,7 @@ public abstract class TestReplicationStateBasic {
   }
 
   @Test
-  public void testReplicationQueuesClient() throws ReplicationException {
+  public void testReplicationQueuesClient() throws ReplicationException, KeeperException {
     rqc.init();
     // Test methods with empty state
     assertEquals(0, rqc.getListOfReplicators().size());
@@ -159,6 +160,38 @@ public abstract class TestReplicationStateBasic {
   }
 
   @Test
+  public void testInvalidClusterKeys() throws ReplicationException, KeeperException {
+    rp.init();
+
+    try {
+      rp.addPeer(ID_ONE,
+        new ReplicationPeerConfig().setClusterKey("hostname1.example.org:1234:hbase"), null);
+      fail("Should throw an IllegalArgumentException because "
+            + "zookeeper.znode.parent is missing leading '/'.");
+    } catch (IllegalArgumentException e) {
+      // Expected.
+    }
+
+    try {
+      rp.addPeer(ID_ONE,
+        new ReplicationPeerConfig().setClusterKey("hostname1.example.org:1234:/"), null);
+      fail("Should throw an IllegalArgumentException because zookeeper.znode.parent is missing.");
+    } catch (IllegalArgumentException e) {
+      // Expected.
+    }
+
+    try {
+      rp.addPeer(ID_ONE,
+        new ReplicationPeerConfig().setClusterKey("hostname1.example.org::/hbase"), null);
+      fail("Should throw an IllegalArgumentException because "
+          + "hbase.zookeeper.property.clientPort is missing.");
+    } catch (IllegalArgumentException e) {
+      // Expected.
+    }
+  }
+
+
+  @Test
   public void testReplicationPeers() throws Exception {
     rp.init();
 
@@ -179,50 +212,48 @@ public abstract class TestReplicationStateBasic {
     } catch (IllegalArgumentException e) {
     }
     try {
-      rp.getStatusOfConnectedPeer("bogus");
+      rp.getStatusOfPeer("bogus");
       fail("Should have thrown an IllegalArgumentException when passed a bogus peerId");
     } catch (IllegalArgumentException e) {
     }
-    assertFalse(rp.connectToPeer("bogus"));
-    rp.disconnectFromPeer("bogus");
-    assertEquals(0, rp.getRegionServersOfConnectedPeer("bogus").size());
-    assertNull(rp.getPeerUUID("bogus"));
+    assertFalse(rp.peerAdded("bogus"));
+    rp.peerRemoved("bogus");
+
     assertNull(rp.getPeerConf("bogus"));
-    assertNumberOfPeers(0, 0);
+    assertNumberOfPeers(0);
 
     // Add some peers
-    rp.addPeer(ID_ONE, KEY_ONE);
-    assertNumberOfPeers(0, 1);
-    rp.addPeer(ID_TWO, KEY_TWO);
-    assertNumberOfPeers(0, 2);
+    rp.addPeer(ID_ONE, new ReplicationPeerConfig().setClusterKey(KEY_ONE), null);
+    assertNumberOfPeers(1);
+    rp.addPeer(ID_TWO, new ReplicationPeerConfig().setClusterKey(KEY_TWO), null);
+    assertNumberOfPeers(2);
 
     // Test methods with a peer that is added but not connected
     try {
-      rp.getStatusOfConnectedPeer(ID_ONE);
+      rp.getStatusOfPeer(ID_ONE);
       fail("There are no connected peers, should have thrown an IllegalArgumentException");
     } catch (IllegalArgumentException e) {
     }
-    assertNull(rp.getPeerUUID(ID_ONE));
-    assertEquals(KEY_ONE, ZKUtil.getZooKeeperClusterKey(rp.getPeerConf(ID_ONE)));
-    rp.disconnectFromPeer(ID_ONE);
-    assertEquals(0, rp.getRegionServersOfConnectedPeer(ID_ONE).size());
+    assertEquals(KEY_ONE, ZKConfig.getZooKeeperClusterKey(rp.getPeerConf(ID_ONE).getSecond()));
+    rp.removePeer(ID_ONE);
+    rp.peerRemoved(ID_ONE);
+    assertNumberOfPeers(1);
 
-    // Connect to one peer
-    rp.connectToPeer(ID_ONE);
-    assertNumberOfPeers(1, 2);
-    assertTrue(rp.getStatusOfConnectedPeer(ID_ONE));
+    // Add one peer
+    rp.addPeer(ID_ONE, new ReplicationPeerConfig().setClusterKey(KEY_ONE), null);
+    rp.peerAdded(ID_ONE);
+    assertNumberOfPeers(2);
+    assertTrue(rp.getStatusOfPeer(ID_ONE));
     rp.disablePeer(ID_ONE);
     assertConnectedPeerStatus(false, ID_ONE);
     rp.enablePeer(ID_ONE);
     assertConnectedPeerStatus(true, ID_ONE);
-    assertEquals(1, rp.getRegionServersOfConnectedPeer(ID_ONE).size());
-    assertNotNull(rp.getPeerUUID(ID_ONE).toString());
 
     // Disconnect peer
-    rp.disconnectFromPeer(ID_ONE);
-    assertNumberOfPeers(0, 2);
+    rp.peerRemoved(ID_ONE);
+    assertNumberOfPeers(2);
     try {
-      rp.getStatusOfConnectedPeer(ID_ONE);
+      rp.getStatusOfPeer(ID_ONE);
       fail("There are no connected peers, should have thrown an IllegalArgumentException");
     } catch (IllegalArgumentException e) {
     }
@@ -234,7 +265,7 @@ public abstract class TestReplicationStateBasic {
       fail("ConnectedPeerStatus was " + !status + " but expected " + status + " in ZK");
     }
     while (true) {
-      if (status == rp.getStatusOfConnectedPeer(peerId)) {
+      if (status == rp.getStatusOfPeer(peerId)) {
         return;
       }
       if (zkTimeoutCount < ZK_MAX_COUNT) {
@@ -247,9 +278,9 @@ public abstract class TestReplicationStateBasic {
     }
   }
 
-  protected void assertNumberOfPeers(int connected, int total) {
-    assertEquals(total, rp.getAllPeerClusterKeys().size());
-    assertEquals(connected, rp.getConnectedPeers().size());
+  protected void assertNumberOfPeers(int total) {
+    assertEquals(total, rp.getAllPeerConfigs().size());
+    assertEquals(total, rp.getAllPeerIds().size());
     assertEquals(total, rp.getAllPeerIds().size());
   }
 
@@ -269,7 +300,7 @@ public abstract class TestReplicationStateBasic {
         rq3.addLog("qId" + i, "filename" + j);
       }
       //Add peers for the corresponding queues so they are not orphans
-      rp.addPeer("qId" + i, "bogus" + i);
+      rp.addPeer("qId" + i, new ReplicationPeerConfig().setClusterKey("localhost:2818:/bogus" + i), null);
     }
   }
 }

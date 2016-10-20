@@ -44,9 +44,12 @@ org.apache.hadoop.hbase.ServerLoad;
 org.apache.hadoop.hbase.ServerName;
 org.apache.hadoop.hbase.client.HBaseAdmin;
 org.apache.hadoop.hbase.client.HConnectionManager;
+org.apache.hadoop.hbase.HRegionInfo;
+org.apache.hadoop.hbase.master.RegionState;
 org.apache.hadoop.hbase.HTableDescriptor;
 org.apache.hadoop.hbase.HBaseConfiguration;
 org.apache.hadoop.hbase.TableName;
+org.apache.hadoop.hbase.tool.Canary;
 org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 org.apache.hadoop.hbase.master.DeadServer;
 org.apache.hadoop.hbase.protobuf.ProtobufUtil;
@@ -79,14 +82,13 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
     }
 
     for(int i = 0; i < zks.length; ++i) {
-      quorums.append(zks[i].trim()).append(",");
+      quorums.append(zks[i].trim());
 
-      if ((i+1) % 4 == 0 && i != (zks.length - 1)) {
+      if (i != (zks.length - 1)) {
         quorums.append("<br/>");
       }
     }
 
-    quorums.setLength(quorums.length() - 1);
     return quorums.toString();
   }
 </%class>
@@ -98,7 +100,8 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>Master: <% master.getServerName().getHostname() %></title>
+    <title><%if master.isActiveMaster() %>Master: <%else>Backup Master: </%if>
+    <% master.getServerName().getHostname() %></title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="">
     <link href="/static/css/bootstrap.min.css" rel="stylesheet">
@@ -138,7 +141,7 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
 	<%if master.isActiveMaster() %>
         <div class="row inner_header">
             <div class="page-header">
-                <h1>Master <small><% master.getServerName().getHostname() %> </small></h1>
+                <h1>Master <small><% master.getServerName().getHostname() %></small></h1>
             </div>
         </div>
 
@@ -156,6 +159,13 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
           <div class="alert alert-error">
           Please note that your cluster is running with the CatalogJanitor disabled. It can be
           re-enabled from the hbase shell by running the command 'catalogjanitor_switch true'
+          </div>
+        </%if>
+        <%if !master.isBalancerOn() %>
+          <div class="alert alert-warning">
+            The Load Balancer is not enabled which will eventually cause performance degradation
+            in HBase as Regions will not be distributed across all RegionServers. The balancer
+            is only expected to be disabled during rolling upgrade scenarios.
           </div>
         </%if>
 
@@ -206,7 +216,7 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
         <section>
             <& BackupMasterStatusTmpl; master = master &>
         </section>
-	</%if>    
+	</%if>
 
 
         <section>
@@ -231,6 +241,11 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
                     <td>When HBase version was compiled and by whom</td>
                 </tr>
                 <tr>
+                    <td>HBase Source Checksum</td>
+                    <td><% org.apache.hadoop.hbase.util.VersionInfo.getSrcChecksum() %></td>
+                    <td>HBase source MD5 checksum</td>
+                </tr>
+                <tr>
                     <td>Hadoop Version</td>
                     <td><% org.apache.hadoop.util.VersionInfo.getVersion() %>, r<% org.apache.hadoop.util.VersionInfo.getRevision() %></td>
                     <td>Hadoop version and revision</td>
@@ -241,10 +256,30 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
                     <td>When Hadoop version was compiled and by whom</td>
                 </tr>
                 <tr>
+                    <td>Hadoop Source Checksum</td>
+                    <td><% org.apache.hadoop.util.VersionInfo.getSrcChecksum() %></td>
+                    <td>Hadoop source MD5 checksum</td>
+                </tr>
+                <tr>
+                    <td>ZooKeeper Client Version</td>
+                    <td><% org.apache.zookeeper.Version.getVersion() %>, revision=<% org.apache.zookeeper.Version.getRevision() %></td>
+                    <td>ZooKeeper client version and revision</td>
+                </tr>
+                <tr>
+                    <td>ZooKeeper Client Compiled</td>
+                    <td><% org.apache.zookeeper.Version.getBuildDate() %></td>
+                    <td>When ZooKeeper client version was compiled</td>
+                </tr>
+                <tr>
                     <td>Zookeeper Quorum</td>
                     <%escape #n>
                     <td> <% formatZKString() %> </td>
                     <td>Addresses of all registered ZK servers. For more, see <a href="/zk.jsp">zk dump</a>.</td>
+                </tr>
+                <tr>
+                    <td>Zookeeper Base Path</td>
+                    <td> <% master.getZooKeeper().getBaseZNode() %></td>
+                    <td>Root node of this cluster in ZK.</td>
                 </tr>
                 <tr>
                     <td>HBase Root Directory</td>
@@ -284,6 +319,11 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
 	                    <td><% java.util.Arrays.toString(master.getCoprocessors()) %></td>
 	                    <td>Coprocessors currently loaded by the master</td>
 	                </tr>
+	                <tr>
+	                    <td>LoadBalancer</td>
+	                    <td><% master.getLoadBalancerClassName() %></td>
+	                    <td>LoadBalancer to be used in the Master</td>
+	                </tr>
                 </%if>
             </table>
         </section>
@@ -320,13 +360,16 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
     </%if>
     <%java>String description = null;
         if (tableName.equals(TableName.META_TABLE_NAME)){
-            description = "The hbase:meta table holds references to all User Table regions";
+            description = "The hbase:meta table holds references to all User Table regions.";
+        } else if (tableName.equals(Canary.DEFAULT_WRITE_TABLE_NAME)){
+            description = "The hbase:canary table is used to sniff the write availbility of"
+              + " each regionserver.";
         } else if (tableName.equals(AccessControlLists.ACL_TABLE_NAME)){
             description = "The hbase:acl table holds information about acl";
-	 } else if (tableName.equals(VisibilityConstants.LABELS_TABLE_NAME)){
-	     description = "The hbase:labels table holds information about visibility labels";
-        } else {
-            description = "The .NAMESPACE. table holds information about namespaces.";
+        } else if (tableName.equals(VisibilityConstants.LABELS_TABLE_NAME)){
+            description = "The hbase:labels table holds information about visibility labels.";
+        } else if (tableName.equals(TableName.NAMESPACE_TABLE_NAME)){
+            description = "The hbase:namespace table holds information about namespaces.";
         }
     </%java>
     <td><% description %></td>
@@ -348,17 +391,43 @@ AssignmentManager assignmentManager = master.getAssignmentManager();
             <th title="Fragmentation - Will be 0% after a major compaction and fluctuate during normal usage.">Frag.</th>
         </%if>
         <th>Online Regions</th>
+        <th>Offline Regions</th>
+        <th>Failed Regions</th>
+        <th>Split Regions</th>
+        <th>Other Regions</th>
         <th>Description</th>
     </tr>
     <%for HTableDescriptor htDesc : tables%>
+    <%java>
+      TableName tableName = htDesc.getTableName();
+      Map<RegionState.State, List<HRegionInfo>> tableRegions =
+          master.getAssignmentManager().getRegionStates()
+            .getRegionByStateOfTable(tableName);
+      int openRegionsCount = tableRegions.get(RegionState.State.OPEN).size();
+      int offlineRegionsCount = tableRegions.get(RegionState.State.OFFLINE).size();
+      int splitRegionsCount = tableRegions.get(RegionState.State.SPLIT).size();
+      int failedRegionsCount = tableRegions.get(RegionState.State.FAILED_OPEN).size()
+             + tableRegions.get(RegionState.State.FAILED_CLOSE).size();
+      int otherRegionsCount = 0;
+      for (List<HRegionInfo> list: tableRegions.values()) {
+         otherRegionsCount += list.size();
+      }
+      // now subtract known states
+      otherRegionsCount = otherRegionsCount - openRegionsCount
+                     - failedRegionsCount - offlineRegionsCount
+                     - splitRegionsCount;
+    </%java>
     <tr>
-        <td><% htDesc.getTableName().getNamespaceAsString() %></td>
-        <td><a href=table.jsp?name=<% htDesc.getTableName().getNameAsString() %>><% htDesc.getTableName().getQualifierAsString() %></a> </td>
+        <td><% tableName.getNamespaceAsString() %></td>
+        <td><a href=table.jsp?name=<% tableName.getNameAsString() %>><% tableName.getQualifierAsString() %></a> </td>
         <%if (frags != null) %>
-            <td align="center"><% frags.get(htDesc.getTableName().getNameAsString()) != null ? frags.get(htDesc.getTableName().getQualifierAsString()).intValue() + "%" : "n/a" %></td>
+            <td align="center"><% frags.get(tableName.getNameAsString()) != null ? frags.get(tableName.getNameAsString()).intValue() + "%" : "n/a" %></td>
         </%if>
-        <td><% master.getAssignmentManager().getRegionStates().getRegionsOfTable(htDesc
-        .getTableName()).size() %>
+        <td><% openRegionsCount %></td>
+        <td><% offlineRegionsCount %></td>
+        <td><% failedRegionsCount %></td>
+        <td><% splitRegionsCount %></td>
+        <td><% otherRegionsCount %></td>
         <td><% htDesc.toStringCustomizedValues() %></td>
     </tr>
     </%for>

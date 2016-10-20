@@ -41,10 +41,14 @@ import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.HeapSize;
+import org.apache.hadoop.hbase.io.TimeRange;
 import org.apache.hadoop.hbase.regionserver.MemStoreLAB.Allocation;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.cloudera.htrace.Trace;
+
+import com.google.common.annotations.VisibleForTesting;
 
 /**
  * The MemStore holds in-memory modifications to the Store.  Modifications
@@ -227,7 +231,8 @@ public class MemStore implements HeapSize {
    */
   long add(final KeyValue kv) {
     KeyValue toAdd = maybeCloneWithAllocator(kv);
-    return internalAdd(toAdd);
+    boolean mslabUsed = (toAdd != kv);
+    return internalAdd(toAdd, mslabUsed);
   }
 
   long timeOfOldestEdit() {
@@ -257,12 +262,32 @@ public class MemStore implements HeapSize {
    * allocator, and doesn't take the lock.
    *
    * Callers should ensure they already have the read lock taken
+   * @param toAdd the kv to add
+   * @param mslabUsed whether MSLAB is used for the kv
+   * @return the heap size change in bytes
    */
-  private long internalAdd(final KeyValue toAdd) {
-    long s = heapSizeChange(toAdd, addToKVSet(toAdd));
+  private long internalAdd(final KeyValue toAdd, boolean mslabUsed) {
+    boolean notPresent = addToKVSet(toAdd);
+    long s = heapSizeChange(toAdd, notPresent);
+    // If there's already a same cell in the CellSet and we are using MSLAB, we must count in the
+    // MSLAB allocation size as well, or else there will be memory leak (occupied heap size larger
+    // than the counted number)
+    if (!notPresent && mslabUsed) {
+      s += getCellLength(toAdd);
+    }
     timeRangeTracker.includeTimestamp(toAdd);
     this.size.addAndGet(s);
     return s;
+  }
+
+  /**
+   * Get cell length after serialized in {@link KeyValue}
+   * @param cell The cell to get length
+   * @return the serialized cell length
+   */
+  @VisibleForTesting
+  int getCellLength(Cell cell) {
+    return KeyValueUtil.length(cell);
   }
 
   private KeyValue maybeCloneWithAllocator(KeyValue kv) {
@@ -319,12 +344,9 @@ public class MemStore implements HeapSize {
    * @return approximate size of the passed key and value.
    */
   long delete(final KeyValue delete) {
-    long s = 0;
     KeyValue toAdd = maybeCloneWithAllocator(delete);
-    s += heapSizeChange(toAdd, addToKVSet(toAdd));
-    timeRangeTracker.includeTimestamp(toAdd);
-    this.size.addAndGet(s);
-    return s;
+    boolean mslabUsed = (toAdd != delete);
+    return internalAdd(toAdd, mslabUsed);
   }
 
   /**
@@ -563,7 +585,7 @@ public class MemStore implements HeapSize {
     // test that triggers the pathological case if we don't avoid MSLAB
     // here.
     KeyValue kv = KeyValueUtil.ensureKeyValue(cell);
-    long addedSize = internalAdd(kv);
+    long addedSize = internalAdd(kv, false);
 
     // Get the KeyValues for the row/family/qualifier regardless of timestamp.
     // For this case we want to clean up any other puts
@@ -587,7 +609,7 @@ public class MemStore implements HeapSize {
         // only remove Puts that concurrent scanners cannot possibly see
         if (cur.getTypeByte() == KeyValue.Type.Put.getCode() &&
             cur.getMvccVersion() <= readpoint) {
-          if (versionsVisible > 1) {
+          if (versionsVisible >= 1) {
             // if we get here we have seen at least one version visible to the oldest scanner,
             // which means we can prove that no scanner will see this version
 
@@ -659,11 +681,11 @@ public class MemStore implements HeapSize {
    * @return False if the key definitely does not exist in this Memstore
    */
   public boolean shouldSeek(Scan scan, long oldestUnexpiredTS) {
-    return (timeRangeTracker.includesTimeRange(scan.getTimeRange()) ||
-        snapshotTimeRangeTracker.includesTimeRange(scan.getTimeRange()))
-        && (Math.max(timeRangeTracker.getMaximumTimestamp(),
-                     snapshotTimeRangeTracker.getMaximumTimestamp()) >=
-            oldestUnexpiredTS);
+    TimeRange timeRange = scan.getTimeRange();
+    return (timeRangeTracker.includesTimeRange(timeRange) ||
+        snapshotTimeRangeTracker.includesTimeRange(timeRange)) &&
+        (Math.max(timeRangeTracker.getMax(), snapshotTimeRangeTracker.getMax())
+            >= oldestUnexpiredTS);
   }
 
   public TimeRangeTracker getSnapshotTimeRangeTracker() {
@@ -740,6 +762,9 @@ public class MemStore implements HeapSize {
       if (snapshotAllocator != null) {
         this.snapshotAllocatorAtCreation = snapshotAllocator;
         this.snapshotAllocatorAtCreation.incScannerCount();
+      }
+      if (Trace.isTracing() && Trace.currentSpan() != null) {
+        Trace.currentSpan().addTimelineAnnotation("Creating MemStoreScanner");
       }
     }
 
@@ -955,28 +980,36 @@ public class MemStore implements HeapSize {
      * specified key, then seek to the first KeyValue of previous row
      */
     @Override
-    public synchronized boolean seekToPreviousRow(KeyValue key) {
-      KeyValue firstKeyOnRow = KeyValue.createFirstOnRow(key.getRow());
-      SortedSet<KeyValue> kvHead = kvsetAtCreation.headSet(firstKeyOnRow);
-      KeyValue kvsetBeforeRow = kvHead.isEmpty() ? null : kvHead.last();
-      SortedSet<KeyValue> snapshotHead = snapshotAtCreation
-          .headSet(firstKeyOnRow);
-      KeyValue snapshotBeforeRow = snapshotHead.isEmpty() ? null : snapshotHead
-          .last();
-      KeyValue lastKVBeforeRow = getHighest(kvsetBeforeRow, snapshotBeforeRow);
-      if (lastKVBeforeRow == null) {
-        theNext = null;
-        return false;
-      }
-      KeyValue firstKeyOnPreviousRow = KeyValue
-          .createFirstOnRow(lastKVBeforeRow.getRow());
-      this.stopSkippingKVsIfNextRow = true;
-      seek(firstKeyOnPreviousRow);
-      this.stopSkippingKVsIfNextRow = false;
-      if (peek() == null
-          || comparator.compareRows(peek(), firstKeyOnPreviousRow) > 0) {
-        return seekToPreviousRow(lastKVBeforeRow);
-      }
+    public synchronized boolean seekToPreviousRow(KeyValue originalKey) {
+      boolean keepSeeking = false;
+      KeyValue key = originalKey;
+      do {
+        KeyValue firstKeyOnRow = KeyValue.createFirstOnRow(key.getRow());
+        SortedSet<KeyValue> kvHead = kvsetAtCreation.headSet(firstKeyOnRow);
+        KeyValue kvsetBeforeRow = kvHead.isEmpty() ? null : kvHead.last();
+        SortedSet<KeyValue> snapshotHead = snapshotAtCreation
+            .headSet(firstKeyOnRow);
+        KeyValue snapshotBeforeRow = snapshotHead.isEmpty() ? null : snapshotHead
+            .last();
+        KeyValue lastKVBeforeRow = getHighest(kvsetBeforeRow, snapshotBeforeRow);
+        if (lastKVBeforeRow == null) {
+          theNext = null;
+          return false;
+        }
+        KeyValue firstKeyOnPreviousRow = KeyValue
+            .createFirstOnRow(lastKVBeforeRow.getRow());
+        this.stopSkippingKVsIfNextRow = true;
+        seek(firstKeyOnPreviousRow);
+        this.stopSkippingKVsIfNextRow = false;
+        if (peek() == null
+            || comparator.compareRows(peek(), firstKeyOnPreviousRow) > 0) {
+          keepSeeking = true;
+          key = firstKeyOnPreviousRow;
+          continue;
+        } else {
+          keepSeeking = false;
+        }
+      } while (keepSeeking);
       return true;
     }
 

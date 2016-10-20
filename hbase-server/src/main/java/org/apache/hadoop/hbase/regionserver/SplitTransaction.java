@@ -24,6 +24,7 @@ import static org.apache.hadoop.hbase.executor.EventType.RS_ZK_REGION_SPLITTING;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.ListIterator;
@@ -38,6 +39,7 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
@@ -50,11 +52,14 @@ import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.executor.EventType;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
 import org.apache.hadoop.hbase.util.ConfigUtil;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HasThread;
+import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.PairOfSameType;
 import org.apache.hadoop.hbase.zookeeper.ZKAssign;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
@@ -178,8 +183,8 @@ public class SplitTransaction {
   }
 
   static class JournalEntry {
-    public JournalEntryType type;
-    public long timestamp;
+    private JournalEntryType type;
+    private long timestamp;
 
     public JournalEntry(JournalEntryType type) {
       this(type, EnvironmentEdgeManager.currentTimeMillis());
@@ -214,6 +219,7 @@ public class SplitTransaction {
     this.parent = r;
     this.splitrow = splitrow;
     this.journal.add(new JournalEntry(JournalEntryType.STARTED));
+    this.useZKForAssignment = ConfigUtil.useZKForAssignment(r.getBaseConf());
   }
 
   /**
@@ -268,12 +274,19 @@ public class SplitTransaction {
    * @param server Hosting server instance.  Can be null when testing (won't try
    * and update in zk if a null server)
    * @param services Used to online/offline regions.
+   * @param user
    * @throws IOException If thrown, transaction failed.
    *    Call {@link #rollback(Server, RegionServerServices)}
    * @return Regions created
    */
+  @Deprecated
   /* package */PairOfSameType<HRegion> createDaughters(final Server server,
       final RegionServerServices services) throws IOException {
+     return createDaughters(server, services, null);
+  }
+
+  /* package */PairOfSameType<HRegion> createDaughters(final Server server,
+      final RegionServerServices services, User user) throws IOException {
     LOG.info("Starting split of region " + this.parent);
     if ((server != null && server.isStopped()) ||
         (services != null && services.isStopping())) {
@@ -286,9 +299,26 @@ public class SplitTransaction {
 
     // Coprocessor callback
     if (this.parent.getCoprocessorHost() != null) {
-      // TODO: Remove one of these
-      this.parent.getCoprocessorHost().preSplit();
-      this.parent.getCoprocessorHost().preSplit(this.splitrow);
+      if (user == null) {
+        // TODO: Remove one of these
+        parent.getCoprocessorHost().preSplit();
+        parent.getCoprocessorHost().preSplit(splitrow);
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              parent.getCoprocessorHost().preSplit();
+              parent.getCoprocessorHost().preSplit(splitrow);
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
 
     journal.add(new JournalEntry(JournalEntryType.AFTER_PRE_SPLIT_HOOK));
@@ -302,10 +332,26 @@ public class SplitTransaction {
 
     PairOfSameType<HRegion> daughterRegions = stepsBeforePONR(server, services, testing);
 
-    List<Mutation> metaEntries = new ArrayList<Mutation>();
+    final List<Mutation> metaEntries = new ArrayList<Mutation>();
+    boolean ret = false;
     if (this.parent.getCoprocessorHost() != null) {
-      if (this.parent.getCoprocessorHost().
-          preSplitBeforePONR(this.splitrow, metaEntries)) {
+      if (user == null) {
+        ret = parent.getCoprocessorHost().preSplitBeforePONR(splitrow, metaEntries);
+      } else {
+        try {
+          ret = user.getUGI().doAs(new PrivilegedExceptionAction<Boolean>() {
+            @Override
+            public Boolean run() throws Exception {
+              return parent.getCoprocessorHost().preSplitBeforePONR(splitrow, metaEntries);
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
+      if (ret) {
         throw new IOException("Coprocessor bypassing region "
             + this.parent.getRegionNameAsString() + " split.");
       }
@@ -426,19 +472,36 @@ public class SplitTransaction {
     // splitStoreFiles creates daughter region dirs under the parent splits dir
     // Nothing to unroll here if failure -- clean up of CREATE_SPLIT_DIR will
     // clean this up.
-    splitStoreFiles(hstoreFilesToSplit);
+    Pair<Integer, Integer> expectedReferences = splitStoreFiles(hstoreFilesToSplit);
 
     // Log to the journal that we are creating region A, the first daughter
     // region.  We could fail halfway through.  If we do, we could have left
     // stuff in fs that needs cleanup -- a storefile or two.  Thats why we
     // add entry to journal BEFORE rather than AFTER the change.
     this.journal.add(new JournalEntry(JournalEntryType.STARTED_REGION_A_CREATION));
+    assertReferenceFileCount(expectedReferences.getFirst(),
+        this.parent.getRegionFileSystem().getSplitsDir(this.hri_a));
     HRegion a = this.parent.createDaughterRegionFromSplits(this.hri_a);
+    assertReferenceFileCount(expectedReferences.getFirst(),
+        new Path(this.parent.getRegionFileSystem().getTableDir(), this.hri_a.getEncodedName()));
 
     // Ditto
     this.journal.add(new JournalEntry(JournalEntryType.STARTED_REGION_B_CREATION));
+    assertReferenceFileCount(expectedReferences.getSecond(),
+        this.parent.getRegionFileSystem().getSplitsDir(this.hri_b));
     HRegion b = this.parent.createDaughterRegionFromSplits(this.hri_b);
+    assertReferenceFileCount(expectedReferences.getSecond(),
+        new Path(this.parent.getRegionFileSystem().getTableDir(), this.hri_b.getEncodedName()));
+
     return new PairOfSameType<HRegion>(a, b);
+  }
+
+  void assertReferenceFileCount(int expectedReferenceFileCount, Path dir)
+      throws IOException {
+    if (expectedReferenceFileCount != 0 &&
+        expectedReferenceFileCount != FSUtils.getRegionReferenceFileCount(this.parent.getFilesystem(), dir)) {
+      throw new IOException("Failing split. Expected reference file count isn't equal.");
+    }
   }
 
   /**
@@ -636,6 +699,15 @@ public class SplitTransaction {
     }
   }
 
+  public PairOfSameType<HRegion> execute(final Server server,
+    final RegionServerServices services)
+        throws IOException {
+    if (User.isHBaseSecurityEnabled(parent.getBaseConf())) {
+      LOG.warn("Should use execute(Server, RegionServerServices, User)");
+    }
+    return execute(server, services, null);
+  }
+
   /**
    * Run the transaction.
    * @param server Hosting server instance.  Can be null when testing (won't try
@@ -648,19 +720,42 @@ public class SplitTransaction {
    * @see #rollback(Server, RegionServerServices)
    */
   public PairOfSameType<HRegion> execute(final Server server,
-      final RegionServerServices services)
+      final RegionServerServices services, User user)
   throws IOException {
     useZKForAssignment =
         server == null ? true : ConfigUtil.useZKForAssignment(server.getConfiguration());
-    PairOfSameType<HRegion> regions = createDaughters(server, services);
+    PairOfSameType<HRegion> regions = createDaughters(server, services, user);
     if (this.parent.getCoprocessorHost() != null) {
-      this.parent.getCoprocessorHost().preSplitAfterPONR();
+      if (user == null) {
+        parent.getCoprocessorHost().preSplitAfterPONR();
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              parent.getCoprocessorHost().preSplitAfterPONR();
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
-    return stepsAfterPONR(server, services, regions);
+    return stepsAfterPONR(server, services, regions, user);
+  }
+
+  @Deprecated
+  public PairOfSameType<HRegion> stepsAfterPONR(final Server server,
+      final RegionServerServices services, final PairOfSameType<HRegion> regions)
+      throws IOException {
+     return stepsAfterPONR(server, services, regions, null);
   }
 
   public PairOfSameType<HRegion> stepsAfterPONR(final Server server,
-      final RegionServerServices services, PairOfSameType<HRegion> regions)
+      final RegionServerServices services, final PairOfSameType<HRegion> regions, User user)
       throws IOException {
     openDaughters(server, services, regions.getFirst(), regions.getSecond());
     if (server != null && server.getZooKeeper() != null && useZKForAssignment) {
@@ -669,7 +764,23 @@ public class SplitTransaction {
     journal.add(new JournalEntry(JournalEntryType.BEFORE_POST_SPLIT_HOOK));
     // Coprocessor callback
     if (this.parent.getCoprocessorHost() != null) {
-      this.parent.getCoprocessorHost().postSplit(regions.getFirst(), regions.getSecond());
+      if (user == null) {
+        this.parent.getCoprocessorHost().postSplit(regions.getFirst(), regions.getSecond());
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              parent.getCoprocessorHost().postSplit(regions.getFirst(), regions.getSecond());
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
     journal.add(new JournalEntry(JournalEntryType.AFTER_POST_SPLIT_HOOK));
     return regions;
@@ -781,7 +892,15 @@ public class SplitTransaction {
     }
   }
 
-  private void splitStoreFiles(final Map<byte[], List<StoreFile>> hstoreFilesToSplit)
+
+  /**
+   * Creates reference files for top and bottom half of the
+   * @param hstoreFilesToSplit map of store files to create half file references for.
+   * @return the number of reference files that were created.
+   * @throws IOException
+   */
+  private Pair<Integer, Integer> splitStoreFiles(
+      final Map<byte[], List<StoreFile>> hstoreFilesToSplit)
       throws IOException {
     if (hstoreFilesToSplit == null) {
       // Could be null because close didn't succeed -- for now consider it fatal
@@ -790,17 +909,30 @@ public class SplitTransaction {
     // The following code sets up a thread pool executor with as many slots as
     // there's files to split. It then fires up everything, waits for
     // completion and finally checks for any exception
-    int nbFiles = hstoreFilesToSplit.size();
+    int nbFiles = 0;
+    for (Map.Entry<byte[], List<StoreFile>> entry: hstoreFilesToSplit.entrySet()) {
+        nbFiles += entry.getValue().size();
+    }
     if (nbFiles == 0) {
       // no file needs to be splitted.
-      return;
+      return new Pair<Integer, Integer>(0,0);
     }
+    // Default max #threads to use is the smaller of table's configured number of blocking store
+    // files or the available number of logical cores.
+    int defMaxThreads = Math.min(parent.conf.getInt(HStore.BLOCKING_STOREFILES_KEY,
+                HStore.DEFAULT_BLOCKING_STOREFILE_COUNT),
+            Runtime.getRuntime().availableProcessors());
+    // Max #threads is the smaller of the number of storefiles or the default max determined above.
+    int maxThreads = Math.min(parent.conf.getInt(HConstants.REGION_SPLIT_THREADS_MAX,
+                defMaxThreads), nbFiles);
+    LOG.info("Preparing to split " + nbFiles + " storefiles for region " + this.parent +
+            " using " + maxThreads + " threads");
     ThreadFactoryBuilder builder = new ThreadFactoryBuilder();
     builder.setNameFormat("StoreFileSplitter-%1$d");
     ThreadFactory factory = builder.build();
     ThreadPoolExecutor threadPool =
-      (ThreadPoolExecutor) Executors.newFixedThreadPool(nbFiles, factory);
-    List<Future<Void>> futures = new ArrayList<Future<Void>>(nbFiles);
+      (ThreadPoolExecutor) Executors.newFixedThreadPool(maxThreads, factory);
+    List<Future<Pair<Path,Path>>> futures = new ArrayList<Future<Pair<Path,Path>>> (nbFiles);
 
     // Split each store file.
     for (Map.Entry<byte[], List<StoreFile>> entry: hstoreFilesToSplit.entrySet()) {
@@ -829,30 +961,54 @@ public class SplitTransaction {
       throw (InterruptedIOException)new InterruptedIOException().initCause(e);
     }
 
+    int created_a = 0;
+    int created_b = 0;
     // Look for any exception
-    for (Future<Void> future: futures) {
+    for (Future<Pair<Path, Path>> future : futures) {
       try {
-        future.get();
+        Pair<Path, Path> p = future.get();
+        created_a += p.getFirst() != null ? 1 : 0;
+        created_b += p.getSecond() != null ? 1 : 0;
       } catch (InterruptedException e) {
-        throw (InterruptedIOException)new InterruptedIOException().initCause(e);
+        throw (InterruptedIOException) new InterruptedIOException().initCause(e);
       } catch (ExecutionException e) {
         throw new IOException(e);
       }
     }
+
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Split storefiles for region " + this.parent + " Daugther A: " + created_a
+          + " storefiles, Daugther B: " + created_b + " storefiles.");
+    }
+    return new Pair<Integer, Integer>(created_a, created_b);
   }
 
-  private void splitStoreFile(final byte[] family, final StoreFile sf) throws IOException {
+  private Pair<Path, Path> splitStoreFile(final byte[] family, final StoreFile sf)
+      throws IOException {
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Splitting started for store file: " + sf.getPath() + " for region: " +
+          this.parent);
+    }
     HRegionFileSystem fs = this.parent.getRegionFileSystem();
     String familyName = Bytes.toString(family);
-    fs.splitStoreFile(this.hri_a, familyName, sf, this.splitrow, false);
-    fs.splitStoreFile(this.hri_b, familyName, sf, this.splitrow, true);
+    Path path_a =
+        fs.splitStoreFile(this.hri_a, familyName, sf, this.splitrow, false,
+          this.parent.getSplitPolicy());
+    Path path_b =
+        fs.splitStoreFile(this.hri_b, familyName, sf, this.splitrow, true,
+          this.parent.getSplitPolicy());
+    if (LOG.isDebugEnabled()) {
+        LOG.debug("Splitting complete for store file: " + sf.getPath() + " for region: " +
+                  this.parent);
+    }
+    return new Pair<Path,Path>(path_a, path_b);
   }
 
   /**
    * Utility class used to do the file splitting / reference writing
    * in parallel instead of sequentially.
    */
-  class StoreFileSplitter implements Callable<Void> {
+  class StoreFileSplitter implements Callable<Pair<Path,Path>> {
     private final byte[] family;
     private final StoreFile sf;
 
@@ -866,10 +1022,17 @@ public class SplitTransaction {
       this.family = family;
     }
 
-    public Void call() throws IOException {
-      splitStoreFile(family, sf);
-      return null;
+    public Pair<Path,Path> call() throws IOException {
+      return splitStoreFile(family, sf);
     }
+  }
+  
+  public boolean rollback(final Server server, final RegionServerServices services)
+      throws IOException {
+    if (User.isHBaseSecurityEnabled(parent.getBaseConf())) {
+      LOG.warn("Should use rollback(Server, RegionServerServices, User)");
+    }
+    return rollback(server, services, null);
   }
 
   /**
@@ -880,11 +1043,27 @@ public class SplitTransaction {
    * of no return and so now need to abort the server to minimize damage.
    */
   @SuppressWarnings("deprecation")
-  public boolean rollback(final Server server, final RegionServerServices services)
+  public boolean rollback(final Server server, final RegionServerServices services, User user)
   throws IOException {
     // Coprocessor callback
     if (this.parent.getCoprocessorHost() != null) {
-      this.parent.getCoprocessorHost().preRollBackSplit();
+      if (user == null) {
+        this.parent.getCoprocessorHost().preRollBackSplit();
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              parent.getCoprocessorHost().preRollBackSplit();
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
 
     boolean result = true;
@@ -962,7 +1141,23 @@ public class SplitTransaction {
     }
     // Coprocessor callback
     if (this.parent.getCoprocessorHost() != null) {
-      this.parent.getCoprocessorHost().postRollBackSplit();
+      if (user == null) {
+        this.parent.getCoprocessorHost().postRollBackSplit();
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              parent.getCoprocessorHost().postRollBackSplit();
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
     return result;
   }

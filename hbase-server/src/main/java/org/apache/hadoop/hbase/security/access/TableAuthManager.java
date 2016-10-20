@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.hbase.security.access;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
@@ -26,17 +27,20 @@ import java.util.concurrent.ConcurrentSkipListMap;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.hbase.AuthUtil;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
+import org.apache.hadoop.hbase.security.Superusers;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.zookeeper.KeeperException;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
@@ -45,7 +49,7 @@ import com.google.common.collect.Lists;
  * Performs authorization checks for a given user's assigned permissions
  */
 @InterfaceAudience.Private
-public class TableAuthManager {
+public class TableAuthManager implements Closeable {
   private static class PermissionCache<T extends Permission> {
     /** Cache of user permissions */
     private ListMultimap<String,T> userCache = ArrayListMultimap.create();
@@ -78,21 +82,19 @@ public class TableAuthManager {
 
     /**
      * Returns a combined map of user and group permissions, with group names prefixed by
-     * {@link AccessControlLists#GROUP_PREFIX}.
+     * {@link AuthUtil#GROUP_PREFIX}.
      */
     public ListMultimap<String,T> getAllPermissions() {
       ListMultimap<String,T> tmp = ArrayListMultimap.create();
       tmp.putAll(userCache);
       for (String group : groupCache.keySet()) {
-        tmp.putAll(AccessControlLists.GROUP_PREFIX + group, groupCache.get(group));
+        tmp.putAll(AuthUtil.toGroupEntry(group), groupCache.get(group));
       }
       return tmp;
     }
   }
 
   private static Log LOG = LogFactory.getLog(TableAuthManager.class);
-
-  private static TableAuthManager instance;
 
   /** Cache of global permissions */
   private volatile PermissionCache<Permission> globalCache;
@@ -122,6 +124,11 @@ public class TableAuthManager {
     }
   }
 
+  @Override
+  public void close() {
+    this.zkperms.close();
+  }
+
   /**
    * Returns a new {@code PermissionCache} initialized with permission assignments
    * from the {@code hbase.superuser} configuration key.
@@ -138,11 +145,11 @@ public class TableAuthManager {
 
     // the system user is always included
     List<String> superusers = Lists.asList(currentUser, conf.getStrings(
-        AccessControlLists.SUPERUSER_CONF_KEY, new String[0]));
+        Superusers.SUPERUSER_CONF_KEY, new String[0]));
     if (superusers != null) {
       for (String name : superusers) {
-        if (AccessControlLists.isGroupPrincipal(name)) {
-          newCache.putGroup(AccessControlLists.getGroupName(name),
+        if (AuthUtil.isGroupPrincipal(name)) {
+          newCache.putGroup(AuthUtil.getGroupName(name),
               new Permission(Permission.Action.values()));
         } else {
           newCache.putUser(name, new Permission(Permission.Action.values()));
@@ -204,8 +211,8 @@ public class TableAuthManager {
     try {
       newCache = initGlobal(conf);
       for (Map.Entry<String,TablePermission> entry : userPerms.entries()) {
-        if (AccessControlLists.isGroupPrincipal(entry.getKey())) {
-          newCache.putGroup(AccessControlLists.getGroupName(entry.getKey()),
+        if (AuthUtil.isGroupPrincipal(entry.getKey())) {
+          newCache.putGroup(AuthUtil.getGroupName(entry.getKey()),
               new Permission(entry.getValue().getActions()));
         } else {
           newCache.putUser(entry.getKey(), new Permission(entry.getValue().getActions()));
@@ -223,7 +230,7 @@ public class TableAuthManager {
    * Updates the internal permissions cache for a single table, splitting
    * the permissions listed into separate caches for users and groups to optimize
    * group lookups.
-   * 
+   *
    * @param table
    * @param tablePerms
    */
@@ -232,8 +239,8 @@ public class TableAuthManager {
     PermissionCache<TablePermission> newTablePerms = new PermissionCache<TablePermission>();
 
     for (Map.Entry<String,TablePermission> entry : tablePerms.entries()) {
-      if (AccessControlLists.isGroupPrincipal(entry.getKey())) {
-        newTablePerms.putGroup(AccessControlLists.getGroupName(entry.getKey()), entry.getValue());
+      if (AuthUtil.isGroupPrincipal(entry.getKey())) {
+        newTablePerms.putGroup(AuthUtil.getGroupName(entry.getKey()), entry.getValue());
       } else {
         newTablePerms.putUser(entry.getKey(), entry.getValue());
       }
@@ -256,8 +263,8 @@ public class TableAuthManager {
     PermissionCache<TablePermission> newTablePerms = new PermissionCache<TablePermission>();
 
     for (Map.Entry<String, TablePermission> entry : tablePerms.entries()) {
-      if (AccessControlLists.isGroupPrincipal(entry.getKey())) {
-        newTablePerms.putGroup(AccessControlLists.getGroupName(entry.getKey()), entry.getValue());
+      if (AuthUtil.isGroupPrincipal(entry.getKey())) {
+        newTablePerms.putGroup(AuthUtil.getGroupName(entry.getKey()), entry.getValue());
       } else {
         newTablePerms.putUser(entry.getKey(), entry.getValue());
       }
@@ -295,7 +302,7 @@ public class TableAuthManager {
         }
       }
     } else if (LOG.isDebugEnabled()) {
-      LOG.debug("No permissions found");
+      LOG.debug("No permissions found for " + action);
     }
 
     return false;
@@ -349,6 +356,20 @@ public class TableAuthManager {
     return false;
   }
 
+  private boolean hasAccess(List<TablePermission> perms,
+                            TableName table, Permission.Action action) {
+    if (perms != null) {
+      for (TablePermission p : perms) {
+        if (p.implies(action)) {
+          return true;
+        }
+      }
+    } else if (LOG.isDebugEnabled()) {
+      LOG.debug("No permissions found for table="+table);
+    }
+    return false;
+  }
+
   /**
    * Authorize a user for a given KV. This is called from AccessControlFilter.
    */
@@ -377,7 +398,7 @@ public class TableAuthManager {
 
   public boolean authorize(User user, String namespace, Permission.Action action) {
     // Global authorizations supercede namespace level
-    if (authorizeUser(user, action)) {
+    if (authorize(user, action)) {
       return true;
     }
     // Check namespace permissions
@@ -416,14 +437,6 @@ public class TableAuthManager {
   }
 
   /**
-   * Checks global authorization for a specific action for a user, based on the
-   * stored user permissions.
-   */
-  public boolean authorizeUser(User user, Permission.Action action) {
-    return authorize(globalCache.getUser(user.getShortName()), action);
-  }
-
-  /**
    * Checks authorization to a given table and column family for a user, based on the
    * stored user permissions.
    *
@@ -442,7 +455,7 @@ public class TableAuthManager {
       byte[] qualifier, Permission.Action action) {
     if (table == null) table = AccessControlLists.ACL_TABLE_NAME;
     // Global and namespace authorizations supercede table level
-    if (authorize(user, table.getNamespaceAsString(), action)) {    
+    if (authorize(user, table.getNamespaceAsString(), action)) {
       return true;
     }
     // Check table permissions
@@ -451,36 +464,90 @@ public class TableAuthManager {
   }
 
   /**
+   * Checks if the user has access to the full table or at least a family/qualifier
+   * for the specified action.
+   *
+   * @param user
+   * @param table
+   * @param action
+   * @return true if the user has access to the table, false otherwise
+   */
+  public boolean userHasAccess(User user, TableName table, Permission.Action action) {
+    if (table == null) table = AccessControlLists.ACL_TABLE_NAME;
+    // Global and namespace authorizations supercede table level
+    if (authorize(user, table.getNamespaceAsString(), action)) {
+      return true;
+    }
+    // Check table permissions
+    return hasAccess(getTablePermissions(table).getUser(user.getShortName()), table, action);
+  }
+
+  /**
    * Checks global authorization for a given action for a group, based on the stored
    * permissions.
    */
   public boolean authorizeGroup(String groupName, Permission.Action action) {
-    return authorize(globalCache.getGroup(groupName), action);
+    List<Permission> perms = globalCache.getGroup(groupName);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("authorizing " + (perms != null && !perms.isEmpty() ? perms.get(0) : "") +
+        " for " + action);
+    }
+    return authorize(perms, action);
   }
 
   /**
-   * Checks authorization to a given table and column family for a group, based
-   * on the stored permissions. 
+   * Checks authorization to a given table, column family and column for a group, based
+   * on the stored permissions.
    * @param groupName
    * @param table
    * @param family
+   * @param qualifier
    * @param action
    * @return true if known and authorized, false otherwise
    */
   public boolean authorizeGroup(String groupName, TableName table, byte[] family,
-      Permission.Action action) {
+      byte[] qualifier, Permission.Action action) {
     // Global authorization supercedes table level
     if (authorizeGroup(groupName, action)) {
       return true;
     }
     if (table == null) table = AccessControlLists.ACL_TABLE_NAME;
     // Namespace authorization supercedes table level
-    if (authorize(getNamespacePermissions(table.getNamespaceAsString()).getGroup(groupName),
-        table, family, action)) {
+    String namespace = table.getNamespaceAsString();
+    if (authorize(getNamespacePermissions(namespace).getGroup(groupName), namespace, action)) {
       return true;
     }
     // Check table level
-    return authorize(getTablePermissions(table).getGroup(groupName), table, family, action);
+    List<TablePermission> tblPerms = getTablePermissions(table).getGroup(groupName);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("authorizing " + (tblPerms != null && !tblPerms.isEmpty() ? tblPerms.get(0) : "") +
+        " for " +groupName + " on " + table + "." + Bytes.toString(family) + "." +
+        Bytes.toString(qualifier) + " with " + action);
+    }
+    return authorize(tblPerms, table, family, qualifier, action);
+  }
+
+  /**
+   * Checks if the user has access to the full table or at least a family/qualifier
+   * for the specified action.
+   * @param groupName
+   * @param table
+   * @param action
+   * @return true if the group has access to the table, false otherwise
+   */
+  public boolean groupHasAccess(String groupName, TableName table, Permission.Action action) {
+    // Global authorization supercedes table level
+    if (authorizeGroup(groupName, action)) {
+      return true;
+    }
+    if (table == null) table = AccessControlLists.ACL_TABLE_NAME;
+    // Namespace authorization supercedes table level
+    if (hasAccess(getNamespacePermissions(table.getNamespaceAsString()).getGroup(groupName),
+        table, action)) {
+      return true;
+    }
+    // Check table level
+    return hasAccess(getTablePermissions(table).getGroup(groupName), table, action);
   }
 
   public boolean authorize(User user, TableName table, byte[] family,
@@ -492,7 +559,23 @@ public class TableAuthManager {
     String[] groups = user.getGroupNames();
     if (groups != null) {
       for (String group : groups) {
-        if (authorizeGroup(group, table, family, action)) {
+        if (authorizeGroup(group, table, family, qualifier, action)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  public boolean hasAccess(User user, TableName table, Permission.Action action) {
+    if (userHasAccess(user, table, action)) {
+      return true;
+    }
+
+    String[] groups = user.getGroupNames();
+    if (groups != null) {
+      for (String group : groups) {
+        if (groupHasAccess(group, table, action)) {
           return true;
         }
       }
@@ -660,16 +743,54 @@ public class TableAuthManager {
     return mtime;
   }
 
-  static Map<ZooKeeperWatcher,TableAuthManager> managerMap =
+  private static Map<ZooKeeperWatcher,TableAuthManager> managerMap =
     new HashMap<ZooKeeperWatcher,TableAuthManager>();
 
-  public synchronized static TableAuthManager get(
+  private static Map<TableAuthManager, Integer> refCount = new HashMap<TableAuthManager, Integer>();
+
+  /** Returns a TableAuthManager from the cache. If not cached, constructs a new one. Returned
+   * instance should be released back by calling {@link #release(TableAuthManager)}. */
+  public synchronized static TableAuthManager getOrCreate(
       ZooKeeperWatcher watcher, Configuration conf) throws IOException {
-    instance = managerMap.get(watcher);
+    TableAuthManager instance = managerMap.get(watcher);
     if (instance == null) {
       instance = new TableAuthManager(watcher, conf);
       managerMap.put(watcher, instance);
     }
+    int ref = refCount.get(instance) == null ? 0 : refCount.get(instance).intValue();
+    refCount.put(instance, ref + 1);
     return instance;
+  }
+
+  @VisibleForTesting
+  static int getTotalRefCount() {
+    int total = 0;
+    for (int count : refCount.values()) {
+      total += count;
+    }
+    return total;
+  }
+
+  /**
+   * Releases the resources for the given TableAuthManager if the reference count is down to 0.
+   * @param instance TableAuthManager to be released
+   */
+  public synchronized static void release(TableAuthManager instance) {
+    if (refCount.get(instance) == null || refCount.get(instance) < 1) {
+      String msg = "Something wrong with the TableAuthManager reference counting: " + instance
+          + " whose count is " + refCount.get(instance);
+      LOG.fatal(msg);
+      instance.close();
+      managerMap.remove(instance.getZKPermissionWatcher().getWatcher());
+      instance.getZKPermissionWatcher().getWatcher().abort(msg, null);
+    } else {
+      int ref = refCount.get(instance);
+      refCount.put(instance, ref-1);
+      if (ref-1 == 0) {
+        instance.close();
+        managerMap.remove(instance.getZKPermissionWatcher().getWatcher());
+        refCount.remove(instance);
+      }
+    }
   }
 }

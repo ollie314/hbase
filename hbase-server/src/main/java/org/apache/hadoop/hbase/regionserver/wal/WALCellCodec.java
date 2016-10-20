@@ -22,15 +22,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.KeyValue;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.codec.BaseDecoder;
 import org.apache.hadoop.hbase.codec.BaseEncoder;
 import org.apache.hadoop.hbase.codec.Codec;
-import org.apache.hadoop.hbase.codec.KeyValueCodec;
+import org.apache.hadoop.hbase.codec.KeyValueCodecWithTags;
 import org.apache.hadoop.hbase.io.util.Dictionary;
 import org.apache.hadoop.hbase.io.util.StreamUtils;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -78,7 +78,7 @@ public class WALCellCodec implements Codec {
     this.compression = compression;
   }
 
-  static String getWALCellCodecClass(Configuration conf) {
+  public static String getWALCellCodecClass(Configuration conf) {
     return conf.get(WAL_CELL_CODEC_CLASS_KEY, WALCellCodec.class.getName());
   }
   
@@ -349,7 +349,7 @@ public class WALCellCodec implements Codec {
   @Override
   public Decoder getDecoder(InputStream is) {
     return (compression == null)
-        ? new KeyValueCodec.KeyValueDecoder(is) : new CompressedKvDecoder(is, compression);
+        ? new KeyValueCodecWithTags.KeyValueDecoder(is) : new CompressedKvDecoder(is, compression);
   }
 
   @Override

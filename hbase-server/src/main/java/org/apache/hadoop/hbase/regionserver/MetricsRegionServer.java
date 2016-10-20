@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.CompatibilitySingletonFactory;
@@ -47,7 +48,7 @@ public class MetricsRegionServer {
     this.serverSource = serverSource;
   }
 
-  // for unit-test usage
+  @VisibleForTesting
   public MetricsRegionServerSource getMetricsSource() {
     return serverSource;
   }
@@ -95,8 +96,20 @@ public class MetricsRegionServer {
     serverSource.updateReplay(t);
   }
 
+  public void updateScannerNext(long scanSize){
+    serverSource.updateScannerNext(scanSize);
+  }
+
   public void updateSplitTime(long t) {
     serverSource.updateSplitTime(t);
+  }
+
+  public void incrSplitRequest() {
+    serverSource.incrSplitRequest();
+  }
+
+  public void incrSplitSuccess() {
+    serverSource.incrSplitSuccess();
   }
 
   public void updateFlushTime(long t) {

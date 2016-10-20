@@ -19,6 +19,7 @@
 
 include Java
 java_import java.util.Arrays
+java_import org.apache.hadoop.hbase.TableName
 java_import org.apache.hadoop.hbase.util.Pair
 java_import org.apache.hadoop.hbase.util.RegionSplitter
 java_import org.apache.hadoop.hbase.util.Bytes
@@ -32,12 +33,8 @@ module Hbase
 
     def initialize(configuration, formatter)
       @admin = org.apache.hadoop.hbase.client.HBaseAdmin.new(configuration)
-      connection = @admin.getConnection()
+      @connection = org.apache.hadoop.hbase.client.HConnectionManager.createConnection(configuration)
       @conf = configuration
-      @zk_wrapper = org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher.new(configuration,
-        "admin", nil)
-      zk = @zk_wrapper.getRecoverableZooKeeper().getZooKeeper()
-      @zk_main = org.apache.zookeeper.ZooKeeperMain.new(zk)
       @formatter = formatter
     end
 
@@ -66,7 +63,7 @@ module Hbase
 
     # Requests to compact all regions on the regionserver
     def compact_regionserver(servername, major = false)
-      @admin.compactRegionServer(ServerName.valueOf(servername), major)
+      @admin.compactRegionServer(org.apache.hadoop.hbase.ServerName.valueOf(servername), major)
     end
 
     #----------------------------------------------------------------------------------------------
@@ -81,7 +78,7 @@ module Hbase
     end
 
     #----------------------------------------------------------------------------------------------
-    # Requests a regionserver's HLog roll
+    # Requests a regionserver's WAL roll
     def hlog_roll(server_name)
       @admin.rollHLogWriter(server_name)
     end
@@ -109,6 +106,13 @@ module Hbase
     def balance_switch(enableDisable)
       @admin.setBalancerRunning(
         java.lang.Boolean::valueOf(enableDisable), java.lang.Boolean::valueOf(false))
+    end
+
+    #----------------------------------------------------------------------------------------------
+    # Query the current state of the LoadBalancer.
+    # Returns the balancer's state (true is enabled).
+    def balancer_enabled?()
+      @admin.isBalancerEnabled()
     end
 
     #----------------------------------------------------------------------------------------------
@@ -165,7 +169,7 @@ module Hbase
     #---------------------------------------------------------------------------------------------
     # Throw exception if table doesn't exist
     def tableExists(table_name)
-      raise ArgumentError, "Table #{table_name} does not exist.'" unless exists?(table_name)
+      raise ArgumentError, "Table #{table_name} does not exist." unless exists?(table_name)
     end
 
     #----------------------------------------------------------------------------------------------
@@ -178,7 +182,7 @@ module Hbase
     # Drops a table
     def drop(table_name)
       tableExists(table_name)
-      raise ArgumentError, "Table #{table_name} is enabled. Disable it first.'" if enabled?(table_name)
+      raise ArgumentError, "Table #{table_name} is enabled. Disable it first." if enabled?(table_name)
 
       @admin.deleteTable(table_name)
     end
@@ -194,6 +198,11 @@ module Hbase
     #----------------------------------------------------------------------------------------------
     # Returns ZooKeeper status dump
     def zk_dump
+      @zk_wrapper = org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher.new(@conf,
+       "admin",
+        nil)
+      zk = @zk_wrapper.getRecoverableZooKeeper().getZooKeeper()
+      @zk_main = org.apache.zookeeper.ZooKeeperMain.new(zk)
       org.apache.hadoop.hbase.zookeeper.ZKUtil::dump(@zk_wrapper)
     end
 
@@ -269,7 +278,15 @@ module Hbase
         htd.setReadOnly(JBoolean.valueOf(arg.delete(READONLY))) if arg[READONLY]
         htd.setCompactionEnabled(JBoolean.valueOf(arg[COMPACTION_ENABLED])) if arg[COMPACTION_ENABLED]
         htd.setMemStoreFlushSize(JLong.valueOf(arg.delete(MEMSTORE_FLUSHSIZE))) if arg[MEMSTORE_FLUSHSIZE]
-        htd.setAsyncLogFlush(JBoolean.valueOf(arg.delete(DEFERRED_LOG_FLUSH))) if arg[DEFERRED_LOG_FLUSH]
+        # DEFERRED_LOG_FLUSH is deprecated and was replaced by DURABILITY.  To keep backward compatible, it still exists.
+        # However, it has to be set before DURABILITY so that DURABILITY could overwrite if both args are set
+        if arg.include?(DEFERRED_LOG_FLUSH)
+          if arg.delete(DEFERRED_LOG_FLUSH).to_s.upcase == "TRUE"
+            htd.setDurability(org.apache.hadoop.hbase.client.Durability.valueOf("ASYNC_WAL"))
+          else
+            htd.setDurability(org.apache.hadoop.hbase.client.Durability.valueOf("SYNC_WAL"))
+          end
+        end
         htd.setDurability(org.apache.hadoop.hbase.client.Durability.valueOf(arg.delete(DURABILITY))) if arg[DURABILITY]
         set_user_metadata(htd, arg.delete(METADATA)) if arg[METADATA]
         set_descriptor_config(htd, arg.delete(CONFIGURATION)) if arg[CONFIGURATION]
@@ -336,12 +353,16 @@ module Hbase
       @admin.getTableDescriptor(table_name.to_java_bytes).getColumnFamilies()
     end
 
+    def get_table_attributes(table_name)
+      @admin.getTableDescriptor(table_name.to_java_bytes).toStringTableAttributes
+    end
+
     #----------------------------------------------------------------------------------------------
     # Truncates table (deletes all records by recreating the table)
     def truncate(table_name, conf = @conf)
-      h_table = org.apache.hadoop.hbase.client.HTable.new(conf, table_name)
+      h_table = @connection.getTable(TableName.valueOf(table_name))
       table_description = h_table.getTableDescriptor()
-      raise ArgumentError, "Table #{table_name} is not enabled. Enable it first.'" unless enabled?(table_name)
+      raise ArgumentError, "Table #{table_name} is not enabled. Enable it first." unless enabled?(table_name)
       yield 'Disabling table...' if block_given?
       @admin.disableTable(table_name)
 
@@ -368,9 +389,9 @@ module Hbase
     #----------------------------------------------------------------------------------------------
     # Truncates table while maintaing region boundaries (deletes all records by recreating the table)
     def truncate_preserve(table_name, conf = @conf)
-      h_table = org.apache.hadoop.hbase.client.HTable.new(conf, table_name)
-      splits = h_table.getRegionLocations().keys().map{|i| Bytes.toString(i.getStartKey)}.delete_if{|k| k == ""}.to_java :String
-      splits = org.apache.hadoop.hbase.util.Bytes.toByteArrays(splits)
+      h_table = @connection.getTable(TableName.valueOf(table_name))
+      splits = h_table.getRegionLocations().keys().map{|i| Bytes.toStringBinary(i.getStartKey)}.delete_if{|k| k == ""}.to_java :String
+      splits = org.apache.hadoop.hbase.util.Bytes.toBinaryByteArrays(splits)
       table_description = h_table.getTableDescriptor()
       yield 'Disabling table...' if block_given?
       disable(table_name)
@@ -476,10 +497,19 @@ module Hbase
           # Unset table attributes
           elsif method == "table_att_unset"
             raise(ArgumentError, "NAME parameter missing for table_att_unset method") unless name
-            if (htd.getValue(name) == nil)
-              raise ArgumentError, "Can not find attribute: #{name}"
+            if name.kind_of?(Array)
+              name.each do |key|
+                if (htd.getValue(key) == nil)
+                  raise ArgumentError, "Could not find attribute: #{key}"
+                end
+                htd.remove(key)
+              end
+            else
+              if (htd.getValue(name) == nil)
+                raise ArgumentError, "Could not find attribute: #{name}"
+              end
+              htd.remove(name)
             end
-            htd.remove(name)
             @admin.modifyTable(table_name.to_java_bytes, htd)
           # Unknown method
           else
@@ -509,7 +539,15 @@ module Hbase
         htd.setReadOnly(JBoolean.valueOf(arg.delete(READONLY))) if arg[READONLY]
         htd.setCompactionEnabled(JBoolean.valueOf(arg[COMPACTION_ENABLED])) if arg[COMPACTION_ENABLED]
         htd.setMemStoreFlushSize(JLong.valueOf(arg.delete(MEMSTORE_FLUSHSIZE))) if arg[MEMSTORE_FLUSHSIZE]
-        htd.setAsyncLogFlush(JBoolean.valueOf(arg.delete(DEFERRED_LOG_FLUSH))) if arg[DEFERRED_LOG_FLUSH]
+        # DEFERRED_LOG_FLUSH is deprecated and was replaced by DURABILITY.  To keep backward compatible, it still exists.
+        # However, it has to be set before DURABILITY so that DURABILITY could overwrite if both args are set
+        if arg.include?(DEFERRED_LOG_FLUSH)
+          if arg.delete(DEFERRED_LOG_FLUSH).to_s.upcase == "TRUE"
+            htd.setDurability(org.apache.hadoop.hbase.client.Durability.valueOf("ASYNC_WAL"))
+          else
+            htd.setDurability(org.apache.hadoop.hbase.client.Durability.valueOf("SYNC_WAL"))
+          end
+        end
         htd.setDurability(org.apache.hadoop.hbase.client.Durability.valueOf(arg.delete(DURABILITY))) if arg[DURABILITY]
         set_user_metadata(htd, arg.delete(METADATA)) if arg[METADATA]
         set_descriptor_config(htd, arg.delete(CONFIGURATION)) if arg[CONFIGURATION]
@@ -522,25 +560,9 @@ module Hbase
             k.strip!
 
             if (k =~ /coprocessor/i)
-              # validate coprocessor specs
               v = String.new(value)
               v.strip!
-              if !(v =~ /^([^\|]*)\|([^\|]+)\|[\s]*([\d]*)[\s]*(\|.*)?$/)
-                raise ArgumentError, "Coprocessor value doesn't match spec: #{v}"
-              end
-
-              # generate a coprocessor ordinal by checking max id of existing cps
-              maxId = 0
-              htd.getValues().each do |k1, v1|
-                attrName = org.apache.hadoop.hbase.util.Bytes.toString(k1.get())
-                # a cp key is coprocessor$(\d)
-                if (attrName =~ /coprocessor\$(\d+)/i)
-                  ids = attrName.scan(/coprocessor\$(\d+)/i)
-                  maxId = ids[0][0].to_i if ids[0][0].to_i > maxId
-                end
-              end
-              maxId += 1
-              htd.setValue(k + "\$" + maxId.to_s, value)
+              htd.addCoprocessorWithSpec(v)
               valid_coproc_keys << key
             end
           end
@@ -564,7 +586,7 @@ module Hbase
       end
     end
 
-    def status(format)
+    def status(format, type)
       status = @admin.getClusterStatus()
       if format == "detailed"
         puts("version %s" % [ status.getHBaseVersion() ])
@@ -573,6 +595,14 @@ module Hbase
         for k, v in status.getRegionsInTransition()
           puts("    %s" % [v])
         end
+        master = status.getMaster()
+        puts("active master:  %s:%d %d" % [master.getHostname(), master.getPort(), master.getStartcode()])
+        puts("%d backup masters" % [ status.getBackupMastersSize() ])
+        for server in status.getBackupMasters()
+          puts("    %s:%d %d" % \
+            [ server.getHostname(), server.getPort(), server.getStartcode() ])
+        end
+
         master_coprocs = java.util.Arrays.toString(@admin.getMasterCoprocessors())
         if master_coprocs != nil
           puts("master coprocessors: %s" % master_coprocs)
@@ -591,9 +621,56 @@ module Hbase
         for server in status.getDeadServerNames()
           puts("    %s" % [ server ])
         end
+      elsif format == "replication"
+        #check whether replication is enabled or not
+        if (!@admin.getConfiguration().getBoolean(org.apache.hadoop.hbase.HConstants::REPLICATION_ENABLE_KEY, 
+          org.apache.hadoop.hbase.HConstants::REPLICATION_ENABLE_DEFAULT))
+          puts("Please enable replication first.")
+        else
+          puts("version %s" % [ status.getHBaseVersion() ])
+          puts("%d live servers" % [ status.getServersSize() ])
+          for server in status.getServers()
+            sl = status.getLoad(server)
+            rSinkString   = "       SINK  :"
+            rSourceString = "       SOURCE:"
+            rLoadSink = sl.getReplicationLoadSink()
+            rSinkString << " AgeOfLastAppliedOp=" + rLoadSink.getAgeOfLastAppliedOp().to_s
+            rSinkString << ", TimeStampsOfLastAppliedOp=" + 
+			    (java.util.Date.new(rLoadSink.getTimeStampsOfLastAppliedOp())).toString()
+            rLoadSourceList = sl.getReplicationLoadSourceList()
+            index = 0
+            while index < rLoadSourceList.size()
+              rLoadSource = rLoadSourceList.get(index)
+              rSourceString << " PeerID=" + rLoadSource.getPeerID()
+              rSourceString << ", AgeOfLastShippedOp=" + rLoadSource.getAgeOfLastShippedOp().to_s
+              rSourceString << ", SizeOfLogQueue=" + rLoadSource.getSizeOfLogQueue().to_s
+              rSourceString << ", TimeStampsOfLastShippedOp=" + 
+			      (java.util.Date.new(rLoadSource.getTimeStampOfLastShippedOp())).toString()
+              rSourceString << ", Replication Lag=" + rLoadSource.getReplicationLag().to_s
+              index = index + 1
+            end
+            puts("    %s:" %
+            [ server.getHostname() ])
+            if type.casecmp("SOURCE") == 0
+              puts("%s" % rSourceString)
+            elsif type.casecmp("SINK") == 0
+              puts("%s" % rSinkString)
+            else
+              puts("%s" % rSourceString)
+              puts("%s" % rSinkString)
+            end
+          end
+        end
       elsif format == "simple"
         load = 0
         regions = 0
+        master = status.getMaster()
+        puts("active master:  %s:%d %d" % [master.getHostname(), master.getPort(), master.getStartcode()])
+        puts("%d backup masters" % [ status.getBackupMastersSize() ])
+        for server in status.getBackupMasters()
+          puts("    %s:%d %d" % \
+            [ server.getHostname(), server.getPort(), server.getStartcode() ])
+        end
         puts("%d live servers" % [ status.getServersSize() ])
         for server in status.getServers()
           puts("    %s:%d %d" % \
@@ -608,7 +685,7 @@ module Hbase
         end
         puts("Aggregate load: %d, regions: %d" % [ load , regions ] )
       else
-        puts "#{status.getServersSize} servers, #{status.getDeadServers} dead, #{'%.4f' % status.getAverageLoad} average load"
+        puts "1 active master, #{status.getBackupMastersSize} backup masters, #{status.getServersSize} servers, #{status.getDeadServers} dead, #{'%.4f' % status.getAverageLoad} average load"
       end
     end
 
@@ -648,6 +725,7 @@ module Hbase
 
       family.setBlockCacheEnabled(JBoolean.valueOf(arg.delete(org.apache.hadoop.hbase.HColumnDescriptor::BLOCKCACHE))) if arg.include?(org.apache.hadoop.hbase.HColumnDescriptor::BLOCKCACHE)
       family.setScope(JInteger.valueOf(arg.delete(org.apache.hadoop.hbase.HColumnDescriptor::REPLICATION_SCOPE))) if arg.include?(org.apache.hadoop.hbase.HColumnDescriptor::REPLICATION_SCOPE)
+      family.setCacheDataOnWrite(JBoolean.valueOf(arg.delete(org.apache.hadoop.hbase.HColumnDescriptor::CACHE_DATA_ON_WRITE))) if arg.include?(org.apache.hadoop.hbase.HColumnDescriptor::CACHE_DATA_ON_WRITE)
       family.setInMemory(JBoolean.valueOf(arg.delete(org.apache.hadoop.hbase.HColumnDescriptor::IN_MEMORY))) if arg.include?(org.apache.hadoop.hbase.HColumnDescriptor::IN_MEMORY)
       family.setTimeToLive(JInteger.valueOf(arg.delete(org.apache.hadoop.hbase.HColumnDescriptor::TTL))) if arg.include?(org.apache.hadoop.hbase.HColumnDescriptor::TTL)
       family.setDataBlockEncoding(org.apache.hadoop.hbase.io.encoding.DataBlockEncoding.valueOf(arg.delete(org.apache.hadoop.hbase.HColumnDescriptor::DATA_BLOCK_ENCODING))) if arg.include?(org.apache.hadoop.hbase.HColumnDescriptor::DATA_BLOCK_ENCODING)
@@ -687,6 +765,9 @@ module Hbase
 
       set_user_metadata(family, arg.delete(METADATA)) if arg[METADATA]
       set_descriptor_config(family, arg.delete(CONFIGURATION)) if arg[CONFIGURATION]
+      family.setDFSReplication(JInteger.valueOf(arg.delete(org.apache.hadoop.hbase.
+        HColumnDescriptor::DFS_REPLICATION))) if arg.include?(org.apache.hadoop.hbase.
+        HColumnDescriptor::DFS_REPLICATION)
 
       arg.each_key do |unknown_key|
         puts("Unknown argument ignored for column family %s: %s" % [name, unknown_key])
@@ -699,8 +780,7 @@ module Hbase
     # Enables/disables a region by name
     def online(region_name, on_off)
       # Open meta table
-      meta = org.apache.hadoop.hbase.client.HTable.new(
-          org.apache.hadoop.hbase.TableName::META_TABLE_NAME)
+      meta = @connection.getTable(org.apache.hadoop.hbase.TableName::META_TABLE_NAME)
 
       # Read region info
       # FIXME: fail gracefully if can't find the region
@@ -756,15 +836,21 @@ module Hbase
     end
 
     #----------------------------------------------------------------------------------------------
-    # Rename specified snapshot
-    def rename_snapshot(old_snapshot_name, new_snapshot_name)
-      @admin.renameSnapshot(old_snapshot_name.to_java_bytes, new_snapshot_name.to_java_bytes)
-    end
-
-    #----------------------------------------------------------------------------------------------
     # Delete specified snapshot
     def delete_snapshot(snapshot_name)
       @admin.deleteSnapshot(snapshot_name.to_java_bytes)
+    end
+
+    #----------------------------------------------------------------------------------------------
+    # Deletes the snapshots matching the given regex
+    def delete_all_snapshot(regex)
+      @admin.deleteSnapshots(regex).to_a
+    end
+
+    #----------------------------------------------------------------------------------------------
+    # Deletes the table snapshots matching the given regex
+    def delete_table_snapshots(tableNameRegex, snapshotNameRegex = ".*")
+      @admin.deleteTableSnapshots(tableNameRegex, snapshotNameRegex).to_a
     end
 
     #----------------------------------------------------------------------------------------------
@@ -772,6 +858,53 @@ module Hbase
     def list_snapshot(regex = ".*")
       @admin.listSnapshots(regex).to_a
     end
+
+    #----------------------------------------------------------------------------------------------
+    # Returns a list of table snapshots
+    def list_table_snapshots(tableNameRegex, snapshotNameRegex = ".*")
+      @admin.listTableSnapshots(tableNameRegex, snapshotNameRegex).to_a
+    end
+
+    #----------------------------------------------------------------------------------------------
+    # Returns a list of regionservers
+    def getRegionServers()
+      return @admin.getClusterStatus.getServers.map { |serverName| serverName }
+    end
+
+    #----------------------------------------------------------------------------------------------
+    # Returns a list of servernames
+    def getServerNames(servers)
+      regionservers = getRegionServers()
+      servernames = []
+
+      if servers.length == 0
+        # if no servers were specified as arguments, get a list of all servers
+        servernames = regionservers
+      else
+        # Strings replace with ServerName objects in servers array
+        i = 0
+        while (i < servers.length)
+          server = servers[i]
+
+          if ServerName.isFullServerName(server)
+            servernames.push(ServerName.valueOf(server))
+          else
+            name_list = server.split(",")
+            j = 0
+            while (j < regionservers.length)
+              sn = regionservers[j]
+              if name_list[0] == sn.hostname and (name_list[1] == nil ? true : (name_list[1] == sn.port.to_s) )
+                servernames.push(sn)
+              end
+              j += 1
+            end
+          end
+          i += 1
+        end
+      end
+
+      return servernames
+    end 
 
     # Apply config specific to a table/column to its descriptor
     def set_descriptor_config(descriptor, config)
@@ -880,5 +1013,10 @@ module Hbase
       @admin.deleteNamespace(namespace_name)
     end
 
+    #----------------------------------------------------------------------------------------------
+    # Get security capabilities
+    def get_security_capabilities
+      @admin.getSecurityCapabilities
+    end
   end
 end

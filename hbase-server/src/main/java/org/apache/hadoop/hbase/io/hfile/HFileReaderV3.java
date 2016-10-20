@@ -27,6 +27,7 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.fs.HFileSystem;
 import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.crypto.Cipher;
@@ -186,6 +187,22 @@ public class HFileReaderV3 extends HFileReaderV2 {
       return kvBufSize;
     }
 
+    @Override
+    public KeyValue getKeyValue() {
+      if (!isSeeked())
+        return null;
+      if (currTagsLen == 0) {
+        // There are no Tags in this KeyValue. Just return NoTagsKeyValue
+        return formNoTagsKeyValue();
+      }
+      KeyValue ret = new KeyValue(blockBuffer.array(), blockBuffer.arrayOffset()
+          + blockBuffer.position(), getCellBufSize());
+      if (this.reader.shouldIncludeMemstoreTS()) {
+        ret.setMvccVersion(currMemstoreTS);
+      }
+      return ret;
+    }
+
     protected void setNonSeekedState() {
       super.setNonSeekedState();
       currTagsLen = 0;
@@ -274,13 +291,9 @@ public class HFileReaderV3 extends HFileReaderV2 {
         }
         if (this.reader.shouldIncludeMemstoreTS()) {
           if (this.reader.decodeMemstoreTS) {
-            try {
-              memstoreTS = Bytes.readVLong(blockBuffer.array(), blockBuffer.arrayOffset()
-                  + blockBuffer.position());
-              memstoreTSLen = WritableUtils.getVIntSize(memstoreTS);
-            } catch (Exception e) {
-              throw new RuntimeException("Error reading memstore timestamp", e);
-            }
+            memstoreTS = Bytes.readAsVLong(blockBuffer.array(), blockBuffer.arrayOffset()
+                + blockBuffer.position());
+            memstoreTSLen = WritableUtils.getVIntSize(memstoreTS);
           } else {
             memstoreTS = 0;
             memstoreTSLen = 1;

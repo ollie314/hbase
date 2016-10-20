@@ -34,6 +34,7 @@ import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.RetriesExhaustedException;
 import org.apache.hadoop.hbase.ipc.RpcClient.FailedServerException;
 import org.apache.hadoop.hbase.ipc.ServerNotRunningYetException;
+import org.apache.hadoop.hbase.master.RegionState;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.AdminService;
 import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;
@@ -49,6 +50,7 @@ import java.net.NoRouteToHostException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import java.util.Locale;
 
 /**
  * Tracks the availability of the catalog tables
@@ -273,6 +275,16 @@ public class CatalogTracker {
     }
     return sn;
   }
+  
+  /**
+   * Get meta region state
+   * @return RegionState
+   */
+  public RegionState getMetaRegionState() {
+    return metaRegionTracker.getMetaRegionState();
+  }
+  
+  
 
   /**
    * Gets a connection to the server hosting meta, as reported by ZooKeeper,
@@ -372,7 +384,7 @@ public class CatalogTracker {
       } else if (cause != null && cause instanceof EOFException) {
         // Catch. Other end disconnected us.
       } else if (cause != null && cause.getMessage() != null &&
-        cause.getMessage().toLowerCase().contains("connection reset")) {
+        cause.getMessage().toLowerCase(Locale.ROOT).contains("connection reset")) {
         // Catch. Connection reset.
       } else {
         throw ioe;

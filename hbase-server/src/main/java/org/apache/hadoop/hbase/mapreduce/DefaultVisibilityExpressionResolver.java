@@ -37,6 +37,7 @@ import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.security.visibility.Authorizations;
+import org.apache.hadoop.hbase.security.visibility.VisibilityConstants;
 import org.apache.hadoop.hbase.security.visibility.VisibilityLabelOrdinalProvider;
 import org.apache.hadoop.hbase.security.visibility.VisibilityUtils;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -69,10 +70,6 @@ public class DefaultVisibilityExpressionResolver implements VisibilityExpression
     HTable labelsTable = null;
     try {
       labelsTable = new HTable(conf, LABELS_TABLE_NAME);
-    } catch (TableNotFoundException e) {
-      // Just return with out doing any thing. When the VC is not used we wont be having 'labels'
-      // table in the cluster.
-      return;
     } catch (IOException e) {
       LOG.error("Error opening 'labels' table", e);
       return;
@@ -89,6 +86,9 @@ public class DefaultVisibilityExpressionResolver implements VisibilityExpression
         byte[] value = next.getValue(LABELS_TABLE_FAMILY, LABEL_QUALIFIER);
         labels.put(Bytes.toString(value), Bytes.toInt(row));
       }
+    } catch (TableNotFoundException e) {
+      // Table not found. So just return
+      return;
     } catch (IOException e) {
       LOG.error("Error reading 'labels' table", e);
     } finally {
@@ -111,7 +111,19 @@ public class DefaultVisibilityExpressionResolver implements VisibilityExpression
     VisibilityLabelOrdinalProvider provider = new VisibilityLabelOrdinalProvider() {
       @Override
       public int getLabelOrdinal(String label) {
-        return labels.get(label);
+        Integer ordinal = null;
+        ordinal = labels.get(label);
+        if (ordinal != null) {
+          return ordinal.intValue();
+        }
+        return VisibilityConstants.NON_EXIST_LABEL_ORDINAL;
+      }
+
+      @Override
+      public String getLabel(int ordinal) {
+        // Unused
+        throw new UnsupportedOperationException(
+            "getLabel should not be used in VisibilityExpressionResolver");
       }
     };
     return VisibilityUtils.createVisibilityExpTags(visExpression, true, false, null, provider);

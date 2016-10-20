@@ -72,8 +72,8 @@ public class RootResource extends ResourceBase {
   @Produces({MIMETYPE_TEXT, MIMETYPE_XML, MIMETYPE_JSON, MIMETYPE_PROTOBUF,
     MIMETYPE_PROTOBUF_IETF})
   public Response get(final @Context UriInfo uriInfo) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("GET " + uriInfo.getAbsolutePath());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("GET " + uriInfo.getAbsolutePath());
     }
     servlet.getMetrics().incrementRequests(1);
     try {
@@ -102,5 +102,10 @@ public class RootResource extends ResourceBase {
   public TableResource getTableResource(
       final @PathParam("table") String table) throws IOException {
     return new TableResource(table);
+  }
+
+  @Path("namespaces")
+  public NamespacesResource getNamespaceResource() throws IOException {
+    return new NamespacesResource();
   }
 }

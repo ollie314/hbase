@@ -27,7 +27,7 @@ import java.security.PrivilegedExceptionAction;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HTable;
@@ -66,7 +66,7 @@ public class TestEnforcingScanLabelGenerator {
     // setup configuration
     conf = TEST_UTIL.getConfiguration();
     VisibilityTestUtil.enableVisiblityLabels(conf);
-    String classes = DefaultScanLabelGenerator.class.getCanonicalName() + " , "
+    String classes = DefinedSetFilterScanLabelGenerator.class.getCanonicalName() + " , "
         + EnforcingScanLabelGenerator.class.getCanonicalName();
     conf.setStrings(VisibilityUtils.VISIBILITY_LABEL_GENERATOR_CLASS, classes);
     conf.set("hbase.superuser", "admin");
@@ -110,6 +110,24 @@ public class TestEnforcingScanLabelGenerator {
           put = new Put(ROW_1);
           put.add(CF, Q3, HConstants.LATEST_TIMESTAMP, value);
           table.put(put);
+          return null;
+        } finally {
+          table.close();
+        }
+      }
+    });
+
+    // Test that super user can see all the cells.
+    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>() {
+      public Void run() throws Exception {
+        HTable table = new HTable(conf, tableName);
+        try {
+          // Test that super user can see all the cells.
+          Get get = new Get(ROW_1);
+          Result result = table.get(get);
+          assertTrue("Missing authorization", result.containsColumn(CF, Q1));
+          assertTrue("Missing authorization", result.containsColumn(CF, Q2));
+          assertTrue("Missing authorization", result.containsColumn(CF, Q3));
           return null;
         } finally {
           table.close();

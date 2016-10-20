@@ -31,6 +31,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.KVComparator;
+import org.apache.hadoop.hbase.NoTagsKeyValue;
 import org.apache.hadoop.hbase.fs.HFileSystem;
 import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoder;
@@ -182,10 +183,14 @@ public class HFileReaderV2 extends AbstractHFileReader {
     if (cacheConf.shouldPrefetchOnOpen()) {
       PrefetchExecutor.request(path, new Runnable() {
         public void run() {
+          long offset = 0;
+          long end = 0;
           try {
-            long offset = 0;
-            long end = fileSize - getTrailer().getTrailerSize();
+            end = getTrailer().getLoadOnOpenDataOffset();
             HFileBlock prevBlock = null;
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Prefetch start " + getPathOffsetEndStr(path, offset, end));
+            }
             while (offset < end) {
               if (Thread.interrupted()) {
                 break;
@@ -201,11 +206,14 @@ public class HFileReaderV2 extends AbstractHFileReader {
           } catch (IOException e) {
             // IOExceptions are probably due to region closes (relocation, etc.)
             if (LOG.isTraceEnabled()) {
-              LOG.trace("Exception encountered while prefetching " + path + ":", e);
+              LOG.trace("Prefetch " + getPathOffsetEndStr(path, offset, end), e);
             }
+          } catch (NullPointerException e) {
+            LOG.warn("Stream moved/closed or prefetch cancelled?" +
+                getPathOffsetEndStr(path, offset, end), e);
           } catch (Exception e) {
             // Other exceptions are interesting
-            LOG.warn("Exception encountered while prefetching " + path + ":", e);
+            LOG.warn("Prefetch " + getPathOffsetEndStr(path, offset, end), e);
           } finally {
             PrefetchExecutor.complete(path);
           }
@@ -221,6 +229,10 @@ public class HFileReaderV2 extends AbstractHFileReader {
       .withCompression(this.compressAlgo)
       .withHBaseCheckSum(trailer.getMinorVersion() >= MINOR_VERSION_WITH_CHECKSUM)
       .build();
+  }
+
+  private static String getPathOffsetEndStr(final Path path, final long offset, final long end) {
+    return "path=" + path.toString() + ", offset=" + offset + ", end=" + end;
   }
 
   /**
@@ -327,11 +339,11 @@ public class HFileReaderV2 extends AbstractHFileReader {
     if (dataBlockIndexReader == null) {
       throw new IOException("Block index not loaded");
     }
-    if (dataBlockOffset < 0
-        || dataBlockOffset >= trailer.getLoadOnOpenDataOffset()) {
-      throw new IOException("Requested block is out of range: "
-          + dataBlockOffset + ", lastDataBlockOffset: "
-          + trailer.getLastDataBlockOffset());
+    long trailerOffset = trailer.getLoadOnOpenDataOffset();
+    if (dataBlockOffset < 0 || dataBlockOffset >= trailerOffset) {
+      throw new IOException("Requested block is out of range: " + dataBlockOffset +
+        ", lastDataBlockOffset: " + trailer.getLastDataBlockOffset() +
+        ", trailer.getLoadOnOpenDataOffset: " + trailerOffset);
     }
     // For any given block from any given file, synchronize reads for said
     // block.
@@ -349,12 +361,11 @@ public class HFileReaderV2 extends AbstractHFileReader {
     TraceScope traceScope = Trace.startSpan("HFileReaderV2.readBlock");
     try {
       while (true) {
-        if (useLock) {
-          lockEntry = offsetLock.getLockEntry(dataBlockOffset);
-        }
-
         // Check cache for block. If found return.
-        if (cacheConf.isBlockCacheEnabled()) {
+        if (cacheConf.shouldReadBlockFromCache(expectedBlockType)) {
+          if (useLock) {
+            lockEntry = offsetLock.getLockEntry(dataBlockOffset);
+          }
           // Try and get the block from the block cache. If the useLock variable is true then this
           // is the second time through the loop and it should not be counted as a block cache miss.
           HFileBlock cachedBlock = (HFileBlock) cacheConf.getBlockCache().getBlock(cacheKey, 
@@ -362,6 +373,9 @@ public class HFileReaderV2 extends AbstractHFileReader {
           if (cachedBlock != null) {
             if (cacheConf.shouldCacheCompressed(cachedBlock.getBlockType().getCategory())) {
               cachedBlock = cachedBlock.unpack(hfileContext, fsBlockReader);
+            }
+            if (Trace.isTracing()) {
+              traceScope.getSpan().addTimelineAnnotation("blockCacheHit");
             }
             assert cachedBlock.isUnpacked() : "Packed block leak.";
             if (cachedBlock.getBlockType().isData()) {
@@ -377,13 +391,14 @@ public class HFileReaderV2 extends AbstractHFileReader {
             }
             return cachedBlock;
           }
+          if (!useLock && cacheBlock && cacheConf.shouldLockOnCacheMiss(expectedBlockType)) {
+            // check cache again with lock
+            useLock = true;
+            continue;
+          }
           // Carry on, please load.
         }
-        if (!useLock) {
-          // check cache again with lock
-          useLock = true;
-          continue;
-        }
+
         if (Trace.isTracing()) {
           traceScope.getSpan().addTimelineAnnotation("blockCacheMiss");
         }
@@ -495,6 +510,10 @@ public class HFileReaderV2 extends AbstractHFileReader {
       extends AbstractHFileReader.Scanner {
     protected HFileBlock block;
 
+    @Override
+    public byte[] getNextIndexedKey() {
+      return nextIndexedKey;
+    }
     /**
      * The next indexed key is to keep track of the indexed key of the next data block.
      * If the nextIndexedKey is HConstants.NO_NEXT_INDEXED_KEY, it means that the
@@ -603,9 +622,12 @@ public class HFileReaderV2 extends AbstractHFileReader {
 
         // It is important that we compute and pass onDiskSize to the block
         // reader so that it does not have to read the header separately to
-        // figure out the size.
+        // figure out the size.  Currently, we do not have a way to do this
+        // correctly in the general case however.
+        // TODO: See https://issues.apache.org/jira/browse/HBASE-14576
+        int prevBlockSize = -1;
         seekToBlock = reader.readBlock(previousBlockOffset,
-            seekToBlock.getOffset() - previousBlockOffset, cacheBlocks,
+            prevBlockSize, cacheBlocks,
             pread, isCompaction, true, BlockType.DATA);
         // TODO shortcut: seek forward in this block to the last key of the
         // block.
@@ -677,7 +699,12 @@ public class HFileReaderV2 extends AbstractHFileReader {
       if (!isSeeked())
         return null;
 
-      KeyValue ret = new KeyValue(blockBuffer.array(), blockBuffer.arrayOffset()
+      // HFile V2 do not support tags.
+      return formNoTagsKeyValue();
+    }
+
+    protected KeyValue formNoTagsKeyValue() {
+      KeyValue ret = new NoTagsKeyValue(blockBuffer.array(), blockBuffer.arrayOffset()
           + blockBuffer.position(), getCellBufSize());
       if (this.reader.shouldIncludeMemstoreTS()) {
         ret.setMvccVersion(currMemstoreTS);
@@ -870,13 +897,9 @@ public class HFileReaderV2 extends AbstractHFileReader {
     protected void readMvccVersion() {
       if (this.reader.shouldIncludeMemstoreTS()) {
         if (this.reader.decodeMemstoreTS) {
-          try {
-            currMemstoreTS = Bytes.readVLong(blockBuffer.array(), blockBuffer.arrayOffset()
-                + blockBuffer.position());
-            currMemstoreTSLen = WritableUtils.getVIntSize(currMemstoreTS);
-          } catch (Exception e) {
-            throw new RuntimeException("Error reading memstore timestamp", e);
-          }
+          currMemstoreTS = Bytes.readAsVLong(blockBuffer.array(), blockBuffer.arrayOffset()
+              + blockBuffer.position());
+          currMemstoreTSLen = WritableUtils.getVIntSize(currMemstoreTS);
         } else {
           currMemstoreTS = 0;
           currMemstoreTSLen = 1;
@@ -912,15 +935,10 @@ public class HFileReaderV2 extends AbstractHFileReader {
         blockBuffer.reset();
         if (this.reader.shouldIncludeMemstoreTS()) {
           if (this.reader.decodeMemstoreTS) {
-            try {
-              int memstoreTSOffset = blockBuffer.arrayOffset()
-                  + blockBuffer.position() + KEY_VALUE_LEN_SIZE + klen + vlen;
-              memstoreTS = Bytes.readVLong(blockBuffer.array(),
-                  memstoreTSOffset);
-              memstoreTSLen = WritableUtils.getVIntSize(memstoreTS);
-            } catch (Exception e) {
-              throw new RuntimeException("Error reading memstore timestamp", e);
-            }
+            int memstoreTSOffset = blockBuffer.arrayOffset() + blockBuffer.position()
+                + KEY_VALUE_LEN_SIZE + klen + vlen;
+            memstoreTS = Bytes.readAsVLong(blockBuffer.array(), memstoreTSOffset);
+            memstoreTSLen = WritableUtils.getVIntSize(memstoreTS);
           } else {
             memstoreTS = 0;
             memstoreTSLen = 1;

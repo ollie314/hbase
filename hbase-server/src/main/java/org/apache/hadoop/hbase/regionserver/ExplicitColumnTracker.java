@@ -44,7 +44,7 @@ import org.apache.hadoop.hbase.util.Bytes;
  * <ul><li>{@link #getNextRowOrNextColumn} is called whenever ScanQueryMatcher
  * believes that the current column should be skipped (by timestamp, filter etc.)
  * <p>
- * These two methods returns a 
+ * These two methods returns a
  * {@link org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode}
  * to define what action should be taken.
  * <p>
@@ -55,10 +55,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
 
   private final int maxVersions;
   private final int minVersions;
-
-  // hint for the tracker about how many KVs we will attempt to search via next()
-  // before we schedule a (re)seek operation
-  private final int lookAhead; 
 
  /**
   * Contains the list of columns that the ExplicitColumnTracker is tracking.
@@ -72,7 +68,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
    * Used to eliminate duplicates. */
   private long latestTSOfCurrentColumn;
   private long oldestStamp;
-  private int skipCount;
 
   /**
    * Default constructor.
@@ -80,15 +75,12 @@ public class ExplicitColumnTracker implements ColumnTracker {
    * @param minVersions minimum number of versions to keep
    * @param maxVersions maximum versions to return per column
    * @param oldestUnexpiredTS the oldest timestamp we are interested in,
-   *  based on TTL 
-   * @param lookAhead number of KeyValues to look ahead via next before
-   *  (re)seeking
+   *  based on TTL
    */
   public ExplicitColumnTracker(NavigableSet<byte[]> columns, int minVersions,
-      int maxVersions, long oldestUnexpiredTS, int lookAhead) {
+      int maxVersions, long oldestUnexpiredTS) {
     this.maxVersions = maxVersions;
     this.minVersions = minVersions;
-    this.lookAhead = lookAhead;
     this.oldestStamp = oldestUnexpiredTS;
     this.columns = new ColumnCount[columns.size()];
     int i=0;
@@ -144,8 +136,7 @@ public class ExplicitColumnTracker implements ColumnTracker {
       if (ret > 0) {
         // The current KV is smaller than the column the ExplicitColumnTracker
         // is interested in, so seek to that column of interest.
-        return this.skipCount++ < this.lookAhead ? ScanQueryMatcher.MatchCode.SKIP
-            : ScanQueryMatcher.MatchCode.SEEK_NEXT_COL;
+        return ScanQueryMatcher.MatchCode.SEEK_NEXT_COL;
       }
 
       // The current KV is bigger than the column the ExplicitColumnTracker
@@ -154,7 +145,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
       // column of interest, and check again.
       if (ret <= -1) {
         ++this.index;
-        this.skipCount = 0;
         if (done()) {
           // No more to match, do not include, done with this row.
           return ScanQueryMatcher.MatchCode.SEEK_NEXT_ROW; // done_row
@@ -179,7 +169,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
     if (count >= maxVersions || (count >= minVersions && isExpired(timestamp))) {
       // Done with versions for this column
       ++this.index;
-      this.skipCount = 0;
       resetTS();
       if (done()) {
         // We have served all the requested columns.
@@ -198,7 +187,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
   // Called between every row.
   public void reset() {
     this.index = 0;
-    this.skipCount = 0;
     this.column = this.columns[this.index];
     for(ColumnCount col : this.columns) {
       col.setCount(0);
@@ -238,7 +226,6 @@ public class ExplicitColumnTracker implements ColumnTracker {
       resetTS();
       if (compare <= 0) {
         ++this.index;
-        this.skipCount = 0;
         if (done()) {
           // Will not hit any more columns in this storefile
           this.column = null;

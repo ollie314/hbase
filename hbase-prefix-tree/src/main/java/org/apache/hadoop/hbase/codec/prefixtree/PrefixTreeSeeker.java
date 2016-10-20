@@ -84,14 +84,6 @@ public class PrefixTreeSeeker implements EncodedSeeker {
    * currently must do deep copy into new array
    */
   @Override
-  public ByteBuffer getKeyValueBuffer() {
-    return KeyValueUtil.copyToNewByteBuffer(ptSearcher.current());
-  }
-
-  /**
-   * currently must do deep copy into new array
-   */
-  @Override
   public KeyValue getKeyValue() {
     if (ptSearcher.current() == null) {
       return null;
@@ -120,14 +112,9 @@ public class PrefixTreeSeeker implements EncodedSeeker {
 
   @Override
   public boolean next() {
-    boolean advance = ptSearcher.advance();
-    if (ptSearcher.hasMovedToPreviousAsPartOfSeek()) {
-      ptSearcher.setMovedToPreviousAsPartOfSeek(false);
-    }
-    return advance;
+    return ptSearcher.advance();
   }
 
-//  @Override
   public boolean advance() {
     return ptSearcher.advance();
   }
@@ -210,7 +197,6 @@ public class PrefixTreeSeeker implements EncodedSeeker {
     if(CellScannerPosition.AFTER == position){
       if(!ptSearcher.isBeforeFirst()){
         ptSearcher.previous();
-        ptSearcher.setMovedToPreviousAsPartOfSeek(true);
       }
       return 1;
     }

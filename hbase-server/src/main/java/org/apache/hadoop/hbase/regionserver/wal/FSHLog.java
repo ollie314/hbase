@@ -36,7 +36,6 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -62,6 +61,7 @@ import org.apache.hadoop.hbase.util.DrainBarrier;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HasThread;
+import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.util.StringUtils;
 import org.cloudera.htrace.Trace;
 import org.cloudera.htrace.TraceScope;
@@ -111,6 +111,8 @@ import com.google.common.annotations.VisibleForTesting;
 class FSHLog implements HLog, Syncable {
   static final Log LOG = LogFactory.getLog(FSHLog.class);
 
+  private static final int DEFAULT_SLOW_SYNC_TIME_MS = 100; // in ms
+
   private final FileSystem fs;
   private final Path rootDir;
   private final Path dir;
@@ -137,6 +139,9 @@ class FSHLog implements HLog, Syncable {
   // rollWriter will be triggered
   private int minTolerableReplication;
   private Method getNumCurrentReplicas; // refers to DFSOutputStream.getNumCurrentReplicas
+  private final Method getPipeLine; // refers to DFSOutputStream.getPipeLine
+  private final int slowSyncNs;
+
   final static Object [] NO_ARGS = new Object []{};
 
   /** The barrier used to ensure that close() waits for all log rolls and flushes to finish. */
@@ -417,8 +422,12 @@ class FSHLog implements HLog, Syncable {
     // rollWriter sets this.hdfs_out if it can.
     rollWriter();
 
+    this.slowSyncNs =
+        1000000 * conf.getInt("hbase.regionserver.hlog.slowsync.ms",
+          DEFAULT_SLOW_SYNC_TIME_MS);
     // handle the reflection necessary to call getNumCurrentReplicas()
     this.getNumCurrentReplicas = getGetNumCurrentReplicas(this.hdfs_out);
+    this.getPipeLine = getGetPipeline(this.hdfs_out);
 
     final String n = Thread.currentThread().getName();
 
@@ -439,6 +448,7 @@ class FSHLog implements HLog, Syncable {
     coprocessorHost = new WALCoprocessorHost(this, conf);
 
     this.metrics = new MetricsWAL();
+    registerWALActionsListener(metrics);
   }
 
   /**
@@ -1232,7 +1242,7 @@ class FSHLog implements HLog, Syncable {
               // we need fail all the writes with txid <= txidToSync to avoid
               // 'data loss' where user get successful write response but can't
               // read the writes!
-              LOG.fatal("should never happen: has unsynced writes but writer is null!");
+              LOG.error("should never happen: has unsynced writes but writer is null!");
               asyncIOE = new IOException("has unsynced writes but writer is null!");
               failedTxid.set(this.txidToSync);
             } else {
@@ -1242,7 +1252,7 @@ class FSHLog implements HLog, Syncable {
             }
             postSync();
           } catch (IOException e) {
-            LOG.fatal("Error while AsyncSyncer sync, request close of hlog ", e);
+            LOG.warn("Error while AsyncSyncer sync, request close of hlog ", e);
             requestLogRoll();
 
             asyncIOE = e;
@@ -1250,7 +1260,16 @@ class FSHLog implements HLog, Syncable {
 
             this.isSyncing = false;
           }
-          metrics.finishSync(EnvironmentEdgeManager.currentTimeMillis() - now);
+          final long took = EnvironmentEdgeManager.currentTimeMillis() - now;
+          metrics.finishSync(took);
+          if (took > (slowSyncNs/1000000)) {
+            String msg =
+                new StringBuilder().append("Slow sync cost: ")
+                    .append(took).append(" ms, current pipeline: ")
+                    .append(Arrays.toString(getPipeLine())).toString();
+            Trace.addTimelineAnnotation(msg);
+            LOG.info(msg);
+          }
 
           // 3. wake up AsyncNotifier to notify(wake-up) all pending 'put'
           // handler threads on 'sync()'
@@ -1258,16 +1277,16 @@ class FSHLog implements HLog, Syncable {
           asyncNotifier.setFlushedTxid(this.lastSyncedTxid);
 
           // 4. check and do logRoll if needed
-          boolean logRollNeeded = false;
+          boolean lowReplication = false;
           if (rollWriterLock.tryLock()) {
             try {
-              logRollNeeded = checkLowReplication();
+              lowReplication = checkLowReplication();
             } finally {
               rollWriterLock.unlock();
             }            
             try {
-              if (logRollNeeded || writer != null && writer.getLength() > logrollsize) {
-                requestLogRoll();
+              if (lowReplication || writer != null && writer.getLength() > logrollsize) {
+                requestLogRoll(lowReplication);
               }
             } catch (IOException e) {
               LOG.warn("writer.getLength() failed,this failure won't block here");
@@ -1384,7 +1403,8 @@ class FSHLog implements HLog, Syncable {
             LOG.warn("HDFS pipeline error detected. " + "Found "
                 + numCurrentReplicas + " replicas but expecting no less than "
                 + this.minTolerableReplication + " replicas. "
-                + " Requesting close of hlog.");
+                + " Requesting close of hlog. current pipeline: "
+                + Arrays.toString(getPipeLine()));
             logRollNeeded = true;
             // If rollWriter is requested, increase consecutiveLogRolls. Once it
             // is larger than lowReplicationRollLimit, disable the
@@ -1467,9 +1487,13 @@ class FSHLog implements HLog, Syncable {
   }
 
   private void requestLogRoll() {
+    requestLogRoll(false);
+  }
+
+  private void requestLogRoll(boolean tooFewReplicas) {
     if (!this.listeners.isEmpty()) {
       for (WALActionsListener i: this.listeners) {
-        i.logRollRequested();
+        i.logRollRequested(tooFewReplicas);
       }
     }
   }
@@ -1505,7 +1529,7 @@ class FSHLog implements HLog, Syncable {
       }
       this.metrics.finishAppend(took, len);
     } catch (IOException e) {
-      LOG.fatal("Could not append. Requesting close of hlog", e);
+      LOG.warn("Could not append. Requesting close of hlog", e);
       requestLogRoll();
       throw e;
     }
@@ -1691,5 +1715,52 @@ class FSHLog implements HLog, Syncable {
       usage();
       System.exit(-1);
     }
+  }
+
+  /**
+   * Find the 'getPipeline' on the passed <code>os</code> stream.
+   * @return Method or null.
+   */
+  private Method getGetPipeline(final FSDataOutputStream os) {
+    Method m = null;
+    if (os != null) {
+      Class<? extends OutputStream> wrappedStreamClass = os.getWrappedStream()
+          .getClass();
+      try {
+        m = wrappedStreamClass.getDeclaredMethod("getPipeline",
+          new Class<?>[] {});
+        m.setAccessible(true);
+      } catch (NoSuchMethodException e) {
+        LOG.info("FileSystem's output stream doesn't support"
+            + " getPipeline; not available; fsOut="
+            + wrappedStreamClass.getName());
+      } catch (SecurityException e) {
+        LOG.info(
+          "Doesn't have access to getPipeline on "
+              + "FileSystems's output stream ; fsOut="
+              + wrappedStreamClass.getName(), e);
+        m = null; // could happen on setAccessible()
+      }
+    }
+    return m;
+  }
+
+  /**
+   * This method gets the pipeline for the current HLog.
+   * @return
+   */
+  DatanodeInfo[] getPipeLine() {
+    if (this.getPipeLine != null && this.hdfs_out != null) {
+      Object repl;
+      try {
+        repl = this.getPipeLine.invoke(getOutputStream(), NO_ARGS);
+        if (repl instanceof DatanodeInfo[]) {
+          return ((DatanodeInfo[]) repl);
+        }
+      } catch (Exception e) {
+        LOG.info("Get pipeline failed", e);
+      }
+    }
+    return new DatanodeInfo[0];
   }
 }

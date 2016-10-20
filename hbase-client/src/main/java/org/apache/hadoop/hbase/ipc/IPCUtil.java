@@ -22,6 +22,7 @@ import java.io.DataInput;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 
 import org.apache.commons.io.IOUtils;
@@ -30,8 +31,12 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.CellScanner;
+import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseIOException;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.codec.Codec;
+import org.apache.hadoop.hbase.io.BoundedByteBufferPool;
+import org.apache.hadoop.hbase.io.ByteBufferInputStream;
 import org.apache.hadoop.hbase.io.ByteBufferOutputStream;
 import org.apache.hadoop.hbase.io.HeapSize;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -49,6 +54,7 @@ import com.google.protobuf.Message;
 /**
  * Utility to help ipc'ing.
  */
+@InterfaceAudience.Private
 class IPCUtil {
   public static final Log LOG = LogFactory.getLog(IPCUtil.class);
   /**
@@ -63,6 +69,7 @@ class IPCUtil {
     this.conf = conf;
     this.cellBlockDecompressionMultiplier =
         conf.getInt("hbase.ipc.cellblock.decompression.buffersize.multiplier", 3);
+
     // Guess that 16k is a good size for rpc buffer.  Could go bigger.  See the TODO below in
     // #buildCellBlock.
     this.cellBlockBuildingInitialBufferSize =
@@ -72,6 +79,7 @@ class IPCUtil {
   /**
    * Thrown if a cellscanner but no codec to encode it with.
    */
+  @InterfaceAudience.Private
   public static class CellScannerButNoCodecException extends HBaseIOException {};
 
   /**
@@ -89,23 +97,48 @@ class IPCUtil {
   ByteBuffer buildCellBlock(final Codec codec, final CompressionCodec compressor,
     final CellScanner cellScanner)
   throws IOException {
+    return buildCellBlock(codec, compressor, cellScanner, null);
+  }
+
+  /**
+   * Puts CellScanner Cells into a cell block using passed in <code>codec</code> and/or
+   * <code>compressor</code>.
+   * @param codec
+   * @param compressor
+   * @param cellScanner
+   * @param pool Pool of ByteBuffers to make use of. Can be null and then we'll allocate
+   * our own ByteBuffer.
+   * @return Null or byte buffer filled with a cellblock filled with passed-in Cells encoded using
+   * passed in <code>codec</code> and/or <code>compressor</code>; the returned buffer has been
+   * flipped and is ready for reading.  Use limit to find total size. If <code>pool</code> was not
+   * null, then this returned ByteBuffer came from there and should be returned to the pool when
+   * done.
+   * @throws IOException
+   */
+  @SuppressWarnings("resource")
+  public ByteBuffer buildCellBlock(final Codec codec, final CompressionCodec compressor,
+    final CellScanner cellScanner, final BoundedByteBufferPool pool)
+  throws IOException {
     if (cellScanner == null) return null;
     if (codec == null) throw new CellScannerButNoCodecException();
     int bufferSize = this.cellBlockBuildingInitialBufferSize;
-    if (cellScanner instanceof HeapSize) {
-      long longSize = ((HeapSize)cellScanner).heapSize();
-      // Just make sure we don't have a size bigger than an int.
-      if (longSize > Integer.MAX_VALUE) {
-        throw new IOException("Size " + longSize + " > " + Integer.MAX_VALUE);
+    ByteBufferOutputStream baos = null;
+    if (pool != null) {
+      ByteBuffer bb = pool.getBuffer();
+      bufferSize = bb.capacity();
+      baos = new ByteBufferOutputStream(bb);
+    } else {
+      // Then we need to make our own to return.
+      if (cellScanner instanceof HeapSize) {
+        long longSize = ((HeapSize)cellScanner).heapSize();
+        // Just make sure we don't have a size bigger than an int.
+        if (longSize > Integer.MAX_VALUE) {
+          throw new IOException("Size " + longSize + " > " + Integer.MAX_VALUE);
+        }
+        bufferSize = ClassSize.align((int)longSize);
       }
-      bufferSize = ClassSize.align((int)longSize);
-    } // TODO: Else, get estimate on size of buffer rather than have the buffer resize.
-    // See TestIPCUtil main for experiment where we spin through the Cells getting estimate of
-    // total size before creating the buffer.  It costs somw small percentage.  If we are usually
-    // within the estimated buffer size, then the cost is not worth it.  If we are often well
-    // outside the guesstimated buffer size, the processing can be done in half the time if we
-    // go w/ the estimated size rather than let the buffer resize.
-    ByteBufferOutputStream baos = new ByteBufferOutputStream(bufferSize);
+      baos = new ByteBufferOutputStream(bufferSize);
+    }
     OutputStream os = baos;
     Compressor poolCompressor = null;
     try {
@@ -124,6 +157,8 @@ class IPCUtil {
       // If no cells, don't mess around.  Just return null (could be a bunch of existence checking
       // gets or something -- stuff that does not return a cell).
       if (count == 0) return null;
+    } catch (BufferOverflowException e) {
+      throw new DoNotRetryIOException(e);
     } finally {
       os.close();
       if (poolCompressor != null) CodecPool.returnCompressor(poolCompressor);
@@ -146,19 +181,18 @@ class IPCUtil {
   CellScanner createCellScanner(final Codec codec, final CompressionCodec compressor,
       final byte [] cellBlock)
   throws IOException {
-    return createCellScanner(codec, compressor, cellBlock, 0, cellBlock.length);
+    return createCellScanner(codec, compressor, ByteBuffer.wrap(cellBlock));
   }
 
   /**
    * @param codec
-   * @param cellBlock
-   * @param offset
-   * @param length
+   * @param cellBlock ByteBuffer containing the cells written by the Codec. The buffer should be
+   * position()'ed at the start of the cell block and limit()'ed at the end.
    * @return CellScanner to work against the content of <code>cellBlock</code>
    * @throws IOException
    */
   CellScanner createCellScanner(final Codec codec, final CompressionCodec compressor,
-      final byte [] cellBlock, final int offset, final int length)
+      final ByteBuffer cellBlock)
   throws IOException {
     // If compressed, decompress it first before passing it on else we will leak compression
     // resources if the stream is not closed properly after we let it out.
@@ -168,13 +202,12 @@ class IPCUtil {
       if (compressor instanceof Configurable) ((Configurable)compressor).setConf(this.conf);
       Decompressor poolDecompressor = CodecPool.getDecompressor(compressor);
       CompressionInputStream cis =
-        compressor.createInputStream(new ByteArrayInputStream(cellBlock, offset, length),
-        poolDecompressor);
+        compressor.createInputStream(new ByteBufferInputStream(cellBlock), poolDecompressor);
       ByteBufferOutputStream bbos = null;
       try {
         // TODO: This is ugly.  The buffer will be resized on us if we guess wrong.
         // TODO: Reuse buffers.
-        bbos = new ByteBufferOutputStream((length - offset) *
+        bbos = new ByteBufferOutputStream(cellBlock.remaining() *
           this.cellBlockDecompressionMultiplier);
         IOUtils.copy(cis, bbos);
         bbos.close();
@@ -187,7 +220,7 @@ class IPCUtil {
         CodecPool.returnDecompressor(poolDecompressor);
       }
     } else {
-      is = new ByteArrayInputStream(cellBlock, offset, length);
+      is = new ByteBufferInputStream(cellBlock);
     }
     return codec.getDecoder(is);
   }

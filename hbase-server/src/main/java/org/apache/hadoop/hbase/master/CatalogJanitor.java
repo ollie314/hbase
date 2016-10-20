@@ -97,7 +97,11 @@ public class CatalogJanitor extends Chore {
   @Override
   protected void chore() {
     try {
-      if (this.enabled.get()) {
+      AssignmentManager am = this.services.getAssignmentManager();
+      if (this.enabled.get()
+          && am != null
+          && am.isFailoverCleanupDone()
+          && am.getRegionStates().getRegionsInTransition().size() == 0) {
         scan();
       } else {
         LOG.warn("CatalogJanitor disabled! Not running scan.");
@@ -200,6 +204,8 @@ public class CatalogJanitor extends Chore {
       HFileArchiver.archiveRegion(this.services.getConfiguration(), fs, regionA);
       HFileArchiver.archiveRegion(this.services.getConfiguration(), fs, regionB);
       MetaEditor.deleteMergeQualifiers(server.getCatalogTracker(), mergedRegion);
+      services.getServerManager().removeRegion(regionA);
+      services.getServerManager().removeRegion(regionB);
       return true;
     }
     return false;
@@ -332,6 +338,7 @@ public class CatalogJanitor extends Chore {
       if (LOG.isTraceEnabled()) LOG.trace("Archiving parent region: " + parent);
       HFileArchiver.archiveRegion(this.services.getConfiguration(), fs, parent);
       MetaEditor.deleteRegion(this.server.getCatalogTracker(), parent);
+      services.getServerManager().removeRegion(parent);
       result = true;
     }
     return result;
@@ -367,22 +374,35 @@ public class CatalogJanitor extends Chore {
     Path rootdir = this.services.getMasterFileSystem().getRootDir();
     Path tabledir = FSUtils.getTableDir(rootdir, daughter.getTable());
 
+    Path daughterRegionDir = new Path(tabledir, daughter.getEncodedName());
+
     HRegionFileSystem regionFs = null;
+
     try {
-      regionFs = HRegionFileSystem.openRegionFromFileSystem(
-          this.services.getConfiguration(), fs, tabledir, daughter, true);
-    } catch (IOException e) {
-      LOG.warn("Daughter region does not exist: " + daughter.getEncodedName()
-        + ", parent is: " + parent.getEncodedName());
-      return new Pair<Boolean, Boolean>(Boolean.FALSE, Boolean.FALSE);
+      if (!FSUtils.isExists(fs, daughterRegionDir)) {
+        return new Pair<Boolean, Boolean>(Boolean.FALSE, Boolean.FALSE);
+      }
+    } catch (IOException ioe) {
+      LOG.error("Error trying to determine if daughter region exists, " +
+               "assuming exists and has references", ioe);
+      return new Pair<Boolean, Boolean>(Boolean.TRUE, Boolean.TRUE);
     }
 
     boolean references = false;
     HTableDescriptor parentDescriptor = getTableDescriptor(parent.getTable());
-    for (HColumnDescriptor family: parentDescriptor.getFamilies()) {
-      if ((references = regionFs.hasReferences(family.getNameAsString()))) {
-        break;
+    try {
+      regionFs = HRegionFileSystem.openRegionFromFileSystem(
+          this.services.getConfiguration(), fs, tabledir, daughter, true);
+      
+      for (HColumnDescriptor family: parentDescriptor.getFamilies()) {
+        if ((references = regionFs.hasReferences(family.getNameAsString()))) {
+          break;
+        }
       }
+    } catch (IOException e) {
+      LOG.error("Error trying to determine referenced files from : " + daughter.getEncodedName()
+          + ", to: " + parent.getEncodedName() + " assuming has references", e);
+      return new Pair<Boolean, Boolean>(Boolean.TRUE, Boolean.TRUE);
     }
     return new Pair<Boolean, Boolean>(Boolean.TRUE, Boolean.valueOf(references));
   }

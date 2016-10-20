@@ -61,7 +61,8 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.TableExistsException;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
@@ -81,15 +82,19 @@ import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.hfile.TestHFile;
 import org.apache.hadoop.hbase.master.AssignmentManager;
 import org.apache.hadoop.hbase.master.HMaster;
+import org.apache.hadoop.hbase.master.RegionState;
 import org.apache.hadoop.hbase.master.RegionStates;
 import org.apache.hadoop.hbase.master.TableLockManager;
 import org.apache.hadoop.hbase.master.TableLockManager.TableLock;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos;
+import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.HRegionFileSystem;
 import org.apache.hadoop.hbase.regionserver.HRegionServer;
+import org.apache.hadoop.hbase.regionserver.SplitTransaction;
 import org.apache.hadoop.hbase.regionserver.TestEndToEndSplitTransaction;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.util.HBaseFsck.ErrorReporter;
 import org.apache.hadoop.hbase.util.HBaseFsck.ErrorReporter.ERROR_CODE;
 import org.apache.hadoop.hbase.util.HBaseFsck.HbckInfo;
@@ -98,9 +103,11 @@ import org.apache.hadoop.hbase.util.HBaseFsck.TableInfo;
 import org.apache.hadoop.hbase.util.hbck.HFileCorruptionChecker;
 import org.apache.hadoop.hbase.util.hbck.HbckTestingUtil;
 import org.apache.hadoop.hbase.zookeeper.MetaRegionTracker;
+import org.apache.hadoop.hbase.zookeeper.ZKAssign;
 import org.apache.zookeeper.KeeperException;
 import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -137,6 +144,7 @@ public class TestHBaseFsck {
   public static void setUpBeforeClass() throws Exception {
     TEST_UTIL.getConfiguration().setInt("hbase.regionserver.handler.count", 2);
     TEST_UTIL.getConfiguration().setInt("hbase.regionserver.metahandler.count", 2);
+    TEST_UTIL.getConfiguration().setInt("hbase.hbck.close.timeout", 2 * REGION_ONLINE_TIMEOUT);
     TEST_UTIL.startMiniCluster(3);
     TEST_UTIL.setHDFSClientRetry(0);
 
@@ -381,7 +389,7 @@ public class TestHBaseFsck {
   }
 
   /**
-   * Counts the number of row to verify data loss or non-dataloss.
+   * Counts the number of rows to verify data loss or non-dataloss.
    */
   int countRows() throws IOException {
      Scan s = new Scan();
@@ -393,6 +401,18 @@ public class TestHBaseFsck {
      return i;
   }
 
+  /**
+   * Counts the number of rows to verify data loss or non-dataloss.
+   */
+  int countRows(byte[] start, byte[] end) throws IOException {
+    Scan s = new Scan(start, end);
+    ResultScanner rs = tbl.getScanner(s);
+    int i = 0;
+    while (rs.next() != null) {
+      i++;
+    }
+    return i;
+  }  
   /**
    * delete table in preparation for next test
    *
@@ -1027,6 +1047,54 @@ public class TestHBaseFsck {
   }
 
   /**
+   * This creates and fixes a bad table with a missing region -- hole in meta and data present but
+   * .regioninfo missing (an orphan hdfs region)in the fs. At last we check every row was present
+   * at the correct region.
+   */
+  @Test(timeout = 180000)
+  public void testHDFSRegioninfoMissingAndCheckRegionBoundary() throws Exception {
+    TableName table = TableName.valueOf("testHDFSRegioninfoMissingAndCheckRegionBoundary");
+    try {
+      setupTable(table);
+      assertEquals(ROWKEYS.length, countRows());
+  
+      // Mess it up by leaving a hole in the meta data
+      HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+      admin.disableTable(table);
+      deleteRegion(conf, tbl.getTableDescriptor(), Bytes.toBytes("B"), Bytes.toBytes("C"), true,
+        true, false, true);
+      admin.enableTable(table);
+  
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck,
+        new HBaseFsck.ErrorReporter.ERROR_CODE[] {
+            HBaseFsck.ErrorReporter.ERROR_CODE.ORPHAN_HDFS_REGION,
+            HBaseFsck.ErrorReporter.ERROR_CODE.NOT_IN_META_OR_DEPLOYED,
+            HBaseFsck.ErrorReporter.ERROR_CODE.HOLE_IN_REGION_CHAIN });
+      // holes are separate from overlap groups
+      assertEquals(0, hbck.getOverlapGroups(table).size());
+  
+      // fix hole
+      doFsck(conf, true);
+  
+      // check that hole fixed
+      assertNoErrors(doFsck(conf, false));
+  
+      // check data belong to the correct region,every scan should get one row.
+      for (int i = 0; i < ROWKEYS.length; i++) {
+        if (i != ROWKEYS.length - 1) {
+          assertEquals(1, countRows(ROWKEYS[i], ROWKEYS[i + 1]));
+        } else {
+          assertEquals(1, countRows(ROWKEYS[i], null));
+        }
+      }
+  
+    } finally {
+      deleteTable(table);
+    }
+  }
+    
+  /**
    * This creates and fixes a bad table with a region that is missing meta and
    * not assigned to a region server.
    */
@@ -1419,7 +1487,8 @@ public class TestHBaseFsck {
       // TODO: fixHdfsHoles does not work against splits, since the parent dir lingers on
       // for some time until children references are deleted. HBCK erroneously sees this as
       // overlapping regions
-      HBaseFsck hbck = doFsck(conf, true, true, false, false, false, true, true, true, false, false, null);
+      HBaseFsck hbck = doFsck(
+        conf, true, true, false, false, false, true, true, true, false, false, false, null);
       assertErrors(hbck, new ERROR_CODE[] {}); //no LINGERING_SPLIT_PARENT reported
 
       // assert that the split hbase:meta entry is still there.
@@ -1482,7 +1551,8 @@ public class TestHBaseFsck {
           ERROR_CODE.NOT_IN_META_OR_DEPLOYED, ERROR_CODE.HOLE_IN_REGION_CHAIN}); //no LINGERING_SPLIT_PARENT
 
       // now fix it. The fix should not revert the region split, but add daughters to META
-      hbck = doFsck(conf, true, true, false, false, false, false, false, false, false, false, null);
+      hbck = doFsck(
+        conf, true, true, false, false, false, false, false, false, false, false, false, null);
       assertErrors(hbck, new ERROR_CODE[] {ERROR_CODE.NOT_IN_META_OR_DEPLOYED,
           ERROR_CODE.NOT_IN_META_OR_DEPLOYED, ERROR_CODE.HOLE_IN_REGION_CHAIN});
 
@@ -1523,6 +1593,34 @@ public class TestHBaseFsck {
 
       HBaseFsck hbck = doFsck(conf, false);
       assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.FIRST_REGION_STARTKEY_NOT_EMPTY });
+      // fix hole
+      doFsck(conf, true);
+      // check that hole fixed
+      assertNoErrors(doFsck(conf, false));
+    } finally {
+      deleteTable(table);
+    }
+  }
+
+  /**
+   * This creates and fixes a bad table with a missing region which is the 1st region -- hole in
+   * meta and data missing in the fs.
+   */
+  @Test(timeout=120000)
+  public void testRegionDeployedNotInHdfs() throws Exception {
+    TableName table =
+        TableName.valueOf("testSingleRegionDeployedNotInHdfs");
+    try {
+      setupTable(table);
+      TEST_UTIL.getHBaseAdmin().flush(table.getName());
+
+      // Mess it up by deleting region dir
+      deleteRegion(conf, tbl.getTableDescriptor(),
+        HConstants.EMPTY_START_ROW, Bytes.toBytes("A"), false,
+        false, true);
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.NOT_IN_HDFS });
       // fix hole
       doFsck(conf, true);
       // check that hole fixed
@@ -2102,7 +2200,7 @@ public class TestHBaseFsck {
     }
   }
 
-  @Test(timeout=60000)
+  @Test(timeout=180000)
   public void testCheckTableLocks() throws Exception {
     IncrementingEnvironmentEdge edge = new IncrementingEnvironmentEdge(0);
     EnvironmentEdgeManager.injectEdge(edge);
@@ -2169,6 +2267,55 @@ public class TestHBaseFsck {
         "should acquire without blocking");
     writeLock.acquire(); // this should not block.
     writeLock.release(); // release for clean state
+  }
+
+  /**
+   * Test orphaned table ZNode (for table states)
+   */
+  @Test
+  public void testOrphanedTableZNode() throws Exception {
+    TableName table = TableName.valueOf("testOrphanedZKTableEntry");
+
+    try {
+      TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager().getZKTable().
+      setEnablingTable(table);
+
+      try {
+        setupTable(table);
+        Assert.fail(
+          "Create table should fail when its ZNode has already existed with ENABLING state.");
+      } catch(TableExistsException t) {
+        //Expected exception
+      }
+      // The setup table was interrupted in some state that needs to some cleanup.
+      try {
+        deleteTable(table);
+      } catch (IOException e) {
+        // Because create table failed, it is expected that the cleanup table would
+        // throw some exception.  Ignore and continue.
+      }
+
+      HBaseFsck hbck = doFsck(conf, false);
+      assertTrue(hbck.getErrors().getErrorList().contains(ERROR_CODE.ORPHANED_ZK_TABLE_ENTRY));
+
+      // fix the orphaned ZK entry
+      hbck = doFsck(conf, true);
+
+      // check that orpahned ZK table entry is gone.
+      hbck = doFsck(conf, false);
+      assertFalse(hbck.getErrors().getErrorList().contains(ERROR_CODE.ORPHANED_ZK_TABLE_ENTRY));
+      // Now create table should succeed.
+      setupTable(table);
+    } finally {
+      // This code could be called that either a table was created successfully or set up
+      // table failed in some unknown state.  Therefore, clean up can either succeed or fail.
+      try {
+        deleteTable(table);
+      } catch (IOException e) {
+        // The cleanup table would throw some exception if create table failed in some state.
+        // Ignore this exception
+      }
+    }
   }
 
   @Test
@@ -2334,5 +2481,67 @@ public class TestHBaseFsck {
     hbck.setIgnorePreCheckPermission(true);
     Assert.assertEquals("shouldIgnorePreCheckPermission", true,
       hbck.shouldIgnorePreCheckPermission());
+  }
+
+  @Before
+  public void setUp() {
+    EnvironmentEdgeManager.reset();
+  }
+
+  @Test (timeout=180000)
+  public void testCleanUpDaughtersNotInMetaAfterFailedSplit() throws Exception {
+    TableName table = TableName.valueOf("testCleanUpDaughtersNotInMetaAfterFailedSplit");
+    MiniHBaseCluster cluster = TEST_UTIL.getHBaseCluster();
+    try {
+      HTableDescriptor desc = new HTableDescriptor(table);
+      desc.addFamily(new HColumnDescriptor(Bytes.toBytes("f")));
+      TEST_UTIL.getHBaseAdmin().createTable(desc);
+      tbl = new HTable(cluster.getConfiguration(), desc.getTableName());
+      for (int i = 0; i < 5; i++) {
+        Put p1 = new Put(("r" + i).getBytes());
+        p1.add(Bytes.toBytes("f"), "q1".getBytes(), "v".getBytes());
+        tbl.put(p1);
+      }
+      TEST_UTIL.getHBaseAdmin().flush(desc.getTableName().toString());
+      List<HRegion> regions = cluster.getRegions(desc.getTableName());
+      int serverWith = cluster.getServerWith(regions.get(0).getRegionName());
+      HRegionServer regionServer = cluster.getRegionServer(serverWith);
+      cluster.getServerWith(regions.get(0).getRegionName());
+      SplitTransaction st = new SplitTransaction(regions.get(0), Bytes.toBytes("r3"));
+      st.prepare();
+      st.stepsBeforePONR(regionServer, regionServer, false);
+      AssignmentManager am = cluster.getMaster().getAssignmentManager();
+      Map<String, RegionState> regionsInTransition = am.getRegionStates().getRegionsInTransition();
+      for (RegionState state : regionsInTransition.values()) {
+        am.regionOffline(state.getRegion());
+      }
+      ZKAssign.deleteNodeFailSilent(regionServer.getZooKeeper(), regions.get(0).getRegionInfo());
+      Map<HRegionInfo, ServerName> regionsMap = new HashMap<HRegionInfo, ServerName>();
+      regionsMap.put(regions.get(0).getRegionInfo(), regionServer.getServerName());
+      am.assign(regionsMap);
+      am.waitForAssignment(regions.get(0).getRegionInfo());
+      HBaseFsck hbck = doFsck(conf, false);
+      assertErrors(hbck, new ERROR_CODE[] { ERROR_CODE.NOT_IN_META_OR_DEPLOYED,
+          ERROR_CODE.NOT_IN_META_OR_DEPLOYED });
+      // holes are separate from overlap groups
+      assertEquals(0, hbck.getOverlapGroups(table).size());
+
+      // fix hole
+      assertErrors(
+        doFsck(
+          conf, false, true, false, false, false, false, false, false, false, false, false, null),
+        new ERROR_CODE[] { ERROR_CODE.NOT_IN_META_OR_DEPLOYED,
+          ERROR_CODE.NOT_IN_META_OR_DEPLOYED });
+
+      // check that hole fixed
+      assertNoErrors(doFsck(conf, false));
+      assertEquals(5, countRows());
+    } finally {
+      if (tbl != null) {
+        tbl.close();
+        tbl = null;
+      }
+      deleteTable(table);
+    }
   }
 }

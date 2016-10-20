@@ -61,6 +61,7 @@ import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HConnection;
+import org.apache.hadoop.hbase.client.HConnectionManager;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
@@ -85,7 +86,9 @@ import org.apache.hadoop.hbase.regionserver.InternalScanner;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.security.visibility.VisibilityLabelsCache;
 import org.apache.hadoop.hbase.tool.Canary;
+import org.apache.hadoop.hbase.tool.Canary.RegionTask.TaskType;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
 import org.apache.hadoop.hbase.util.FSUtils;
@@ -552,8 +555,7 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
       true, null, null, hosts, null);
 
     // Set this just-started cluster as our filesystem.
-    FileSystem fs = this.dfsCluster.getFileSystem();
-    FSUtils.setFsDefault(this.conf, new Path(fs.getUri()));
+    setFs();
 
     // Wait for the cluster to be totally up
     this.dfsCluster.waitClusterUp();
@@ -564,6 +566,14 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     return this.dfsCluster;
   }
 
+  private void setFs() throws IOException {
+    if(this.dfsCluster == null){
+      LOG.info("Skipping setting fs because dfsCluster is null");
+      return;
+    }
+    FileSystem fs = this.dfsCluster.getFileSystem();
+    FSUtils.setFsDefault(this.conf, new Path(fs.getUri()));
+  }
 
   public MiniDFSCluster startMiniDFSCluster(int servers, final  String racks[], String hosts[])
       throws Exception {
@@ -877,7 +887,9 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
 
     // Bring up mini dfs cluster. This spews a bunch of warnings about missing
     // scheme. Complaints are 'Scheme is undefined for build/test/data/dfs/name1'.
-    startMiniDFSCluster(numDataNodes, dataNodeHosts);
+    if(this.dfsCluster == null) {
+      dfsCluster = startMiniDFSCluster(numDataNodes, dataNodeHosts);
+    }
 
     // Start up a zk cluster.
     if (this.zkCluster == null) {
@@ -934,6 +946,11 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
 
     getHBaseAdmin(); // create immediately the hbaseAdmin
     LOG.info("Minicluster is up");
+
+    // Set the hbase.fs.tmp.dir config to make sure that we have some default value. This is
+    // for tests that do not read hbase-defaults.xml
+    setHBaseFsTmpDir();
+
     return (MiniHBaseCluster)this.hbaseCluster;
   }
 
@@ -1053,6 +1070,16 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     fs.mkdirs(hbaseRootdir);
     FSUtils.setVersion(fs, hbaseRootdir);
     return hbaseRootdir;
+  }
+
+  private void setHBaseFsTmpDir() throws IOException {
+    String hbaseFsTmpDirInString = this.conf.get("hbase.fs.tmp.dir");
+    if (hbaseFsTmpDirInString == null) {
+      this.conf.set("hbase.fs.tmp.dir",  getDataTestDirOnTestFS("hbase-staging").toString());
+      LOG.info("Setting hbase.fs.tmp.dir to " + this.conf.get("hbase.fs.tmp.dir"));
+    } else {
+      LOG.info("The hbase.fs.tmp.dir is set to " + hbaseFsTmpDirInString);
+    }
   }
 
   /**
@@ -1505,6 +1532,24 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     // HBaseAdmin only waits for regions to appear in hbase:meta we should wait until they are assigned
     waitUntilAllRegionsAssigned(TableName.valueOf(tableName));
     return new HTable(getConfiguration(), tableName);
+  }
+
+  /**
+   * Create a table with multiple regions.
+   * @param tableName
+   * @param family
+   * @param numRegions
+   * @return An HTable instance for the created table.
+   * @throws IOException
+   */
+  public HTable createMultiRegionTable(TableName tableName, byte[] family, int numRegions)
+      throws IOException {
+    if (numRegions < 3) throw new IOException("Must create at least 3 regions");
+    byte[] startKey = Bytes.toBytes("aaaaa");
+    byte[] endKey = Bytes.toBytes("zzzzz");
+    byte[][] splitKeys = Bytes.split(startKey, endKey, numRegions - 3);
+
+    return createTable(tableName, family, splitKeys);
   }
 
   /**
@@ -2318,6 +2363,16 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     if (schedulerAddress != null) {
       conf.set("yarn.resourcemanager.scheduler.address", schedulerAddress);
     }
+    String mrJobHistoryWebappAddress =
+      jobConf.get("mapreduce.jobhistory.webapp.address");
+    if (mrJobHistoryWebappAddress != null) {
+      conf.set("mapreduce.jobhistory.webapp.address", mrJobHistoryWebappAddress);
+    }
+    String yarnRMWebappAddress =
+      jobConf.get("yarn.resourcemanager.webapp.address");
+    if (yarnRMWebappAddress != null) {
+      conf.set("yarn.resourcemanager.webapp.address", yarnRMWebappAddress);
+    }
   }
 
   /**
@@ -2663,11 +2718,25 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     return dfsCluster;
   }
 
-  public void setDFSCluster(MiniDFSCluster cluster) throws IOException {
-    if (dfsCluster != null && dfsCluster.isClusterUp()) {
-      throw new IOException("DFSCluster is already running! Shut it down first.");
+  public void setDFSCluster(MiniDFSCluster cluster) throws IllegalStateException, IOException {
+    setDFSCluster(cluster, true);
+  }
+
+  /**
+   * Set the MiniDFSCluster
+   * @param cluster cluster to use
+   * @param requireDown requireDown require the that cluster not be "up"
+   *  (MiniDFSCluster#isClusterUp) before it is set.
+   * @throws IllegalStateException if the passed cluster is up when it is required to be down
+   * @throws IOException if the FileSystem could not be set from the passed dfs cluster
+   */
+  public void setDFSCluster(MiniDFSCluster cluster, boolean requireDown)
+      throws IllegalStateException, IOException {
+    if (dfsCluster != null && requireDown && dfsCluster.isClusterUp()) {
+      throw new IllegalStateException("DFSCluster is already running! Shut it down first.");
     }
     this.dfsCluster = cluster;
+    this.setFs();
   }
 
   public FileSystem getTestFileSystem() throws IOException {
@@ -2762,14 +2831,59 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     // online in the regionserver is the very last thing done and can take a little while to happen.
     // Below we do a get.  The get will retry if a NotServeringRegionException or a
     // RegionOpeningException.  It is crass but when done all will be online.
+    HConnection connection = HConnectionManager.createConnection(conf);
     try {
-      Canary.sniff(admin, TableName.valueOf(table));
+      Canary.sniff(connection, TableName.valueOf(table), TaskType.READ);
     } catch (Exception e) {
       throw new IOException(e);
+    } finally {
+      connection.close();
     }
   }
 
   /**
+   * Waits for a table to be 'disabled'.  Disabled means that table is set as 'disabled'
+   * Will timeout after default period (30 seconds)
+   * @param table Table to wait on.
+   * @throws InterruptedException
+   * @throws IOException
+   */
+  public void waitTableDisabled(byte[] table)
+      throws InterruptedException, IOException {
+    waitTableDisabled(getHBaseAdmin(), table, 30000);
+  }
+
+  public void waitTableDisabled(HBaseAdmin admin, byte[] table)
+      throws InterruptedException, IOException {
+    waitTableDisabled(admin, table, 30000);
+  }
+
+  /**
+   * Waits for a table to be 'disabled'.  Disabled means that table is set as 'disabled'
+   * @param table Table to wait on.
+   * @param timeoutMillis Time to wait on it being marked disabled.
+   * @throws InterruptedException
+   * @throws IOException
+   */
+  public void waitTableDisabled(byte[] table, long timeoutMillis)
+      throws InterruptedException, IOException {
+    waitTableDisabled(getHBaseAdmin(), table, timeoutMillis);
+  }
+
+  public void waitTableDisabled(HBaseAdmin admin, byte[] table, long timeoutMillis)
+      throws InterruptedException, IOException {
+    TableName tableName = TableName.valueOf(table);
+    long startWait = System.currentTimeMillis();
+    while (!admin.isTableDisabled(tableName)) {
+      assertTrue("Timed out waiting for table to become disabled " +
+              Bytes.toStringBinary(table),
+          System.currentTimeMillis() - startWait < timeoutMillis);
+      Thread.sleep(200);
+    }
+  }
+
+  /**
+   * 
    * Make sure that at least the specified number of region servers
    * are running
    * @param num minimum number of region servers that should be running
@@ -2823,7 +2937,7 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
   /**
    * This method clones the passed <code>c</code> configuration setting a new
    * user into the clone.  Use it getting new instances of FileSystem.  Only
-   * works for DistributedFileSystem.
+   * works for DistributedFileSystem w/o Kerberos.
    * @param c Initial configuration
    * @param differentiatingSuffix Suffix to differentiate this user from others.
    * @return A new configuration instance with a different user set into it.
@@ -2833,7 +2947,7 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
     final String differentiatingSuffix)
   throws IOException {
     FileSystem currentfs = FileSystem.get(c);
-    if (!(currentfs instanceof DistributedFileSystem)) {
+    if (!(currentfs instanceof DistributedFileSystem) || User.isHBaseSecurityEnabled(c)) {
       return User.getCurrent();
     }
     // Else distributed filesystem.  Make a new instance per daemon.  Below
@@ -3426,6 +3540,16 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
       boolean failIfTimeout, Predicate<E> predicate) throws E {
     return Waiter.waitFor(this.conf, timeout, interval, failIfTimeout, predicate);
   }
+  
+  /**
+   * Wait until no regions in transition.
+   * @param timeout How long to wait.
+   * @throws Exception
+   */
+  public void waitUntilNoRegionsInTransition(
+      final long timeout) throws Exception {
+    waitFor(timeout, predicateNoRegionsInTransition());
+  }
 
   /**
    * Returns a {@link Predicate} for checking that there are no regions in transition in master
@@ -3451,6 +3575,27 @@ public class HBaseTestingUtility extends HBaseCommonTestingUtility {
        return getHBaseAdmin().isTableEnabled(tableName);
       }
     };
+  }
+
+  /**
+   * Wait until labels is ready in VisibilityLabelsCache.
+   * @param timeoutMillis
+   * @param labels
+   */
+  public void waitLabelAvailable(long timeoutMillis, final String... labels) {
+    final VisibilityLabelsCache labelsCache = VisibilityLabelsCache.get();
+    waitFor(timeoutMillis, new Waiter.Predicate<RuntimeException>() {
+
+      @Override
+      public boolean evaluate() {
+        for (String label : labels) {
+          if (labelsCache.getLabelOrdinal(label) == 0) {
+            return false;
+          }
+        }
+        return true;
+      }
+    });
   }
 
   /**

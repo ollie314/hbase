@@ -35,7 +35,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.Stoppable;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
@@ -294,7 +294,7 @@ public class TestHFileArchiving {
   public void testArchiveOnTableFamilyDelete() throws Exception {
     TableName TABLE_NAME =
         TableName.valueOf("testArchiveOnTableFamilyDelete");
-    UTIL.createTable(TABLE_NAME, TEST_FAM);
+    UTIL.createTable(TABLE_NAME, new byte[][] {TEST_FAM, Bytes.toBytes("fam2")});
 
     List<HRegion> servingRegions = UTIL.getHBaseCluster().getRegions(TABLE_NAME);
     // make sure we only have 1 region serving this table

@@ -19,9 +19,21 @@
 
 package org.apache.hadoop.hbase.master;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import java.io.IOException;
+import java.util.List;
+
+import org.apache.commons.lang.ClassUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.Coprocessor;
+import org.apache.hadoop.hbase.HColumnDescriptor;
+import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.NamespaceDescriptor;
+import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.coprocessor.*;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 
@@ -36,6 +48,8 @@ import java.util.List;
 @InterfaceAudience.Private
 public class MasterCoprocessorHost
     extends CoprocessorHost<MasterCoprocessorHost.MasterEnvironment> {
+
+  private static final Log LOG = LogFactory.getLog(MasterCoprocessorHost.class);
 
   /**
    * Coprocessor environment extension providing access to master related
@@ -59,10 +73,16 @@ public class MasterCoprocessorHost
 
   private MasterServices masterServices;
 
-  MasterCoprocessorHost(final MasterServices services, final Configuration conf) {
+  public MasterCoprocessorHost(final MasterServices services, final Configuration conf) {
     super(services);
     this.conf = conf;
     this.masterServices = services;
+    // Log the state of coprocessor loading here; should appear only once or
+    // twice in the daemon log, depending on HBase version, because there is
+    // only one MasterCoprocessorHost instance in the master process
+    boolean coprocessorsEnabled = conf.getBoolean(COPROCESSORS_ENABLED_CONF_KEY,
+      DEFAULT_COPROCESSORS_ENABLED);
+    LOG.info("System coprocessor loading is " + (coprocessorsEnabled ? "enabled" : "disabled"));
     loadSystemCoprocessors(conf, MASTER_COPROCESSOR_CONF_KEY);
   }
 
@@ -70,7 +90,8 @@ public class MasterCoprocessorHost
   public MasterEnvironment createEnvironment(final Class<?> implClass,
       final Coprocessor instance, final int priority, final int seq,
       final Configuration conf) {
-    for (Class<?> c : implClass.getInterfaces()) {
+    for (Object itf : ClassUtils.getAllInterfaces(implClass)) {
+      Class<?> c = (Class<?>) itf;
       if (CoprocessorService.class.isAssignableFrom(c)) {
         masterServices.registerService(((CoprocessorService)instance).getService());
       }
@@ -135,6 +156,50 @@ public class MasterCoprocessorHost
       public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
           throws IOException {
         oserver.postModifyNamespace(ctx, ns);
+      }
+    });
+  }
+
+  public void preGetNamespaceDescriptor(final String namespaceName)
+      throws IOException {
+    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+      @Override
+      public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
+          throws IOException {
+        oserver.preGetNamespaceDescriptor(ctx, namespaceName);
+      }
+    });
+  }
+
+  public void postGetNamespaceDescriptor(final NamespaceDescriptor ns)
+      throws IOException {
+    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+      @Override
+      public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
+          throws IOException {
+        oserver.postGetNamespaceDescriptor(ctx, ns);
+      }
+    });
+  }
+
+  public boolean preListNamespaceDescriptors(final List<NamespaceDescriptor> descriptors)
+      throws IOException {
+    return execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+      @Override
+      public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
+          throws IOException {
+        oserver.preListNamespaceDescriptors(ctx, descriptors);
+      }
+    });
+  }
+
+  public void postListNamespaceDescriptors(final List<NamespaceDescriptor> descriptors)
+      throws IOException {
+    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+      @Override
+      public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
+          throws IOException {
+        oserver.postListNamespaceDescriptors(ctx, descriptors);
       }
     });
   }
@@ -673,7 +738,9 @@ public class MasterCoprocessorHost
   }
 
   public void preShutdown() throws IOException {
-    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+    // While stopping the cluster all coprocessors method should be executed first then the
+    // coprocessor should be cleaned up.
+    execShutdown(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
       @Override
       public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
           throws IOException {
@@ -688,7 +755,9 @@ public class MasterCoprocessorHost
   }
 
   public void preStopMaster() throws IOException {
-    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+    // While stopping master all coprocessors method should be executed first then the coprocessor
+    // environment should be cleaned up.
+    execShutdown(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
       @Override
       public void call(MasterObserver oserver, ObserverContext<MasterCoprocessorEnvironment> ctx)
           throws IOException {
@@ -859,7 +928,9 @@ public class MasterCoprocessorHost
   private boolean execOperation(final CoprocessorOperation ctx) throws IOException {
     if (ctx == null) return false;
     boolean bypass = false;
-    for (MasterEnvironment env: coprocessors) {
+    List<MasterEnvironment> envs = coprocessors.get();
+    for (int i = 0; i < envs.size(); i++) {
+      MasterEnvironment env = envs.get(i);
       if (env.getInstance() instanceof MasterObserver) {
         ctx.prepare(env);
         Thread currentThread = Thread.currentThread();
@@ -881,4 +952,52 @@ public class MasterCoprocessorHost
     }
     return bypass;
   }
+
+  /**
+   * Master coprocessor classes can be configured in any order, based on that priority is set and
+   * chained in a sorted order. For preStopMaster()/preShutdown(), coprocessor methods are invoked
+   * in call() and environment is shutdown in postEnvCall(). <br>
+   * Need to execute all coprocessor methods first then postEnvCall(), otherwise some coprocessors
+   * may remain shutdown if any exception occurs during next coprocessor execution which prevent
+   * Master stop or cluster shutdown. (Refer:
+   * <a href="https://issues.apache.org/jira/browse/HBASE-16663">HBASE-16663</a>
+   * @param ctx CoprocessorOperation
+   * @return true if bypaas coprocessor execution, false if not.
+   * @throws IOException
+   */
+  private boolean execShutdown(final CoprocessorOperation ctx) throws IOException {
+    if (ctx == null) return false;
+    boolean bypass = false;
+    List<MasterEnvironment> envs = coprocessors.get();
+    int envsSize = envs.size();
+    // Iterate the coprocessors and execute CoprocessorOperation's call()
+    for (int i = 0; i < envsSize; i++) {
+      MasterEnvironment env = envs.get(i);
+      if (env.getInstance() instanceof MasterObserver) {
+        ctx.prepare(env);
+        Thread currentThread = Thread.currentThread();
+        ClassLoader cl = currentThread.getContextClassLoader();
+        try {
+          currentThread.setContextClassLoader(env.getClassLoader());
+          ctx.call((MasterObserver) env.getInstance(), ctx);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        } finally {
+          currentThread.setContextClassLoader(cl);
+        }
+        bypass |= ctx.shouldBypass();
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+
+    // Iterate the coprocessors and execute CoprocessorOperation's postEnvCall()
+    for (int i = 0; i < envsSize; i++) {
+      MasterEnvironment env = envs.get(i);
+      ctx.postEnvCall(env);
+    }
+    return bypass;
+  }
+
 }

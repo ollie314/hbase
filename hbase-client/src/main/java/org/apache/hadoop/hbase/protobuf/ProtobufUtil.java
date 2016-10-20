@@ -22,6 +22,7 @@ import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import com.google.protobuf.Parser;
@@ -29,6 +30,7 @@ import com.google.protobuf.RpcChannel;
 import com.google.protobuf.Service;
 import com.google.protobuf.ServiceException;
 import com.google.protobuf.TextFormat;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Cell;
@@ -45,6 +47,7 @@ import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.Tag;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.client.Append;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
@@ -55,9 +58,11 @@ import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.metrics.ScanMetrics;
+import org.apache.hadoop.hbase.client.security.SecurityCapability;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.filter.ByteArrayComparable;
 import org.apache.hadoop.hbase.filter.Filter;
+import org.apache.hadoop.hbase.io.LimitInputStream;
 import org.apache.hadoop.hbase.io.TimeRange;
 import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
 import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos;
@@ -95,6 +100,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto.Col
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto.DeleteType;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto.MutationType;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanRequest;
+import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos.RegionLoad;
 import org.apache.hadoop.hbase.protobuf.generated.ComparatorProtos;
 import org.apache.hadoop.hbase.protobuf.generated.FilterProtos;
@@ -104,12 +110,16 @@ import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionInfo;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.RegionSpecifierType;
 import org.apache.hadoop.hbase.protobuf.generated.MapReduceProtos;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.CreateTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescriptorsResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MasterService;
+import org.apache.hadoop.hbase.protobuf.generated.RPCProtos;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.RegionServerReportRequest;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.RegionServerStartupRequest;
 import org.apache.hadoop.hbase.protobuf.generated.WALProtos.CompactionDescriptor;
+import org.apache.hadoop.hbase.replication.ReplicationLoadSink;
+import org.apache.hadoop.hbase.replication.ReplicationLoadSource;
 import org.apache.hadoop.hbase.security.access.Permission;
 import org.apache.hadoop.hbase.security.access.TablePermission;
 import org.apache.hadoop.hbase.security.access.UserPermission;
@@ -122,12 +132,14 @@ import org.apache.hadoop.hbase.util.DynamicClassLoader;
 import org.apache.hadoop.hbase.util.ExceptionUtil;
 import org.apache.hadoop.hbase.util.Methods;
 import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.security.token.Token;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -147,6 +159,7 @@ import static org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpeci
 /**
  * Protobufs utility.
  */
+@InterfaceAudience.Private // TODO: some clients (Hive, etc) use this class
 public final class ProtobufUtil {
 
   private ProtobufUtil() {
@@ -165,8 +178,15 @@ public final class ProtobufUtil {
    */
   private final static Cell[] EMPTY_CELL_ARRAY = new Cell[]{};
   private final static Result EMPTY_RESULT = Result.create(EMPTY_CELL_ARRAY);
-  private final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
-  private final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
+
+  final static Result EMPTY_RESULT_EXISTS_TRUE = Result.create(null, true);
+  final static Result EMPTY_RESULT_EXISTS_FALSE = Result.create(null, false);
+  private final static Result EMPTY_RESULT_STALE = Result.create(null, true);
+  private final static Result EMPTY_RESULT_EXISTS_TRUE_STALE
+    = Result.create(null, true);
+  private final static Result EMPTY_RESULT_EXISTS_FALSE_STALE
+    = Result.create(null, true);
+
 
   private final static ClientProtos.Result EMPTY_RESULT_PB;
   private final static ClientProtos.Result EMPTY_RESULT_PB_EXISTS_TRUE;
@@ -235,6 +255,7 @@ public final class ProtobufUtil {
    * @return True if passed <code>bytes</code> has {@link #PB_MAGIC} for a prefix.
    */
   public static boolean isPBMagicPrefix(final byte [] bytes) {
+    if (bytes == null) return false;
     return isPBMagicPrefix(bytes, 0, bytes.length);
   }
 
@@ -490,7 +511,7 @@ public final class ProtobufUtil {
     MutationType type = proto.getMutateType();
     assert type == MutationType.PUT: type.name();
     long timestamp = proto.hasTimestamp()? proto.getTimestamp(): HConstants.LATEST_TIMESTAMP;
-    Put put = null;
+    Put put = proto.hasRow() ? new Put(proto.getRow().toByteArray(), timestamp) : null;
     int cellCount = proto.hasAssociatedCellCount()? proto.getAssociatedCellCount(): 0;
     if (cellCount > 0) {
       // The proto has metadata only and the data is separate to be found in the cellScanner.
@@ -510,9 +531,7 @@ public final class ProtobufUtil {
         put.add(cell);
       }
     } else {
-      if (proto.hasRow()) {
-        put = new Put(proto.getRow().asReadOnlyByteBuffer(), timestamp);
-      } else {
+      if (put == null) {
         throw new IllegalArgumentException("row cannot be null");
       }
       // The proto has the metadata and the data itself
@@ -589,12 +608,8 @@ public final class ProtobufUtil {
   throws IOException {
     MutationType type = proto.getMutateType();
     assert type == MutationType.DELETE : type.name();
-    byte [] row = proto.hasRow()? proto.getRow().toByteArray(): null;
-    long timestamp = HConstants.LATEST_TIMESTAMP;
-    if (proto.hasTimestamp()) {
-      timestamp = proto.getTimestamp();
-    }
-    Delete delete = null;
+    long timestamp = proto.hasTimestamp() ? proto.getTimestamp() : HConstants.LATEST_TIMESTAMP;
+    Delete delete = proto.hasRow() ? new Delete(proto.getRow().toByteArray(), timestamp) : null;
     int cellCount = proto.hasAssociatedCellCount()? proto.getAssociatedCellCount(): 0;
     if (cellCount > 0) {
       // The proto has metadata only and the data is separate to be found in the cellScanner.
@@ -617,7 +632,9 @@ public final class ProtobufUtil {
         delete.addDeleteMarker(KeyValueUtil.ensureKeyValue(cell));
       }
     } else {
-      delete = new Delete(row, timestamp);
+      if (delete == null) {
+        throw new IllegalArgumentException("row cannot be null");
+      }
       for (ColumnValue column: proto.getColumnValueList()) {
         byte[] family = column.getFamily().toByteArray();
         for (QualifierValue qv: column.getQualifierValueList()) {
@@ -1027,6 +1044,16 @@ public final class ProtobufUtil {
     return builder.build();
   }
 
+  static void setTimeRange(final MutationProto.Builder builder, final TimeRange timeRange) {
+    if (!timeRange.isAllTime()) {
+      HBaseProtos.TimeRange.Builder timeRangeBuilder =
+        HBaseProtos.TimeRange.newBuilder();
+      timeRangeBuilder.setFrom(timeRange.getMin());
+      timeRangeBuilder.setTo(timeRange.getMax());
+      builder.setTimeRange(timeRangeBuilder.build());
+    }
+  }
+
   /**
    * Convert a client Increment to a protobuf Mutate.
    *
@@ -1042,13 +1069,7 @@ public final class ProtobufUtil {
       builder.setNonce(nonce);
     }
     TimeRange timeRange = increment.getTimeRange();
-    if (!timeRange.isAllTime()) {
-      HBaseProtos.TimeRange.Builder timeRangeBuilder =
-        HBaseProtos.TimeRange.newBuilder();
-      timeRangeBuilder.setFrom(timeRange.getMin());
-      timeRangeBuilder.setTo(timeRange.getMax());
-      builder.setTimeRange(timeRangeBuilder.build());
-    }
+    setTimeRange(builder, timeRange);
     ColumnValue.Builder columnBuilder = ColumnValue.newBuilder();
     QualifierValue.Builder valueBuilder = QualifierValue.newBuilder();
     for (Map.Entry<byte[], List<Cell>> family: increment.getFamilyCellMap().entrySet()) {
@@ -1127,10 +1148,6 @@ public final class ProtobufUtil {
         valueBuilder.setValue(ByteStringer.wrap(
             kv.getValueArray(), kv.getValueOffset(), kv.getValueLength()));
         valueBuilder.setTimestamp(kv.getTimestamp());
-        if(cell.getTagsLengthUnsigned() > 0) {
-          valueBuilder.setTags(ByteStringer.wrap(kv.getTagsArray(), kv.getTagsOffset(),
-              kv.getTagsLengthUnsigned()));
-        }
         if (type == MutationType.DELETE || (type == MutationType.PUT && CellUtil.isDelete(kv))) {
           KeyValue.Type keyValueType = KeyValue.Type.codeToType(kv.getType());
           valueBuilder.setDeleteType(toDeleteType(keyValueType));
@@ -1174,6 +1191,9 @@ public final class ProtobufUtil {
       final MutationProto.Builder builder, long nonce) throws IOException {
     getMutationBuilderAndSetCommonFields(type, mutation, builder);
     builder.setAssociatedCellCount(mutation.size());
+    if (mutation instanceof Increment) {
+      setTimeRange(builder, ((Increment)mutation).getTimeRange());
+    }
     if (nonce != HConstants.NO_NONCE) {
       builder.setNonce(nonce);
     }
@@ -2414,13 +2434,13 @@ public final class ProtobufUtil {
    */
   public static String getRegionEncodedName(
       final RegionSpecifier regionSpecifier) throws DoNotRetryIOException {
-    byte[] value = regionSpecifier.getValue().toByteArray();
+    ByteString value = regionSpecifier.getValue();
     RegionSpecifierType type = regionSpecifier.getType();
     switch (type) {
       case REGION_NAME:
-        return HRegionInfo.encodeRegionName(value);
+        return HRegionInfo.encodeRegionName(value.toByteArray());
       case ENCODED_REGION_NAME:
-        return Bytes.toString(value);
+        return value.toStringUtf8();
       default:
         throw new DoNotRetryIOException(
           "Unsupported region specifier type: " + type);
@@ -2564,12 +2584,19 @@ public final class ProtobufUtil {
 
   public static CompactionDescriptor toCompactionDescriptor(HRegionInfo info, byte[] family,
       List<Path> inputPaths, List<Path> outputPaths, Path storeDir) {
+    return toCompactionDescriptor(info, null, family, inputPaths, outputPaths, storeDir);
+  }
+
+  @SuppressWarnings("deprecation")
+  public static CompactionDescriptor toCompactionDescriptor(HRegionInfo info, byte[] regionName,
+      byte[] family, List<Path> inputPaths, List<Path> outputPaths, Path storeDir) {
     // compaction descriptor contains relative paths.
     // input / output paths are relative to the store dir
     // store dir is relative to region dir
     CompactionDescriptor.Builder builder = CompactionDescriptor.newBuilder()
         .setTableName(ByteStringer.wrap(info.getTableName()))
-        .setEncodedRegionName(ByteStringer.wrap(info.getEncodedNameAsBytes()))
+        .setEncodedRegionName(ByteStringer.wrap(
+          regionName == null ? info.getEncodedNameAsBytes() : regionName))
         .setFamilyName(ByteStringer.wrap(family))
         .setStoreHomeDir(storeDir.getName()); //make relative
     for (Path inputPath : inputPaths) {
@@ -2686,8 +2713,9 @@ public final class ProtobufUtil {
     ClientProtos.CellVisibility.Builder builder = ClientProtos.CellVisibility.newBuilder();
     ClientProtos.CellVisibility proto = null;
     try {
-      proto = builder.mergeFrom(protoBytes).build();
-    } catch (InvalidProtocolBufferException e) {
+      ProtobufUtil.mergeFrom(builder, protoBytes);
+      proto = builder.build();
+    } catch (IOException e) {
       throw new DeserializationException(e);
     }
     return toCellVisibility(proto);
@@ -2728,8 +2756,9 @@ public final class ProtobufUtil {
     ClientProtos.Authorizations.Builder builder = ClientProtos.Authorizations.newBuilder();
     ClientProtos.Authorizations proto = null;
     try {
-      proto = builder.mergeFrom(protoBytes).build();
-    } catch (InvalidProtocolBufferException e) {
+      ProtobufUtil.mergeFrom(builder, protoBytes);
+      proto = builder.build();
+    } catch (IOException e) {
       throw new DeserializationException(e);
     }
     return toAuthorizations(proto);
@@ -2786,5 +2815,171 @@ public final class ProtobufUtil {
       }
     }
     return result;
+  }
+
+  /**
+   * This version of protobuf's mergeDelimitedFrom avoids the hard-coded 64MB limit for decoding
+   * buffers
+   * @param builder current message builder
+   * @param in Inputsream with delimited protobuf data
+   * @throws IOException
+   */
+  public static void mergeDelimitedFrom(Message.Builder builder, InputStream in)
+    throws IOException {
+    // This used to be builder.mergeDelimitedFrom(in);
+    // but is replaced to allow us to bump the protobuf size limit.
+    final int firstByte = in.read();
+    if (firstByte != -1) {
+      final int size = CodedInputStream.readRawVarint32(firstByte, in);
+      final InputStream limitedInput = new LimitInputStream(in, size);
+      final CodedInputStream codedInput = CodedInputStream.newInstance(limitedInput);
+      codedInput.setSizeLimit(size);
+      builder.mergeFrom(codedInput);
+      codedInput.checkLastTagWas(0);
+    }
+  }
+
+  /**
+   * This version of protobuf's mergeFrom avoids the hard-coded 64MB limit for decoding
+   * buffers where the message size is known
+   * @param builder current message builder
+   * @param in InputStream containing protobuf data
+   * @param size known size of protobuf data
+   * @throws IOException 
+   */
+  public static void mergeFrom(Message.Builder builder, InputStream in, int size)
+      throws IOException {
+    final CodedInputStream codedInput = CodedInputStream.newInstance(in);
+    codedInput.setSizeLimit(size);
+    builder.mergeFrom(codedInput);
+    codedInput.checkLastTagWas(0);
+  }
+
+  /**
+   * This version of protobuf's mergeFrom avoids the hard-coded 64MB limit for decoding
+   * buffers where the message size is not known
+   * @param builder current message builder
+   * @param in InputStream containing protobuf data
+   * @throws IOException 
+   */
+  public static void mergeFrom(Message.Builder builder, InputStream in)
+      throws IOException {
+    final CodedInputStream codedInput = CodedInputStream.newInstance(in);
+    codedInput.setSizeLimit(Integer.MAX_VALUE);
+    builder.mergeFrom(codedInput);
+    codedInput.checkLastTagWas(0);
+  }
+
+  /**
+   * This version of protobuf's mergeFrom avoids the hard-coded 64MB limit for decoding
+   * buffers when working with ByteStrings
+   * @param builder current message builder
+   * @param bs ByteString containing the 
+   * @throws IOException 
+   */
+  public static void mergeFrom(Message.Builder builder, ByteString bs) throws IOException {
+    final CodedInputStream codedInput = bs.newCodedInput();
+    codedInput.setSizeLimit(bs.size());
+    builder.mergeFrom(codedInput);
+    codedInput.checkLastTagWas(0);
+  }
+
+  /**
+   * This version of protobuf's mergeFrom avoids the hard-coded 64MB limit for decoding
+   * buffers when working with byte arrays
+   * @param builder current message builder
+   * @param b byte array
+   * @throws IOException 
+   */
+  public static void mergeFrom(Message.Builder builder, byte[] b) throws IOException {
+    final CodedInputStream codedInput = CodedInputStream.newInstance(b);
+    codedInput.setSizeLimit(b.length);
+    builder.mergeFrom(codedInput);
+    codedInput.checkLastTagWas(0);
+  }
+
+  /**
+   * This version of protobuf's mergeFrom avoids the hard-coded 64MB limit for decoding
+   * buffers when working with byte arrays
+   * @param builder current message builder
+   * @param b byte array
+   * @param offset
+   * @param length
+   * @throws IOException
+   */
+  public static void mergeFrom(Message.Builder builder, byte[] b, int offset, int length)
+      throws IOException {
+    final CodedInputStream codedInput = CodedInputStream.newInstance(b, offset, length);
+    codedInput.setSizeLimit(length);
+    builder.mergeFrom(codedInput);
+    codedInput.checkLastTagWas(0);
+  }
+
+  public static void mergeFrom(Message.Builder builder, CodedInputStream codedInput, int length)
+      throws IOException {
+    codedInput.resetSizeCounter();
+    int prevLimit = codedInput.setSizeLimit(length);
+
+    int limit = codedInput.pushLimit(length);
+    builder.mergeFrom(codedInput);
+    codedInput.popLimit(limit);
+
+    codedInput.checkLastTagWas(0);
+    codedInput.setSizeLimit(prevLimit);
+  }
+
+  public static ReplicationLoadSink toReplicationLoadSink(
+      ClusterStatusProtos.ReplicationLoadSink cls) {
+    return new ReplicationLoadSink(cls.getAgeOfLastAppliedOp(), cls.getTimeStampsOfLastAppliedOp());
+  }
+
+  public static ReplicationLoadSource toReplicationLoadSource(
+      ClusterStatusProtos.ReplicationLoadSource cls) {
+    return new ReplicationLoadSource(cls.getPeerID(), cls.getAgeOfLastShippedOp(),
+        cls.getSizeOfLogQueue(), cls.getTimeStampOfLastShippedOp(), cls.getReplicationLag());
+  }
+
+  public static List<ReplicationLoadSource> toReplicationLoadSourceList(
+      List<ClusterStatusProtos.ReplicationLoadSource> clsList) {
+    ArrayList<ReplicationLoadSource> rlsList = new ArrayList<ReplicationLoadSource>();
+    for (ClusterStatusProtos.ReplicationLoadSource cls : clsList) {
+      rlsList.add(toReplicationLoadSource(cls));
+    }
+    return rlsList;
+  }
+
+  /**
+   * Get a protocol buffer VersionInfo
+   *
+   * @return the converted protocol buffer VersionInfo
+   */
+  public static RPCProtos.VersionInfo getVersionInfo() {
+    RPCProtos.VersionInfo.Builder builder = RPCProtos.VersionInfo.newBuilder();
+    builder.setVersion(VersionInfo.getVersion());
+    builder.setUrl(VersionInfo.getUrl());
+    builder.setRevision(VersionInfo.getRevision());
+    builder.setUser(VersionInfo.getUser());
+    builder.setDate(VersionInfo.getDate());
+    builder.setSrcChecksum(VersionInfo.getSrcChecksum());
+    return builder.build();
+  }
+
+  /**
+   * Convert SecurityCapabilitiesResponse.Capability to SecurityCapability
+   * @param capabilities capabilities returned in the SecurityCapabilitiesResponse message
+   * @return the converted list of SecurityCapability elements
+   */
+  public static List<SecurityCapability> toSecurityCapabilityList(
+      List<MasterProtos.SecurityCapabilitiesResponse.Capability> capabilities) {
+    List<SecurityCapability> scList = new ArrayList<SecurityCapability>(capabilities.size());
+    for (MasterProtos.SecurityCapabilitiesResponse.Capability c: capabilities) {
+      try {
+        scList.add(SecurityCapability.valueOf(c.getNumber()));
+      } catch (IllegalArgumentException e) {
+        // Unknown capability, just ignore it. We don't understand the new capability
+        // but don't care since by definition we cannot take advantage of it.
+      }
+    }
+    return scList;
   }
 }

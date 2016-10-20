@@ -35,7 +35,7 @@ import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
@@ -353,8 +353,8 @@ public class TestBlocksRead extends HBaseTestCase {
       putData(FAMILY, "row", "col3", 9);
       region.flushcache();
 
-      // Baseline expected blocks read: 8. [HBASE-4532]
-      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 5);
+      // Baseline expected blocks read: 6. [HBASE-4532]
+      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 6, 7, 7);
       assertEquals(0, kvs.length);
  
       // File 7: Put back new data
@@ -364,8 +364,8 @@ public class TestBlocksRead extends HBaseTestCase {
       region.flushcache();
 
 
-      // Expected blocks read: 5. [HBASE-4585]
-      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 5);
+      // Expected blocks read: 8. [HBASE-4585, HBASE-13109]
+      kvs = getData(FAMILY, "row", Arrays.asList("col1", "col2", "col3"), 8, 9, 9);
       assertEquals(3, kvs.length);
       verifyData(kvs[0], "row", "col1", 11);
       verifyData(kvs[1], "row", "col2", 12);

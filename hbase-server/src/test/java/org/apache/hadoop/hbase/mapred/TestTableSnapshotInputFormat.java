@@ -23,7 +23,7 @@ import static org.mockito.Mockito.mock;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
@@ -148,6 +148,15 @@ public class TestTableSnapshotInputFormat extends TableSnapshotInputFormatTestBa
   // run the MR job while HBase is offline
   public void testWithMapReduceAndOfflineHBaseMultiRegion() throws Exception {
     testWithMapReduce(UTIL, "testWithMapReduceAndOfflineHBaseMultiRegion", 10, 10, true);
+  }
+
+  @Override
+  public void testRestoreSnapshotDoesNotCreateBackRefLinksInit(TableName tableName,
+      String snapshotName, Path tmpTableDir) throws Exception {
+    JobConf job = new JobConf(UTIL.getConfiguration());
+    TableMapReduceUtil.initTableSnapshotMapJob(snapshotName,
+      COLUMNS, TestTableSnapshotMapper.class, ImmutableBytesWritable.class,
+      NullWritable.class, job, false, tmpTableDir);
   }
 
   @Override

@@ -91,6 +91,7 @@ import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.Regio
 import org.apache.hadoop.hbase.regionserver.CompactionRequestor;
 import org.apache.hadoop.hbase.regionserver.FlushRequester;
 import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.HeapMemoryManager;
 import org.apache.hadoop.hbase.regionserver.Leases;
 import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices;
@@ -282,6 +283,12 @@ ClientProtos.ClientService.BlockingInterface, RegionServerServices {
   @Override
   public ServerName getServerName() {
     return this.sn;
+  }
+
+  @Override
+  public void postOpenDeployTasks(PostOpenDeployContext context, CatalogTracker ct)
+      throws KeeperException, IOException {
+    addToOnlineRegions(context.getRegion());
   }
 
   @Override
@@ -577,6 +584,11 @@ ClientProtos.ClientService.BlockingInterface, RegionServerServices {
   }
 
   @Override
+  public boolean reportRegionStateTransition(RegionStateTransitionContext context) {
+    return false;
+  }
+
+  @Override
   public boolean registerService(Service service) {
     // TODO Auto-generated method stub
     return false;
@@ -587,5 +599,15 @@ ClientProtos.ClientService.BlockingInterface, RegionServerServices {
       CoprocessorServiceRequest request) throws ServiceException {
     // TODO Auto-generated method stub
     return null;
+  }
+
+  @Override
+  public HeapMemoryManager getHeapMemoryManager() {
+    return null;
+  }
+
+  @Override
+  public double getCompactionPressure() {
+    return 0;
   }
 }

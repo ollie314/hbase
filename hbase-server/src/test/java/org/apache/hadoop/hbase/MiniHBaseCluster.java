@@ -232,8 +232,13 @@ public class MiniHBaseCluster extends HBaseCluster {
     }
   }
 
-  @Override
+  @Deprecated
   public void startRegionServer(String hostname) throws IOException {
+    this.startRegionServer();
+  }
+
+  @Override
+  public void startRegionServer(String hostname, int port) throws IOException {
     this.startRegionServer();
   }
 
@@ -260,7 +265,57 @@ public class MiniHBaseCluster extends HBaseCluster {
   }
 
   @Override
-  public void startMaster(String hostname) throws IOException {
+  public void startZkNode(String hostname, int port) throws IOException {
+    LOG.warn("Starting zookeeper nodes on mini cluster is not supported");
+  }
+
+  @Override
+  public void killZkNode(ServerName serverName) throws IOException {
+    LOG.warn("Aborting zookeeper nodes on mini cluster is not supported");
+  }
+
+  @Override
+  public void stopZkNode(ServerName serverName) throws IOException {
+    LOG.warn("Stopping zookeeper nodes on mini cluster is not supported");
+  }
+
+  @Override
+  public void waitForZkNodeToStart(ServerName serverName, long timeout) throws IOException {
+    LOG.warn("Waiting for zookeeper nodes to start on mini cluster is not supported");
+  }
+
+  @Override
+  public void waitForZkNodeToStop(ServerName serverName, long timeout) throws IOException {
+    LOG.warn("Waiting for zookeeper nodes to stop on mini cluster is not supported");
+  }
+
+  @Override
+  public void startDataNode(ServerName serverName) throws IOException {
+    LOG.warn("Starting datanodes on mini cluster is not supported");
+  }
+
+  @Override
+  public void killDataNode(ServerName serverName) throws IOException {
+    LOG.warn("Aborting datanodes on mini cluster is not supported");
+  }
+
+  @Override
+  public void stopDataNode(ServerName serverName) throws IOException {
+    LOG.warn("Stopping datanodes on mini cluster is not supported");
+  }
+
+  @Override
+  public void waitForDataNodeToStart(ServerName serverName, long timeout) throws IOException {
+    LOG.warn("Waiting for datanodes to start on mini cluster is not supported");
+  }
+
+  @Override
+  public void waitForDataNodeToStop(ServerName serverName, long timeout) throws IOException {
+    LOG.warn("Waiting for datanodes to stop on mini cluster is not supported");
+  }
+
+  @Override
+  public void startMaster(String hostname, int port) throws IOException {
     this.startMaster();
   }
 
@@ -622,11 +677,12 @@ public class MiniHBaseCluster extends HBaseCluster {
     int count = 0;
     for (JVMClusterUtil.RegionServerThread rst: getRegionServerThreads()) {
       HRegionServer hrs = rst.getRegionServer();
-      HRegion metaRegion =
-        hrs.getOnlineRegion(regionName);
-      if (metaRegion != null) {
-        index = count;
-        break;
+      if (!hrs.isStopped()) {
+        HRegion region = hrs.getOnlineRegion(regionName);
+        if (region != null) {
+          index = count;
+          break;
+        }
       }
       count++;
     }

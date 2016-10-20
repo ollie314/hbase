@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.client.IsolationLevel;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.filter.Filter;
+import org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode;
 import org.apache.hadoop.hbase.regionserver.handler.ParallelSeekHandler;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
@@ -58,7 +59,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
   protected KeyValueHeap heap;
   protected boolean cacheBlocks;
 
-  protected int countPerRow = 0;
+  protected long countPerRow = 0;
   protected int storeLimit = -1;
   protected int storeOffset = 0;
 
@@ -76,6 +77,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
   protected final Scan scan;
   protected final NavigableSet<byte[]> columns;
   protected final long oldestUnexpiredTS;
+  protected final long now;
   protected final int minVersions;
 
   /**
@@ -121,7 +123,8 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
     explicitColumnQuery = numCol > 0;
     this.scan = scan;
     this.columns = columns;
-    oldestUnexpiredTS = EnvironmentEdgeManager.currentTimeMillis() - ttl;
+    this.now = EnvironmentEdgeManager.currentTimeMillis();
+    this.oldestUnexpiredTS = now - ttl;
     this.minVersions = minVersions;
 
     if (store != null && ((HStore)store).getHRegion() != null
@@ -171,28 +174,35 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
     }
     matcher = new ScanQueryMatcher(scan, scanInfo, columns,
         ScanType.USER_SCAN, Long.MAX_VALUE, HConstants.LATEST_TIMESTAMP,
-        oldestUnexpiredTS, store.getCoprocessorHost());
+        oldestUnexpiredTS, now, store.getCoprocessorHost());
 
     this.store.addChangedReaderObserver(this);
 
-    // Pass columns to try to filter out unnecessary StoreFiles.
-    List<KeyValueScanner> scanners = getScannersNoCompaction();
+    try {
+      // Pass columns to try to filter out unnecessary StoreFiles.
+      List<KeyValueScanner> scanners = getScannersNoCompaction();
 
-    // Seek all scanners to the start of the Row (or if the exact matching row
-    // key does not exist, then to the start of the next matching Row).
-    // Always check bloom filter to optimize the top row seek for delete
-    // family marker.
-    seekScanners(scanners, matcher.getStartKey(), explicitColumnQuery
-        && lazySeekEnabledGlobally, isParallelSeekEnabled);
+      // Seek all scanners to the start of the Row (or if the exact matching row
+      // key does not exist, then to the start of the next matching Row).
+      // Always check bloom filter to optimize the top row seek for delete
+      // family marker.
+      seekScanners(scanners, matcher.getStartKey(), explicitColumnQuery && lazySeekEnabledGlobally,
+        isParallelSeekEnabled);
 
-    // set storeLimit
-    this.storeLimit = scan.getMaxResultsPerColumnFamily();
+      // set storeLimit
+      this.storeLimit = scan.getMaxResultsPerColumnFamily();
 
-    // set rowOffset
-    this.storeOffset = scan.getRowOffsetPerColumnFamily();
+      // set rowOffset
+      this.storeOffset = scan.getRowOffsetPerColumnFamily();
 
-    // Combine all seeked scanners with a heap
-    resetKVHeap(scanners, store.getComparator());
+      // Combine all seeked scanners with a heap
+      resetKVHeap(scanners, store.getComparator());
+    } catch (IOException e) {
+      // remove us from the HStore#changedReaderObservers here or we'll have no chance to
+      // and might cause memory leak
+      this.store.deleteChangedReaderObserver(this);
+      throw e;
+    }
   }
 
   /**
@@ -236,10 +246,10 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
         ((HStore)store).getHRegion().getReadpoint(IsolationLevel.READ_COMMITTED));
     if (dropDeletesFromRow == null) {
       matcher = new ScanQueryMatcher(scan, scanInfo, null, scanType, smallestReadPoint,
-          earliestPutTs, oldestUnexpiredTS, store.getCoprocessorHost());
+          earliestPutTs, oldestUnexpiredTS, now, store.getCoprocessorHost());
     } else {
       matcher = new ScanQueryMatcher(scan, scanInfo, null, smallestReadPoint, earliestPutTs,
-          oldestUnexpiredTS, dropDeletesFromRow, dropDeletesToRow, store.getCoprocessorHost());
+          oldestUnexpiredTS, now, dropDeletesFromRow, dropDeletesToRow, store.getCoprocessorHost());
     }
 
     // Filter the list of scanners using Bloom filters, time range, TTL, etc.
@@ -279,7 +289,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
     this(null, scan.getCacheBlocks(), scan, columns, scanInfo.getTtl(),
         scanInfo.getMinVersions(), readPt);
     this.matcher = new ScanQueryMatcher(scan, scanInfo, columns, scanType,
-        Long.MAX_VALUE, earliestPutTs, oldestUnexpiredTS, null);
+        Long.MAX_VALUE, earliestPutTs, oldestUnexpiredTS, now, null);
 
     // In unit tests, the store could be null
     if (this.store != null) {
@@ -359,8 +369,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
 
     // We can only exclude store files based on TTL if minVersions is set to 0.
     // Otherwise, we might have to return KVs that have technically expired.
-    long expiredTimestampCutoff = minVersions == 0 ? oldestUnexpiredTS :
-        Long.MIN_VALUE;
+    long expiredTimestampCutoff = minVersions == 0 ? oldestUnexpiredTS: Long.MIN_VALUE;
 
     // include only those scan files which pass all filters
     for (KeyValueScanner kvs : allScanners) {
@@ -446,36 +455,35 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
       return false;
     }
 
-    KeyValue peeked = this.heap.peek();
-    if (peeked == null) {
+    KeyValue kv = this.heap.peek();
+    if (kv == null) {
       close();
       return false;
     }
 
     // only call setRow if the row changes; avoids confusing the query matcher
     // if scanning intra-row
-    byte[] row = peeked.getBuffer();
-    int offset = peeked.getRowOffset();
-    short length = peeked.getRowLength();
+    byte[] row = kv.getBuffer();
+    int offset = kv.getRowOffset();
+    short length = kv.getRowLength();
     if (limit < 0 || matcher.row == null || !Bytes.equals(row, offset, length, matcher.row,
         matcher.rowOffset, matcher.rowLength)) {
       this.countPerRow = 0;
       matcher.setRow(row, offset, length);
     }
 
-    KeyValue kv;
-
     // Only do a sanity-check if store and comparator are available.
     KeyValue.KVComparator comparator =
         store != null ? store.getComparator() : null;
 
     int count = 0;
-    LOOP: while((kv = this.heap.peek()) != null) {
+    LOOP: do {
       if (prevKV != kv) ++kvsScanned; // Do object compare - we set prevKV from the same heap.
       checkScanOrder(prevKV, kv, comparator);
       prevKV = kv;
 
       ScanQueryMatcher.MatchCode qcode = matcher.match(kv);
+      qcode = optimize(qcode, kv);
       switch(qcode) {
         case INCLUDE:
         case INCLUDE_AND_SEEK_NEXT_ROW:
@@ -559,7 +567,7 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
         default:
           throw new RuntimeException("UNEXPECTED");
       }
-    }
+    } while((kv = this.heap.peek()) != null);
 
     if (count > 0) {
       return true;
@@ -571,6 +579,38 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
     } finally {
       lock.unlock();
     }
+  }
+
+  /*
+   * See if we should actually SEEK or rather just SKIP to the next Cell.
+   * (See HBASE-13109)
+   */
+  private ScanQueryMatcher.MatchCode optimize(ScanQueryMatcher.MatchCode qcode, Cell cell) {
+    switch(qcode) {
+    case INCLUDE_AND_SEEK_NEXT_COL:
+    case SEEK_NEXT_COL:
+    {
+      byte[] nextIndexedKey = getNextIndexedKey();
+      if (nextIndexedKey != null && nextIndexedKey != HConstants.NO_NEXT_INDEXED_KEY
+          && matcher.compareKeyForNextColumn(nextIndexedKey, cell) >= 0) {
+        return qcode == MatchCode.SEEK_NEXT_COL ? MatchCode.SKIP : MatchCode.INCLUDE;
+      }
+      break;
+    }
+    case INCLUDE_AND_SEEK_NEXT_ROW:
+    case SEEK_NEXT_ROW:
+    {
+      byte[] nextIndexedKey = getNextIndexedKey();
+      if (nextIndexedKey != null && nextIndexedKey != HConstants.NO_NEXT_INDEXED_KEY
+          && matcher.compareKeyForNextRow(nextIndexedKey, cell) >= 0) {
+        return qcode == MatchCode.SEEK_NEXT_ROW ? MatchCode.SKIP : MatchCode.INCLUDE;
+      }
+      break;
+    }
+    default:
+      break;
+    }
+    return qcode;
   }
 
   @Override
@@ -775,6 +815,11 @@ public class StoreScanner extends NonReversedNonLazyKeyValueScanner
    */
   public long getEstimatedNumberOfKvsScanned() {
     return this.kvsScanned;
+  }
+
+  @Override
+  public byte[] getNextIndexedKey() {
+    return this.heap.getNextIndexedKey();
   }
 }
 

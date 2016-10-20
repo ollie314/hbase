@@ -1,17 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
 
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
+  http://www.apache.org/licenses/LICENSE-2.0
 
-      http://www.apache.org/licenses/LICENSE-2.0
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
 -->
 
 <!DOCTYPE document PUBLIC "-//APACHE//DTD Documentation V2.0//EN"
@@ -27,6 +31,17 @@
   </properties>
   <body>
   <section name="Old News">
+         <p>February 10th, 2014 <a href="http://www.meetup.com/hbaseusergroup/events/163139322/">HBase Meetup @ Continuuity</a> in Palo Alto</p>
+         <p>January 30th, 2014 <a href="http://www.meetup.com/hbaseusergroup/events/158491762/">HBase Meetup @ Apple</a> in Cupertino</p>
+         <p>January 30th, 2014 <a href="http://www.meetup.com/Los-Angeles-HBase-User-group/events/160560282/">Los Angeles HBase User Group</a> in El Segundo</p>
+         <p>October 24th, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/140759692/">HBase User and <a href="http://www.meetup.com/hackathon/events/144366512/">Developer</a> Meetup at HortonWorks</a>.in Palo Alto</p>
+         <p>September 26, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/135862292/">HBase Meetup at Arista Networks</a>.in San Francisco</p>
+         <p>August 20th, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/120534362/">HBase Meetup at Flurry</a>.in San Francisco</p>
+         <p>July 16th, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/119929152/">HBase Meetup at Twitter</a>.in San Francisco</p>
+         <p>June 25th, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/119154442/">Hadoop Summit Meetup</a>.at San Jose Convention Center</p>
+         <p>June 14th, 2013 <a href="http://kijicon.eventbrite.com/">KijiCon: Building Big Data Apps</a> in San Francisco.</p>
+         <p>June 13th, 2013 <a href="http://www.hbasecon.com/">HBaseCon2013</a> in San Francisco.  Submit an Abstract!</p>
+         <p>June 12th, 2013 <a href="http://www.meetup.com/hackathon/events/123403802/">HBaseConHackAthon</a> at the Cloudera office in San Francisco.</p>
          <p>April 11th, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/103587852/">HBase Meetup at AdRoll</a> in San Francisco</p>
          <p>February 28th, 2013 <a href="http://www.meetup.com/hbaseusergroup/events/96584102/">HBase Meetup at Intel Mission Campus</a></p>
          <p>February 19th, 2013 <a href="http://www.meetup.com/hackathon/events/103633042/">Developers PowWow</a> at HortonWorks' new digs</p>

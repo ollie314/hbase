@@ -20,36 +20,30 @@ package org.apache.hadoop.hbase.replication;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
-import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.CompoundConfiguration;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
-import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos;
+import org.apache.hadoop.hbase.replication.ReplicationPeer.PeerState;
 import org.apache.hadoop.hbase.util.Bytes;
-import org.apache.hadoop.hbase.zookeeper.ZKClusterId;
+import org.apache.hadoop.hbase.util.Pair;
+import org.apache.hadoop.hbase.zookeeper.ZKConfig;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil.ZKUtilOp;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperListener;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.KeeperException.AuthFailedException;
-import org.apache.zookeeper.KeeperException.ConnectionLossException;
-import org.apache.zookeeper.KeeperException.SessionExpiredException;
-
-import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
  * This class provides an implementation of the ReplicationPeers interface using Zookeeper. The
@@ -77,10 +71,11 @@ import com.google.protobuf.InvalidProtocolBufferException;
  *
  * /hbase/replication/peers/1/tableCFs [Value: "table1; table2:cf1,cf3; table3:cfx,cfy"]
  */
+@InterfaceAudience.Private
 public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements ReplicationPeers {
 
   // Map of peer clusters keyed by their id
-  private Map<String, ReplicationPeer> peerClusters;
+  private Map<String, ReplicationPeerZKImpl> peerClusters;
   private final String tableCFsNodeName;
 
   private static final Log LOG = LogFactory.getLog(ReplicationPeersZKImpl.class);
@@ -89,7 +84,7 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
       Abortable abortable) {
     super(zk, conf, abortable);
     this.tableCFsNodeName = conf.get("zookeeper.znode.replication.peers.tableCFs", "tableCFs");
-    this.peerClusters = new ConcurrentHashMap<String, ReplicationPeer>();
+    this.peerClusters = new ConcurrentHashMap<String, ReplicationPeerZKImpl>();
   }
 
   @Override
@@ -101,31 +96,34 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
     } catch (KeeperException e) {
       throw new ReplicationException("Could not initialize replication peers", e);
     }
-    connectExistingPeers();
+    addExistingPeers();
   }
 
   @Override
-  public void addPeer(String id, String clusterKey) throws ReplicationException {
-    addPeer(id, clusterKey, null);
-  }
-
-  @Override
-  public void addPeer(String id, String clusterKey, String tableCFs) throws ReplicationException {
+  public void addPeer(String id, ReplicationPeerConfig peerConfig, String tableCFs)
+      throws ReplicationException {
     try {
       if (peerExists(id)) {
         throw new IllegalArgumentException("Cannot add a peer with id=" + id
             + " because that id already exists.");
       }
       
-      if(id.contains("-")){
+      if (id.contains("-")) {
         throw new IllegalArgumentException("Found invalid peer name:" + id);
       }
-      
+
+      if (peerConfig.getClusterKey() != null) {
+        try {
+          ZKConfig.validateClusterKey(peerConfig.getClusterKey());
+        } catch (IOException ioe) {
+          throw new IllegalArgumentException(ioe.getMessage());
+        }
+      }
+
       ZKUtil.createWithParents(this.zookeeper, this.peersZNode);
       List<ZKUtilOp> listOfOps = new ArrayList<ZKUtil.ZKUtilOp>();
-      ZKUtilOp op1 =
-          ZKUtilOp.createAndFailSilent(ZKUtil.joinZNode(this.peersZNode, id),
-            toByteArray(clusterKey));
+      ZKUtilOp op1 = ZKUtilOp.createAndFailSilent(ZKUtil.joinZNode(this.peersZNode, id),
+          ReplicationSerDeHelper.toByteArray(peerConfig));
       // There is a race (if hbase.zookeeper.useMulti is false)
       // b/w PeerWatcher and ReplicationZookeeper#add method to create the
       // peer-state znode. This happens while adding a peer
@@ -138,8 +136,8 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
       listOfOps.add(op3);
       ZKUtil.multiOrSequential(this.zookeeper, listOfOps, false);
     } catch (KeeperException e) {
-      throw new ReplicationException("Could not add peer with id=" + id + ", clusterKey="
-          + clusterKey, e);
+      throw new ReplicationException("Could not add peer with id=" + id + ", peerConfif="
+          + peerConfig, e);
     }
   }
 
@@ -214,12 +212,12 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
   }
 
   @Override
-  public boolean getStatusOfConnectedPeer(String id) {
+  public boolean getStatusOfPeer(String id) {
     ReplicationPeer replicationPeer = this.peerClusters.get(id);
     if (replicationPeer == null) {
       throw new IllegalArgumentException("Peer with id= " + id + " is not connected");
     } 
-    return replicationPeer.getPeerEnabled().get();
+    return this.peerClusters.get(id).getPeerState() == PeerState.ENABLED;
   }
 
   @Override
@@ -230,7 +228,7 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
       }
       String peerStateZNode = getPeerStateNode(id);
       try {
-        return ReplicationPeer.isStateEnabled(ZKUtil.getData(this.zookeeper, peerStateZNode));
+        return ReplicationPeerZKImpl.isStateEnabled(ZKUtil.getData(this.zookeeper, peerStateZNode));
       } catch (KeeperException e) {
         throw new ReplicationException(e);
       } catch (DeserializationException e) {
@@ -243,155 +241,88 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
   }
 
   @Override
-  public boolean connectToPeer(String peerId) throws ReplicationException {
-    if (peerClusters == null) {
-      return false;
-    }
-    if (this.peerClusters.containsKey(peerId)) {
-      return false;
-    }
-    ReplicationPeer peer = null;
-    try {
-      peer = getPeer(peerId);
-    } catch (Exception e) {
-      throw new ReplicationException("Error connecting to peer with id=" + peerId, e);
-    }
-    if (peer == null) {
-      return false;
-    }
-    ReplicationPeer previous =
-      ((ConcurrentMap<String, ReplicationPeer>) peerClusters).putIfAbsent(peerId, peer);
-    if (previous == null) {
-      LOG.info("Added new peer cluster=" + peer.getClusterKey());
-    } else {
-      LOG.info("Peer already present, " + previous.getClusterKey() + ", new cluster=" +
-        peer.getClusterKey());
-    }
-    return true;
-  }
-
-  @Override
-  public void disconnectFromPeer(String peerId) {
-    ReplicationPeer rp = this.peerClusters.get(peerId);
-    if (rp != null) {
-      rp.getZkw().close();
-      ((ConcurrentMap<String, ReplicationPeer>) peerClusters).remove(peerId, rp);
-    }
-  }
-
-  @Override
-  public Map<String, String> getAllPeerClusterKeys() {
-    Map<String, String> peers = new TreeMap<String, String>();
+  public Map<String, ReplicationPeerConfig> getAllPeerConfigs() {
+    Map<String, ReplicationPeerConfig> peers = new TreeMap<String, ReplicationPeerConfig>();
     List<String> ids = null;
     try {
       ids = ZKUtil.listChildrenNoWatch(this.zookeeper, this.peersZNode);
       for (String id : ids) {
-        byte[] bytes = ZKUtil.getData(this.zookeeper, ZKUtil.joinZNode(this.peersZNode, id));
-        String clusterKey = null;
-        try {
-          clusterKey = parsePeerFrom(bytes);
-        } catch (DeserializationException de) {
-          LOG.warn("Failed parse of clusterid=" + id + " znode content, continuing.");
+        ReplicationPeerConfig peerConfig = getReplicationPeerConfig(id);
+        if (peerConfig == null) {
+          LOG.warn("Failed to get replication peer configuration of clusterid=" + id
+              + " znode content, continuing.");
           continue;
         }
-        peers.put(id, clusterKey);
+        peers.put(id, peerConfig);
       }
     } catch (KeeperException e) {
+      this.abortable.abort("Cannot get the list of peers ", e);
+    } catch (ReplicationException e) {
       this.abortable.abort("Cannot get the list of peers ", e);
     }
     return peers;
   }
 
   @Override
-  public List<ServerName> getRegionServersOfConnectedPeer(String peerId) {
-    if (this.peerClusters.size() == 0) {
-      return Collections.emptyList();
-    }
-    ReplicationPeer peer = this.peerClusters.get(peerId);
-    if (peer == null) {
-      return Collections.emptyList();
-    }
-    // Synchronize peer cluster connection attempts to avoid races and rate
-    // limit connections when multiple replication sources try to connect to
-    // the peer cluster. If the peer cluster is down we can get out of control
-    // over time.
-    synchronized (peer) {
-      List<ServerName> addresses;
-      try {
-        addresses = fetchSlavesAddresses(peer.getZkw());
-      } 
-      catch (KeeperException ke) {
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("Fetch salves addresses failed.", ke);
-        }
-        reconnectPeer(ke, peer);
-        addresses = Collections.emptyList();
-      }
-      peer.setRegionServers(addresses);
-    }
-    
-    return peer.getRegionServers();
-  }
-
-  @Override
-  public UUID getPeerUUID(String peerId) {
-    ReplicationPeer peer = this.peerClusters.get(peerId);
-    if (peer == null) {
-      return null;
-    }
-    UUID peerUUID = null;
-    // Synchronize peer cluster connection attempts to avoid races and rate
-    // limit connections when multiple replication sources try to connect to
-    // the peer cluster. If the peer cluster is down we can get out of control
-    // over time.
-    synchronized (peer) {
-      try {
-        peerUUID = ZKClusterId.getUUIDForCluster(peer.getZkw());
-      } catch (KeeperException ke) {
-        reconnectPeer(ke, peer);
-      }
-    }
-    return peerUUID;
-  }
-
-  @Override
-  public Set<String> getConnectedPeers() {
-    return this.peerClusters.keySet();
-  }
-
-  @Override
-  public Configuration getPeerConf(String peerId) throws ReplicationException {
+  public ReplicationPeerConfig getReplicationPeerConfig(String peerId) throws ReplicationException {
     String znode = ZKUtil.joinZNode(this.peersZNode, peerId);
     byte[] data = null;
     try {
       data = ZKUtil.getData(this.zookeeper, znode);
     } catch (KeeperException e) {
-      throw new ReplicationException("Error getting configuration for peer with id="
-          + peerId, e);
+      throw new ReplicationException("Error getting configuration for peer with id=" + peerId, e);
     }
     if (data == null) {
       LOG.error("Could not get configuration for peer because it doesn't exist. peerId=" + peerId);
       return null;
     }
-    String otherClusterKey = "";
+
     try {
-      otherClusterKey = parsePeerFrom(data);
+      return ReplicationSerDeHelper.parsePeerFrom(data);
     } catch (DeserializationException e) {
       LOG.warn("Failed to parse cluster key from peerId=" + peerId
           + ", specifically the content from the following znode: " + znode);
       return null;
     }
+  }
+  
+  @Override
+  public Pair<ReplicationPeerConfig, Configuration> getPeerConf(String peerId)
+      throws ReplicationException {
+    ReplicationPeerConfig peerConfig = getReplicationPeerConfig(peerId);
 
-    Configuration otherConf = new Configuration(this.conf);
+    if (peerConfig == null) {
+      return null;
+    }
+
+    Configuration otherConf;
     try {
-      ZKUtil.applyClusterKeyToConf(otherConf, otherClusterKey);
+      otherConf = HBaseConfiguration.createClusterConf(this.conf, peerConfig.getClusterKey());
     } catch (IOException e) {
       LOG.error("Can't get peer configuration for peerId=" + peerId + " because:", e);
       return null;
     }
-    return otherConf;
+
+    if (!peerConfig.getConfiguration().isEmpty()) {
+      CompoundConfiguration compound = new CompoundConfiguration();
+      compound.add(otherConf);
+      compound.addStringMap(peerConfig.getConfiguration());
+      return new Pair<ReplicationPeerConfig, Configuration>(peerConfig, compound);
+    }
+
+    return new Pair<ReplicationPeerConfig, Configuration>(peerConfig, otherConf);
+  }
+  
+  @Override
+  public Set<String> getPeerIds() {
+    return peerClusters.keySet(); // this is not thread-safe
   }
 
+  @Override
+  public ReplicationPeer getPeer(String peerId) {
+    return peerClusters.get(peerId);
+  }
+  
   /**
    * List all registered peer clusters and set a watch on their znodes.
    */
@@ -406,20 +337,11 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
     return ids;
   }
 
-  @Override
-  public long getTimestampOfLastChangeToPeer(String peerId) {
-    ReplicationPeer peer = this.peerClusters.get(peerId);
-    if (peer == null) {
-      throw new IllegalArgumentException("Unknown peer id: " + peerId);
-    }
-    return peer.getLastRegionserverUpdate();
-  }
-
   /**
-   * A private method used during initialization. This method attempts to connect to all registered
+   * A private method used during initialization. This method attempts to add all registered
    * peer clusters. This method does not set a watch on the peer cluster znodes.
    */
-  private void connectExistingPeers() throws ReplicationException {
+  private void addExistingPeers() throws ReplicationException {
     List<String> znodes = null;
     try {
       znodes = ZKUtil.listChildrenNoWatch(this.zookeeper, this.peersZNode);
@@ -428,45 +350,92 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
     }
     if (znodes != null) {
       for (String z : znodes) {
-        connectToPeer(z);
+        createAndAddPeer(z);
       }
     }
   }
 
-  /**
-   * A private method used to re-establish a zookeeper session with a peer cluster.
-   * @param ke
-   * @param peer
-   */
-  private void reconnectPeer(KeeperException ke, ReplicationPeer peer) {
-    if (ke instanceof ConnectionLossException || ke instanceof SessionExpiredException
-        || ke instanceof AuthFailedException) {
-      LOG.warn("Lost the ZooKeeper connection for peer " + peer.getClusterKey(), ke);
-      try {
-        peer.reloadZkWatcher();
-        peer.getZkw().registerListener(new PeerRegionServerListener(peer));
-      } catch (IOException io) {
-        LOG.warn("Creation of ZookeeperWatcher failed for peer " + peer.getClusterKey(), io);
-      }
+  @Override
+  public boolean peerAdded(String peerId) throws ReplicationException {
+    return createAndAddPeer(peerId);
+  }
+
+  @Override
+  public void peerRemoved(String peerId) {
+    ReplicationPeer rp = this.peerClusters.get(peerId);
+    if (rp != null) {
+      this.peerClusters.remove(peerId);
     }
   }
 
+  @Override
+  public void updatePeerConfig(String id, ReplicationPeerConfig newConfig)
+    throws ReplicationException {
+    ReplicationPeer peer = getPeer(id);
+    if (peer == null){
+      throw new ReplicationException("Could not find peer Id " + id);
+    }
+    ReplicationPeerConfig existingConfig = peer.getPeerConfig();
+    if (newConfig.getClusterKey() != null && !newConfig.getClusterKey().isEmpty() &&
+        !newConfig.getClusterKey().equals(existingConfig.getClusterKey())){
+      throw new ReplicationException("Changing the cluster key on an existing peer is not allowed."
+          + " Existing key '" + existingConfig.getClusterKey() + "' does not match new key '"
+          + newConfig.getClusterKey() +
+      "'");
+    }
+    String existingEndpointImpl = existingConfig.getReplicationEndpointImpl();
+    if (newConfig.getReplicationEndpointImpl() != null &&
+        !newConfig.getReplicationEndpointImpl().isEmpty() &&
+        !newConfig.getReplicationEndpointImpl().equals(existingEndpointImpl)){
+      throw new ReplicationException("Changing the replication endpoint implementation class " +
+          "on an existing peer is not allowed. Existing class '"
+          + existingConfig.getReplicationEndpointImpl()
+          + "' does not match new class '" + newConfig.getReplicationEndpointImpl() + "'");
+    }
+    //Update existingConfig's peer config and peer data with the new values, but don't touch config
+    // or data that weren't explicitly changed
+    existingConfig.getConfiguration().putAll(newConfig.getConfiguration());
+    existingConfig.getPeerData().putAll(newConfig.getPeerData());
+    try {
+      ZKUtil.setData(this.zookeeper, getPeerNode(id),
+          ReplicationSerDeHelper.toByteArray(existingConfig));
+    }
+    catch(KeeperException ke){
+      throw new ReplicationException("There was a problem trying to save changes to the " +
+          "replication peer " + id, ke);
+    }
+  }
   /**
-   * Get the list of all the region servers from the specified peer
-   * @param zkw zk connection to use
-   * @return list of region server addresses or an empty list if the slave is unavailable
+   * Attempt to connect to a new remote slave cluster.
+   * @param peerId a short that identifies the cluster
+   * @return true if a new connection was made, false if no new connection was made.
    */
-  private static List<ServerName> fetchSlavesAddresses(ZooKeeperWatcher zkw)
-      throws KeeperException {
-    List<String> children = ZKUtil.listChildrenAndWatchForNewChildren(zkw, zkw.rsZNode);
-    if (children == null) {
-      return Collections.emptyList();
+  public boolean createAndAddPeer(String peerId) throws ReplicationException {
+    if (peerClusters == null) {
+      return false;
     }
-    List<ServerName> addresses = new ArrayList<ServerName>(children.size());
-    for (String child : children) {
-      addresses.add(ServerName.parseServerName(child));
+    if (this.peerClusters.containsKey(peerId)) {
+      return false;
     }
-    return addresses;
+
+    ReplicationPeerZKImpl peer = null;
+    try {
+      peer = createPeer(peerId);
+    } catch (Exception e) {
+      throw new ReplicationException("Error adding peer with id=" + peerId, e);
+    }
+    if (peer == null) {
+      return false;
+    }
+    ReplicationPeerZKImpl previous = ((ConcurrentMap<String, ReplicationPeerZKImpl>) peerClusters)
+        .putIfAbsent(peerId, peer);
+    if (previous == null) {
+      LOG.info("Added new peer cluster=" + peer.getPeerConfig().getClusterKey());
+    } else {
+      LOG.info("Peer already present, " + previous.getPeerConfig().getClusterKey()
+          + ", new cluster=" + peer.getPeerConfig().getClusterKey());
+    }
+    return true;
   }
 
   private String getTableCFsNode(String id) {
@@ -510,18 +479,14 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
    * @return object representing the peer
    * @throws ReplicationException
    */
-  private ReplicationPeer getPeer(String peerId) throws ReplicationException {
-    Configuration peerConf = getPeerConf(peerId);
-    if (peerConf == null) {
+  private ReplicationPeerZKImpl createPeer(String peerId) throws ReplicationException {
+    Pair<ReplicationPeerConfig, Configuration> pair = getPeerConf(peerId);
+    if (pair == null) {
       return null;
     }
-    if (this.ourClusterKey.equals(ZKUtil.getZooKeeperClusterKey(peerConf))) {
-      LOG.debug("Not connecting to " + peerId + " because it's us");
-      return null;
-    }
+    Configuration peerConf = pair.getSecond();
 
-    ReplicationPeer peer =
-        new ReplicationPeer(peerConf, peerId);
+    ReplicationPeerZKImpl peer = new ReplicationPeerZKImpl(peerConf, peerId, pair.getFirst());
     try {
       peer.startStateTracker(this.zookeeper, this.getPeerStateNode(peerId));
     } catch (KeeperException e) {
@@ -536,78 +501,13 @@ public class ReplicationPeersZKImpl extends ReplicationStateZKBase implements Re
           peerId, e);
     }
 
-    peer.getZkw().registerListener(new PeerRegionServerListener(peer));
-    return peer;
-  }
-
-  /**
-   * @param bytes Content of a peer znode.
-   * @return ClusterKey parsed from the passed bytes.
-   * @throws DeserializationException
-   */
-  private static String parsePeerFrom(final byte[] bytes) throws DeserializationException {
-    if (ProtobufUtil.isPBMagicPrefix(bytes)) {
-      int pblen = ProtobufUtil.lengthOfPBMagic();
-      ZooKeeperProtos.ReplicationPeer.Builder builder =
-          ZooKeeperProtos.ReplicationPeer.newBuilder();
-      ZooKeeperProtos.ReplicationPeer peer;
-      try {
-        peer = builder.mergeFrom(bytes, pblen, bytes.length - pblen).build();
-      } catch (InvalidProtocolBufferException e) {
-        throw new DeserializationException(e);
-      }
-      return peer.getClusterkey();
-    } else {
-      if (bytes.length > 0) {
-        return Bytes.toString(bytes);
-      }
-      return "";
+    try {
+      peer.startPeerConfigTracker(this.zookeeper, this.getPeerNode(peerId));
+    } catch(KeeperException e) {
+      throw new ReplicationException("Error starting the peer config tracker for peerId=" +
+          peerId, e);
     }
-  }
-
-  /**
-   * @param clusterKey
-   * @return Serialized protobuf of <code>clusterKey</code> with pb magic prefix prepended suitable
-   *         for use as content of a this.peersZNode; i.e. the content of PEER_ID znode under
-   *         /hbase/replication/peers/PEER_ID
-   */
-  private static byte[] toByteArray(final String clusterKey) {
-    byte[] bytes =
-        ZooKeeperProtos.ReplicationPeer.newBuilder().setClusterkey(clusterKey).build()
-            .toByteArray();
-    return ProtobufUtil.prependPBMagic(bytes);
-  }
-
-  /**
-   * Tracks changes to the list of region servers in a peer's cluster.
-   */
-  public static class PeerRegionServerListener extends ZooKeeperListener {
-
-    private ReplicationPeer peer;
-    private String regionServerListNode;
-
-    public PeerRegionServerListener(ReplicationPeer replicationPeer) {
-      super(replicationPeer.getZkw());
-      this.peer = replicationPeer;
-      this.regionServerListNode = peer.getZkw().rsZNode;
+      return peer;
     }
 
-    public PeerRegionServerListener(String regionServerListNode, ZooKeeperWatcher zkw) {
-      super(zkw);
-      this.regionServerListNode = regionServerListNode;
-    }
-
-    @Override
-    public synchronized void nodeChildrenChanged(String path) {
-      if (path.equals(regionServerListNode)) {
-        try {
-          LOG.info("Detected change to peer regionservers, fetching updated list");
-          peer.setRegionServers(fetchSlavesAddresses(peer.getZkw()));
-        } catch (KeeperException e) {
-          LOG.fatal("Error reading slave addresses", e);
-        }
-      }
-    }
-
-  }
 }

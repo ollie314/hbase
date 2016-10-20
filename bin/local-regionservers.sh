@@ -1,7 +1,5 @@
-#!/bin/sh
+#!/usr/bin/env bash
 #/**
-# * Copyright 2007 The Apache Software Foundation
-# *
 # * Licensed to the Apache Software Foundation (ASF) under one
 # * or more contributor license agreements.  See the NOTICE file
 # * distributed with this work for additional information
@@ -52,5 +50,9 @@ shift;
 
 for i in $*
 do
-  run_regionserver  $cmd $i
+  if [[ "$i" =~ ^[0-9]+$ ]]; then
+   run_regionserver $cmd $i
+  else
+   echo "Invalid argument"
+  fi
 done

@@ -24,7 +24,7 @@ import java.util.List;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HRegionInfo;
@@ -109,7 +109,7 @@ public class TruncateTableHandler extends DeleteTableHandler {
 
       HRegionInfo[] newRegions;
       if (this.preserveSplits) {
-        newRegions = regions.toArray(new HRegionInfo[regions.size()]);
+        newRegions = recreateRegionInfo(regions);
         LOG.info("Truncate will preserve " + newRegions.length + " regions");
       } else {
         newRegions = new HRegionInfo[1];
@@ -190,6 +190,9 @@ public class TruncateTableHandler extends DeleteTableHandler {
     LOG.debug("Deleting regions from META");
     MetaEditor.deleteRegions(this.server.getCatalogTracker(), regions);
 
+    // clean region references from the server manager
+    this.masterServices.getServerManager().removeRegions(regions);
+
     // -----------------------------------------------------------------------
     // NOTE: At this point we still have data on disk, but nothing in .META.
     // if the rename below fails, hbck will report an inconsistency.
@@ -243,5 +246,14 @@ public class TruncateTableHandler extends DeleteTableHandler {
             + " in transitions");
       }
     }
+  }
+
+  private static HRegionInfo[] recreateRegionInfo(final List<HRegionInfo> regions) {
+    HRegionInfo[] newRegions = new HRegionInfo[regions.size()];
+    int index = 0;
+    for (HRegionInfo hri: regions) {
+      newRegions[index++] = new HRegionInfo(hri.getTable(), hri.getStartKey(), hri.getEndKey());
+    }
+    return newRegions;
   }
 }

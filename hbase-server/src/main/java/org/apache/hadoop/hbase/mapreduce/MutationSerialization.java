@@ -21,16 +21,20 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
-import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto;
+import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto.MutationType;
 import org.apache.hadoop.io.serializer.Deserializer;
 import org.apache.hadoop.io.serializer.Serialization;
 import org.apache.hadoop.io.serializer.Serializer;
 
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
 public class MutationSerialization implements Serialization<Mutation> {
   @Override
   public boolean accept(Class<?> c) {
@@ -57,7 +61,9 @@ public class MutationSerialization implements Serialization<Mutation> {
 
     @Override
     public Mutation deserialize(Mutation mutation) throws IOException {
-      MutationProto proto = MutationProto.parseDelimitedFrom(in);
+      ClientProtos.MutationProto.Builder builder = ClientProtos.MutationProto.newBuilder();
+      ProtobufUtil.mergeDelimitedFrom(builder, in);
+      ClientProtos.MutationProto proto = builder.build();
       return ProtobufUtil.toMutation(proto);
     }
 

@@ -27,18 +27,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import com.google.protobuf.Descriptors;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
-import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.Abortable;
@@ -47,7 +42,10 @@ import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.client.Append;
 import org.apache.hadoop.hbase.client.CoprocessorHConnection;
 import org.apache.hadoop.hbase.client.Delete;
@@ -69,10 +67,11 @@ import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CoprocessorClassLoader;
-import org.apache.hadoop.hbase.util.SortedCopyOnWriteSet;
+import org.apache.hadoop.hbase.util.SortedList;
 import org.apache.hadoop.hbase.util.VersionInfo;
 import org.apache.hadoop.io.MultipleIOException;
 
+import com.google.protobuf.Descriptors;
 import com.google.protobuf.Message;
 import com.google.protobuf.Service;
 import com.google.protobuf.ServiceException;
@@ -98,12 +97,17 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
     "hbase.coprocessor.wal.classes";
   public static final String ABORT_ON_ERROR_KEY = "hbase.coprocessor.abortonerror";
   public static final boolean DEFAULT_ABORT_ON_ERROR = true;
+  public static final String COPROCESSORS_ENABLED_CONF_KEY = "hbase.coprocessor.enabled";
+  public static final boolean DEFAULT_COPROCESSORS_ENABLED = true;
+  public static final String USER_COPROCESSORS_ENABLED_CONF_KEY =
+    "hbase.coprocessor.user.enabled";
+  public static final boolean DEFAULT_USER_COPROCESSORS_ENABLED = true;
 
-  private static final Log LOG = LogFactory.getLog(CoprocessorHost.class);
+  protected static final Log LOG = LogFactory.getLog(CoprocessorHost.class);
   protected Abortable abortable;
   /** Ordered set of loaded coprocessors with lock */
-  protected SortedSet<E> coprocessors =
-      new SortedCopyOnWriteSet<E>(new EnvironmentPriorityComparator());
+  protected SortedList<E> coprocessors =
+      new SortedList<E>(new EnvironmentPriorityComparator());
   protected Configuration conf;
   // unique file prefix to use for local copies of jars when classloading
   protected String pathPrefix;
@@ -124,8 +128,11 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
    */
   private static Set<String> coprocessorNames =
       Collections.synchronizedSet(new HashSet<String>());
+
   public static Set<String> getLoadedCoprocessors() {
-      return coprocessorNames;
+    synchronized (coprocessorNames) {
+      return new HashSet(coprocessorNames);
+    }
   }
 
   /**
@@ -137,17 +144,23 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
    */
   public Set<String> getCoprocessors() {
     Set<String> returnValue = new TreeSet<String>();
-    for(CoprocessorEnvironment e: coprocessors) {
+    for (CoprocessorEnvironment e: coprocessors) {
       returnValue.add(e.getInstance().getClass().getSimpleName());
     }
     return returnValue;
   }
 
   /**
-   * Load system coprocessors. Read the class names from configuration.
+   * Load system coprocessors once only. Read the class names from configuration.
    * Called by constructor.
    */
   protected void loadSystemCoprocessors(Configuration conf, String confKey) {
+    boolean coprocessorsEnabled = conf.getBoolean(COPROCESSORS_ENABLED_CONF_KEY,
+      DEFAULT_COPROCESSORS_ENABLED);
+    if (!coprocessorsEnabled) {
+      return;
+    }
+
     Class<?> implClass = null;
 
     // load default coprocessors from configure file
@@ -156,27 +169,28 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
       return;
 
     int priority = Coprocessor.PRIORITY_SYSTEM;
-    List<E> configured = new ArrayList<E>();
     for (String className : defaultCPClasses) {
       className = className.trim();
       if (findCoprocessor(className) != null) {
+        // If already loaded will just continue
+        LOG.warn("Attempted duplicate loading of " + className + "; skipped");
         continue;
       }
       ClassLoader cl = this.getClass().getClassLoader();
       Thread.currentThread().setContextClassLoader(cl);
       try {
         implClass = cl.loadClass(className);
-        configured.add(loadInstance(implClass, Coprocessor.PRIORITY_SYSTEM, conf));
+        // Add coprocessors as we go to guard against case where a coprocessor is specified twice
+        // in the configuration
+        this.coprocessors.add(loadInstance(implClass, priority, conf));
         LOG.info("System coprocessor " + className + " was loaded " +
-            "successfully with priority (" + priority++ + ").");
+            "successfully with priority (" + priority + ").");
+        ++priority;
       } catch (Throwable t) {
         // We always abort if system coprocessors cannot be loaded
         abortServer(className, t);
       }
     }
-
-    // add entire set to the collection for COW efficiency
-    coprocessors.addAll(configured);
   }
 
   /**
@@ -189,6 +203,25 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
    */
   public E load(Path path, String className, int priority,
       Configuration conf) throws IOException {
+    String[] includedClassPrefixes = null;
+    if (conf.get(HConstants.CP_HTD_ATTR_INCLUSION_KEY) != null){
+      String prefixes = conf.get(HConstants.CP_HTD_ATTR_INCLUSION_KEY);
+      includedClassPrefixes = prefixes.split(";");
+    }
+    return load(path, className, priority, conf, includedClassPrefixes);
+  }
+
+  /**
+   * Load a coprocessor implementation into the host
+   * @param path path to implementation jar
+   * @param className the main class name
+   * @param priority chaining priority
+   * @param conf configuration for coprocessor
+   * @param includedClassPrefixes class name prefixes to include
+   * @throws java.io.IOException Exception
+   */
+  public E load(Path path, String className, int priority,
+      Configuration conf, String[] includedClassPrefixes) throws IOException {
     Class<?> implClass = null;
     LOG.debug("Loading coprocessor class " + className + " with path " +
         path + " and priority " + priority);
@@ -204,7 +237,7 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
       cl = CoprocessorClassLoader.getClassLoader(
         path, getClass().getClassLoader(), pathPrefix, conf);
       try {
-        implClass = cl.loadClass(className);
+        implClass = ((CoprocessorClassLoader)cl).loadClass(className, includedClassPrefixes);
       } catch (ClassNotFoundException e) {
         throw new IOException("Cannot load external coprocessor class " + className, e);
       }
@@ -363,6 +396,7 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
    */
   static class EnvironmentPriorityComparator
       implements Comparator<CoprocessorEnvironment> {
+    @Override
     public int compare(final CoprocessorEnvironment env1,
         final CoprocessorEnvironment env2) {
       if (env1.getPriority() < env2.getPriority()) {
@@ -729,14 +763,16 @@ public abstract class CoprocessorHost<E extends CoprocessorEnvironment> {
         LOG.warn("Not stopping coprocessor "+impl.getClass().getName()+
             " because not active (state="+state.toString()+")");
       }
-      // clean up any table references
-      for (HTableInterface table: openTables) {
-        try {
-          ((HTableWrapper)table).internalClose();
-        } catch (IOException e) {
-          // nothing can be done here
-          LOG.warn("Failed to close " +
-              Bytes.toStringBinary(table.getTableName()), e);
+      synchronized (openTables) {
+        // clean up any table references
+        for (HTableInterface table: openTables) {
+          try {
+            ((HTableWrapper)table).internalClose();
+          } catch (IOException e) {
+            // nothing can be done here
+            LOG.warn("Failed to close " +
+                Bytes.toStringBinary(table.getTableName()), e);
+          }
         }
       }
     }

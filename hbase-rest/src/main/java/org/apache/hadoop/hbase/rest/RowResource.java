@@ -85,8 +85,8 @@ public class RowResource extends ResourceBase {
   @Produces({MIMETYPE_XML, MIMETYPE_JSON, MIMETYPE_PROTOBUF,
     MIMETYPE_PROTOBUF_IETF})
   public Response get(final @Context UriInfo uriInfo) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("GET " + uriInfo.getAbsolutePath());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("GET " + uriInfo.getAbsolutePath());
     }
     servlet.getMetrics().incrementRequests(1);
     MultivaluedMap<String, String> params = uriInfo.getQueryParameters();
@@ -130,8 +130,8 @@ public class RowResource extends ResourceBase {
   @GET
   @Produces(MIMETYPE_BINARY)
   public Response getBinary(final @Context UriInfo uriInfo) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("GET " + uriInfo.getAbsolutePath() + " as "+ MIMETYPE_BINARY);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("GET " + uriInfo.getAbsolutePath() + " as "+ MIMETYPE_BINARY);
     }
     servlet.getMetrics().incrementRequests(1);
     // doesn't make sense to use a non specific coordinate as this can only
@@ -221,8 +221,8 @@ public class RowResource extends ResourceBase {
           put.addImmutable(parts[0], parts[1], cell.getTimestamp(), cell.getValue());
         }
         puts.add(put);
-        if (LOG.isDebugEnabled()) {
-          LOG.debug("PUT " + put.toString());
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("PUT " + put.toString());
         }
       }
       table = servlet.getTable(tableResource.getName());
@@ -290,8 +290,8 @@ public class RowResource extends ResourceBase {
       put.addImmutable(parts[0], parts[1], timestamp, message);
       table = servlet.getTable(tableResource.getName());
       table.put(put);
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("PUT " + put.toString());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("PUT " + put.toString());
       }
       servlet.getMetrics().incrementSucessfulPutRequests(1);
       return Response.ok().build();
@@ -302,7 +302,7 @@ public class RowResource extends ResourceBase {
       if (table != null) try {
         table.close();
       } catch (IOException ioe) {
-        LOG.debug(ioe);
+        LOG.debug("Exception received while closing the table", ioe);
       }
     }
   }
@@ -312,8 +312,8 @@ public class RowResource extends ResourceBase {
     MIMETYPE_PROTOBUF_IETF})
   public Response put(final CellSetModel model,
       final @Context UriInfo uriInfo) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("PUT " + uriInfo.getAbsolutePath()
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("PUT " + uriInfo.getAbsolutePath()
         + " " + uriInfo.getQueryParameters());
     }
     return update(model, true);
@@ -323,8 +323,8 @@ public class RowResource extends ResourceBase {
   @Consumes(MIMETYPE_BINARY)
   public Response putBinary(final byte[] message,
       final @Context UriInfo uriInfo, final @Context HttpHeaders headers) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("PUT " + uriInfo.getAbsolutePath() + " as "+ MIMETYPE_BINARY);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("PUT " + uriInfo.getAbsolutePath() + " as "+ MIMETYPE_BINARY);
     }
     return updateBinary(message, headers, true);
   }
@@ -334,8 +334,8 @@ public class RowResource extends ResourceBase {
     MIMETYPE_PROTOBUF_IETF})
   public Response post(final CellSetModel model,
       final @Context UriInfo uriInfo) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("POST " + uriInfo.getAbsolutePath()
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("POST " + uriInfo.getAbsolutePath()
         + " " + uriInfo.getQueryParameters());
     }
     return update(model, false);
@@ -345,16 +345,16 @@ public class RowResource extends ResourceBase {
   @Consumes(MIMETYPE_BINARY)
   public Response postBinary(final byte[] message,
       final @Context UriInfo uriInfo, final @Context HttpHeaders headers) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("POST " + uriInfo.getAbsolutePath() + " as "+MIMETYPE_BINARY);
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("POST " + uriInfo.getAbsolutePath() + " as "+MIMETYPE_BINARY);
     }
     return updateBinary(message, headers, false);
   }
 
   @DELETE
   public Response delete(final @Context UriInfo uriInfo) {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("DELETE " + uriInfo.getAbsolutePath());
+    if (LOG.isTraceEnabled()) {
+      LOG.trace("DELETE " + uriInfo.getAbsolutePath());
     }
     servlet.getMetrics().incrementRequests(1);
     if (servlet.isReadOnly()) {
@@ -398,8 +398,8 @@ public class RowResource extends ResourceBase {
       table = servlet.getTable(tableResource.getName());
       table.delete(delete);
       servlet.getMetrics().incrementSucessfulDeleteRequests(1);
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("DELETE " + delete.toString());
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("DELETE " + delete.toString());
       }
     } catch (Exception e) {
       servlet.getMetrics().incrementFailedDeleteRequests(1);
@@ -408,7 +408,7 @@ public class RowResource extends ResourceBase {
       if (table != null) try {
         table.close();
       } catch (IOException ioe) {
-        LOG.debug(ioe);
+        LOG.debug("Exception received while closing the table", ioe);
       }
     }
     return Response.ok().build();
@@ -456,20 +456,40 @@ public class RowResource extends ResourceBase {
       byte[][] valueToPutParts = KeyValue.parseColumn(valueToCheckColumn);
       if (valueToPutParts.length == 2 && valueToPutParts[1].length > 0) {
         CellModel valueToPutCell = null;
+
+        // Copy all the cells to the Put request
+        // and track if the check cell's latest value is also sent
         for (int i = 0, n = cellModelCount - 1; i < n ; i++) {
-          if(Bytes.equals(cellModels.get(i).getColumn(),
-              valueToCheckCell.getColumn())) {
-            valueToPutCell = cellModels.get(i);
-            break;
+          CellModel cell = cellModels.get(i);
+          byte[] col = cell.getColumn();
+
+          if (col == null) {
+            servlet.getMetrics().incrementFailedPutRequests(1);
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .type(MIMETYPE_TEXT).entity("Bad request: Column found to be null." + CRLF)
+                    .build();
+          }
+
+          byte [][] parts = KeyValue.parseColumn(col);
+
+          if (parts.length != 2) {
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .type(MIMETYPE_TEXT).entity("Bad request" + CRLF)
+                    .build();
+          }
+          put.addImmutable(parts[0], parts[1], cell.getTimestamp(), cell.getValue());
+
+          if(Bytes.equals(col,
+                  valueToCheckCell.getColumn())) {
+            valueToPutCell = cell;
           }
         }
+
         if (valueToPutCell == null) {
           servlet.getMetrics().incrementFailedPutRequests(1);
           return Response.status(Response.Status.BAD_REQUEST).type(MIMETYPE_TEXT)
               .entity("Bad request: The column to put and check do not match." + CRLF).build();
         } else {
-          put.addImmutable(valueToPutParts[0], valueToPutParts[1], valueToPutCell.getTimestamp(),
-            valueToPutCell.getValue());
           retValue = table.checkAndPut(key, valueToPutParts[0], valueToPutParts[1],
             valueToCheckCell.getValue(), put);
         }
@@ -480,8 +500,8 @@ public class RowResource extends ResourceBase {
           .build();
       }
 
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("CHECK-AND-PUT " + put.toString() + ", returns " + retValue);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("CHECK-AND-PUT " + put.toString() + ", returns " + retValue);
       }
       if (!retValue) {
         servlet.getMetrics().incrementFailedPutRequests(1);
@@ -499,7 +519,7 @@ public class RowResource extends ResourceBase {
     } finally {
       if (table != null) try {
         table.close();
-      } catch (IOException ioe) { 
+      } catch (IOException ioe) {
         LOG.debug("Exception received while closing the table", ioe);
       }
     }
@@ -535,9 +555,12 @@ public class RowResource extends ResourceBase {
           .build();
       }
 
+      List<CellModel> cellModels = rowModel.getCells();
+      int cellModelCount = cellModels.size();
+
       delete = new Delete(key);
       boolean retValue;
-      CellModel valueToDeleteCell = rowModel.getCells().get(0);
+      CellModel valueToDeleteCell = rowModel.getCells().get(cellModelCount -1);
       byte[] valueToDeleteColumn = valueToDeleteCell.getColumn();
       if (valueToDeleteColumn == null) {
         try {
@@ -549,28 +572,65 @@ public class RowResource extends ResourceBase {
             .build();
         }
       }
-      byte[][] parts = KeyValue.parseColumn(valueToDeleteColumn);
+
+      byte[][] parts ;
+      // Copy all the cells to the Delete request if extra cells are sent
+      if(cellModelCount > 1) {
+        for (int i = 0, n = cellModelCount - 1; i < n; i++) {
+          CellModel cell = cellModels.get(i);
+          byte[] col = cell.getColumn();
+
+          if (col == null) {
+            servlet.getMetrics().incrementFailedPutRequests(1);
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .type(MIMETYPE_TEXT).entity("Bad request: Column found to be null." + CRLF)
+                    .build();
+          }
+
+          parts = KeyValue.parseColumn(col);
+
+          if (parts.length == 1) {
+            // Only Column Family is specified
+            delete.deleteFamily(parts[0], cell.getTimestamp());
+          } else if (parts.length == 2) {
+            delete.deleteColumn(parts[0], parts[1], cell.getTimestamp());
+          } else {
+            servlet.getMetrics().incrementFailedDeleteRequests(1);
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .type(MIMETYPE_TEXT)
+                    .entity("Bad request: Column to delete incorrectly specified." + CRLF)
+                    .build();
+          }
+        }
+      }
+
+      parts = KeyValue.parseColumn(valueToDeleteColumn);
       if (parts.length == 2) {
         if (parts[1].length != 0) {
-          delete.deleteColumns(parts[0], parts[1]);
+          // To support backcompat of deleting a cell
+          // if that is the only cell passed to the rest api
+          if(cellModelCount == 1) {
+            delete.deleteColumns(parts[0], parts[1]);
+          }
           retValue = table.checkAndDelete(key, parts[0], parts[1],
             valueToDeleteCell.getValue(), delete);
         } else {
           // The case of empty qualifier.
-          delete.deleteColumns(parts[0], Bytes.toBytes(StringUtils.EMPTY));
+          if(cellModelCount == 1) {
+            delete.deleteColumns(parts[0], Bytes.toBytes(StringUtils.EMPTY));
+          }
           retValue = table.checkAndDelete(key, parts[0], Bytes.toBytes(StringUtils.EMPTY),
             valueToDeleteCell.getValue(), delete);
         }
       } else {
         servlet.getMetrics().incrementFailedDeleteRequests(1);
         return Response.status(Response.Status.BAD_REQUEST)
-          .type(MIMETYPE_TEXT).entity("Bad request: Column incorrectly specified." + CRLF)
+          .type(MIMETYPE_TEXT).entity("Bad request: Column to check incorrectly specified." + CRLF)
           .build();
       }
-      delete.deleteColumns(parts[0], parts[1]);
 
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("CHECK-AND-DELETE " + delete.toString() + ", returns "
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("CHECK-AND-DELETE " + delete.toString() + ", returns "
           + retValue);
       }
 

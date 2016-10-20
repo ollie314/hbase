@@ -48,7 +48,6 @@ import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.NotAllMetaRegionsOnlineException;
 import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.ServerName;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.TableDescriptors;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.catalog.MetaMockingUtil;
@@ -65,6 +64,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutateRequest;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutateResponse;
 import org.apache.hadoop.hbase.regionserver.HStore;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HFileArchiveUtil;
@@ -176,10 +176,12 @@ public class TestCatalogJanitor {
   class MockMasterServices implements MasterServices {
     private final MasterFileSystem mfs;
     private final AssignmentManager asm;
+    private final ServerManager sm;
 
     MockMasterServices(final Server server) throws IOException {
       this.mfs = new MasterFileSystem(server, this, false);
       this.asm = Mockito.mock(AssignmentManager.class);
+      this.sm = Mockito.mock(ServerManager.class);
     }
 
     @Override
@@ -215,7 +217,7 @@ public class TestCatalogJanitor {
 
     @Override
     public ServerManager getServerManager() {
-      return null;
+      return sm;
     }
 
     @Override

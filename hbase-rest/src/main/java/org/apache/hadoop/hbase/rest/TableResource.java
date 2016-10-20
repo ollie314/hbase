@@ -90,10 +90,10 @@ public class TableResource extends ResourceBase {
     return new SchemaResource(this);
   }
 
-  @Path("multiget")
-  public MultiRowResource getMultipleRowResource(
-          final @QueryParam("v") String versions) throws IOException {
-    return new MultiRowResource(this, versions);
+  @Path("{multiget: multiget.*}")
+  public MultiRowResource getMultipleRowResource(final @QueryParam("v") String versions,
+      @PathParam("multiget") String path) throws IOException {
+    return new MultiRowResource(this, versions, path.replace("multiget", "").replace("/", ""));
   }
 
   @Path("{rowspec: [^*]+}")
@@ -130,37 +130,52 @@ public class TableResource extends ResourceBase {
       @DefaultValue("-1") @QueryParam(Constants.SCAN_BATCH_SIZE) int batchSize,
       @DefaultValue("0") @QueryParam(Constants.SCAN_START_TIME) long startTime,
       @DefaultValue(Long.MAX_VALUE + "") @QueryParam(Constants.SCAN_END_TIME) long endTime,
-      @DefaultValue("true") @QueryParam(Constants.SCAN_BATCH_SIZE) boolean cacheBlocks) {
+      @DefaultValue("true") @QueryParam(Constants.SCAN_BATCH_SIZE) boolean cacheBlocks,
+      @DefaultValue("false") @QueryParam(Constants.SCAN_REVERSED) boolean reversed) {
     try {
       Filter filter = null;
+      Scan tableScan = new Scan();
       if (scanSpec.indexOf('*') > 0) {
         String prefix = scanSpec.substring(0, scanSpec.indexOf('*'));
+        byte[] prefixBytes = Bytes.toBytes(prefix);
         filter = new PrefixFilter(Bytes.toBytes(prefix));
+        if (startRow.isEmpty()) {
+          tableScan.setStartRow(prefixBytes);
+        }
       }
-      LOG.debug("Query parameters  : Table Name = > " + this.table + " Start Row => " + startRow
-          + " End Row => " + endRow + " Columns => " + column + " Start Time => " + startTime
-          + " End Time => " + endTime + " Cache Blocks => " + cacheBlocks + " Max Versions => "
-          + maxVersions + " Batch Size => " + batchSize);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("Query parameters  : Table Name = > " + this.table + " Start Row => " + startRow
+            + " End Row => " + endRow + " Columns => " + column + " Start Time => " + startTime
+            + " End Time => " + endTime + " Cache Blocks => " + cacheBlocks + " Max Versions => "
+            + maxVersions + " Batch Size => " + batchSize);
+      }
       HTableInterface hTable = RESTServlet.getInstance().getTable(this.table);
-      Scan tableScan = new Scan();
       tableScan.setBatch(batchSize);
       tableScan.setMaxVersions(maxVersions);
       tableScan.setTimeRange(startTime, endTime);
-      tableScan.setStartRow(Bytes.toBytes(startRow));
+      if (!startRow.isEmpty()) {
+        tableScan.setStartRow(Bytes.toBytes(startRow));
+      }
       tableScan.setStopRow(Bytes.toBytes(endRow));
       for (String csplit : column) {
         String[] familysplit = csplit.trim().split(":");
         if (familysplit.length == 2) {
           if (familysplit[1].length() > 0) {
-            LOG.debug("Scan family and column : " + familysplit[0] + "  " + familysplit[1]);
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Scan family and column : " + familysplit[0] + "  " + familysplit[1]);
+            }
             tableScan.addColumn(Bytes.toBytes(familysplit[0]), Bytes.toBytes(familysplit[1]));
           } else {
             tableScan.addFamily(Bytes.toBytes(familysplit[0]));
-            LOG.debug("Scan family : " + familysplit[0] + " and empty qualifier.");
+            if (LOG.isTraceEnabled()) {
+              LOG.trace("Scan family : " + familysplit[0] + " and empty qualifier.");
+            }
             tableScan.addColumn(Bytes.toBytes(familysplit[0]), null);
           }
-        } else if (StringUtils.isNotEmpty(familysplit[0])){
-          LOG.debug("Scan family : " + familysplit[0]);
+        } else if (StringUtils.isNotEmpty(familysplit[0])) {
+          if (LOG.isTraceEnabled()) {
+            LOG.trace("Scan family : " + familysplit[0]);
+          }
           tableScan.addFamily(Bytes.toBytes(familysplit[0]));
         }
       }
@@ -169,6 +184,7 @@ public class TableResource extends ResourceBase {
       }
       int fetchSize = this.servlet.getConfiguration().getInt(Constants.SCAN_FETCH_SIZE, 10);
       tableScan.setCaching(fetchSize);
+      tableScan.setReversed(reversed);
      return new TableScanResource(hTable.getScanner(tableScan), userRequestedLimit);
     } catch (Exception exp) {
       servlet.getMetrics().incrementFailedScanRequests(1);

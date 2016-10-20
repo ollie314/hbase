@@ -29,6 +29,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
@@ -40,7 +41,6 @@ import org.apache.hadoop.hbase.master.RegionState;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.AdminService;
 import org.apache.hadoop.hbase.regionserver.HRegion;
-import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.zookeeper.KeeperException;
 
 /**
@@ -117,8 +117,8 @@ public class HBaseFsckRepair {
   public static void waitUntilAssigned(HBaseAdmin admin,
       HRegionInfo region) throws IOException, InterruptedException {
     long timeout = admin.getConfiguration().getLong("hbase.hbck.assign.timeout", 120000);
-    long expiration = timeout + System.currentTimeMillis();
-    while (System.currentTimeMillis() < expiration) {
+    long expiration = timeout + EnvironmentEdgeManager.currentTimeMillis();
+    while (EnvironmentEdgeManager.currentTimeMillis() < expiration) {
       try {
         Map<String, RegionState> rits=
             admin.getClusterStatus().getRegionsInTransition();
@@ -162,7 +162,9 @@ public class HBaseFsckRepair {
           ProtobufUtil.getRegionInfo(rs, region.getRegionName());
         if (rsRegion == null) return;
       } catch (IOException ioe) {
-        return;
+        if (ioe instanceof NotServingRegionException) // no need to retry again
+          return;
+        LOG.warn("Exception when retrieving regioninfo from: " + region.getRegionNameAsString(), ioe);
       }
       Thread.sleep(1000);
     }
@@ -187,12 +189,10 @@ public class HBaseFsckRepair {
       HRegionInfo hri, HTableDescriptor htd) throws IOException {
     // Create HRegion
     Path root = FSUtils.getRootDir(conf);
-    HRegion region = HRegion.createHRegion(hri, root, conf, htd);
-    HLog hlog = region.getLog();
+    HRegion region = HRegion.createHRegion(hri, root, conf, htd, null);
 
     // Close the new region to flush to disk. Close log file too.
     region.close();
-    hlog.closeAndDelete();
     return region;
   }
 }

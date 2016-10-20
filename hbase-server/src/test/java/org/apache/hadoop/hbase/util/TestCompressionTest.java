@@ -22,8 +22,8 @@ package org.apache.hadoop.hbase.util;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.io.compress.Compression;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.io.compress.CompressionOutputStream;
@@ -74,12 +74,14 @@ public class TestCompressionTest {
       nativeCodecTest("LZO", "lzo2", "com.hadoop.compression.lzo.LzoCodec");
       nativeCodecTest("LZ4", null, "org.apache.hadoop.io.compress.Lz4Codec");
       nativeCodecTest("SNAPPY", "snappy", "org.apache.hadoop.io.compress.SnappyCodec");
+      nativeCodecTest("BZIP2", "bzip2", "org.apache.hadoop.io.compress.BZip2Codec");
     } else {
       // Hadoop nativelib is not available
       LOG.debug("Native code not loaded");
       assertFalse(CompressionTest.testCompression("LZO"));
       assertFalse(CompressionTest.testCompression("LZ4"));
       assertFalse(CompressionTest.testCompression("SNAPPY"));
+      assertFalse(CompressionTest.testCompression("BZIP2"));
     }
   }
 

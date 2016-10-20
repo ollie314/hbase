@@ -22,15 +22,19 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.IntegrationTestingUtility;
 import org.apache.hadoop.hbase.chaos.monkies.ChaosMonkey;
 
 import com.google.common.collect.ImmutableMap;
+import org.apache.hadoop.hbase.util.ReflectionUtils;
 
 /**
  * Base class of the factory that will create a ChaosMonkey.
  */
 public abstract class MonkeyFactory {
+  private static final Log LOG = LogFactory.getLog(MonkeyFactory.class);
 
   protected String tableName;
   protected Set<String> columnFamilies;
@@ -68,17 +72,34 @@ public abstract class MonkeyFactory {
   public static final String SERVER_KILLING = "serverKilling";
   public static final String STRESS_AM = "stressAM";
   public static final String NO_KILL = "noKill";
+  public static final String MASTER_KILLING = "masterKilling";
+  public static final String SERVER_AND_DEPENDENCIES_KILLING = "serverAndDependenciesKilling";
 
   public static Map<String, MonkeyFactory> FACTORIES = ImmutableMap.<String,MonkeyFactory>builder()
     .put(CALM, new CalmMonkeyFactory())
     .put(SLOW_DETERMINISTIC, new SlowDeterministicMonkeyFactory())
     .put(UNBALANCE, new UnbalanceMonkeyFactory())
     .put(SERVER_KILLING, new ServerKillingMonkeyFactory())
+    .put(SERVER_AND_DEPENDENCIES_KILLING, new ServerAndDependenciesKillingMonkeyFactory())
     .put(STRESS_AM, new StressAssignmentManagerMonkeyFactory())
     .put(NO_KILL, new NoKillMonkeyFactory())
+    .put(MASTER_KILLING, new MasterKillingMonkeyFactory())
     .build();
 
   public static MonkeyFactory getFactory(String factoryName) {
-    return FACTORIES.get(factoryName);
+    MonkeyFactory fact = FACTORIES.get(factoryName);
+    if (fact == null && factoryName != null && !factoryName.isEmpty()) {
+      Class klass = null;
+      try {
+        klass = Class.forName(factoryName);
+        if (klass != null) {
+          fact = (MonkeyFactory) ReflectionUtils.newInstance(klass);
+        }
+      } catch (Exception e) {
+        LOG.error("Error trying to create " + factoryName + " could not load it by class name");
+        return null;
+      }
+    }
+    return fact;
   }
 }

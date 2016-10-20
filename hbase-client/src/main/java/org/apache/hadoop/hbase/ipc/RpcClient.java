@@ -39,6 +39,7 @@ import java.security.PrivilegedExceptionAction;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Random;
@@ -59,6 +60,7 @@ import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.client.MetricsConnection;
 import org.apache.hadoop.hbase.codec.Codec;
 import org.apache.hadoop.hbase.codec.KeyValueCodec;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
@@ -134,6 +136,7 @@ public class RpcClient {
   protected final SocketFactory socketFactory;           // how to create sockets
   protected String clusterId;
   protected final SocketAddress localAddr;
+  protected final MetricsConnection metrics;
 
   private final boolean fallbackAllowed;
   private UserProvider userProvider;
@@ -277,15 +280,16 @@ public class RpcClient {
     Message responseDefaultType;
     IOException error;                            // exception, null if value
     boolean done;                                 // true when call is done
-    long startTime;
     final MethodDescriptor md;
+    final MetricsConnection.CallStats callStats;
 
     protected Call(final MethodDescriptor md, Message param, final CellScanner cells,
-        final Message responseDefaultType) {
+        final Message responseDefaultType, MetricsConnection.CallStats callStats) {
       this.param = param;
       this.md = md;
       this.cells = cells;
-      this.startTime = System.currentTimeMillis();
+      this.callStats = callStats;
+      this.callStats.setStartTime(System.currentTimeMillis());
       this.responseDefaultType = responseDefaultType;
       synchronized (RpcClient.this) {
         this.id = counter++;
@@ -329,7 +333,7 @@ public class RpcClient {
     }
 
     public long getStartTime() {
-      return this.startTime;
+      return this.callStats.getStartTime();
     }
   }
 
@@ -408,8 +412,8 @@ public class RpcClient {
           throw new IOException(
               "Can't obtain server Kerberos config key from SecurityInfo");
         }
-        serverPrincipal = SecurityUtil.getServerPrincipal(
-            conf.get(serverKey), server.getAddress().getCanonicalHostName().toLowerCase());
+        serverPrincipal = SecurityUtil.getServerPrincipal(conf.get(serverKey),
+          server.getAddress().getCanonicalHostName().toLowerCase(Locale.ROOT));
         if (LOG.isDebugEnabled()) {
           LOG.debug("RPC Server Kerberos principal name for service="
               + remoteId.getServiceName() + " is " + serverPrincipal);
@@ -443,6 +447,7 @@ public class RpcClient {
       if (this.compressor != null) {
         builder.setCellBlockCompressorClass(this.compressor.getClass().getCanonicalName());
       }
+      builder.setVersionInfo(ProtobufUtil.getVersionInfo());
       this.header = builder.build();
 
       this.setName("IPC Client (" + socketFactory.hashCode() +") connection to " +
@@ -766,7 +771,7 @@ public class RpcClient {
         final OutputStream out2) throws IOException {
       saslRpcClient = new HBaseSaslRpcClient(authMethod, token, serverPrincipal, fallbackAllowed,
           conf.get("hbase.rpc.protection", 
-              QualityOfProtection.AUTHENTICATION.name().toLowerCase()));
+              QualityOfProtection.AUTHENTICATION.name().toLowerCase(Locale.ROOT)));
       return saslRpcClient.saslConnect(in2, out2);
     }
 
@@ -817,7 +822,7 @@ public class RpcClient {
               String msg = "Couldn't setup connection for " +
               UserGroupInformation.getLoginUser().getUserName() +
               " to " + serverPrincipal;
-              LOG.warn(msg);
+              LOG.warn(msg, ex);
               throw (IOException) new IOException(msg).initCause(ex);
             }
           } else {
@@ -1044,11 +1049,14 @@ public class RpcClient {
           builder.setCellBlockMeta(cellBlockBuilder.build());
         }
         // Only pass priority if there one.  Let zero be same as no priority.
-        if (priority != 0) builder.setPriority(priority);
+        if (priority != PayloadCarryingRpcController.PRIORITY_UNSET) {
+          builder.setPriority(priority);
+        }
         //noinspection SynchronizeOnNonFinalField
         RequestHeader header = builder.build();
         synchronized (this.out) { // FindBugs IS2_INCONSISTENT_SYNC
-          IPCUtil.write(this.out, header, call.param, cellBlock);
+          call.callStats.setRequestSizeBytes(
+              IPCUtil.write(this.out, header, call.param, cellBlock));
         }
         if (LOG.isDebugEnabled()) {
           LOG.debug(getName() + ": wrote request header " + TextFormat.shortDebugString(header));
@@ -1101,14 +1109,19 @@ public class RpcClient {
           if (isFatalConnectionException(exceptionResponse)) {
             markClosed(re);
           } else {
-            if (call != null) call.setException(re);
+            if (call != null) {
+              call.setException(re);
+              call.callStats.setResponseSizeBytes(totalSize);
+              call.callStats.setCallTimeMs(
+                  System.currentTimeMillis() - call.callStats.getStartTime());
+            }
           }
         } else {
           Message value = null;
           // Call may be null because it may have timedout and been cleaned up on this side already
           if (call != null && call.responseDefaultType != null) {
             Builder builder = call.responseDefaultType.newBuilderForType();
-            builder.mergeDelimitedFrom(in);
+            ProtobufUtil.mergeDelimitedFrom(builder, in);
             value = builder.build();
           }
           CellScanner cellBlockScanner = null;
@@ -1120,7 +1133,12 @@ public class RpcClient {
           }
           // it's possible that this call may have been cleaned up due to a RPC
           // timeout, so check if it still exists before setting the value.
-          if (call != null) call.setResponse(value, cellBlockScanner);
+          if (call != null) {
+            call.setResponse(value, cellBlockScanner);
+            call.callStats.setResponseSizeBytes(totalSize);
+            call.callStats.setCallTimeMs(
+                System.currentTimeMillis() - call.callStats.getStartTime());
+          }
         }
         if (call != null) calls.remove(id);
       } catch (IOException e) {
@@ -1242,13 +1260,15 @@ public class RpcClient {
   }
 
   /**
-   * Construct an IPC cluster client whose values are of the {@link Message} class.
+   * Used in test only. Construct an IPC cluster client whose values are of the
+   * {@link Message} class.
    * @param conf configuration
    * @param clusterId
    * @param factory socket factory
    */
+  @VisibleForTesting
   RpcClient(Configuration conf, String clusterId, SocketFactory factory) {
-    this(conf, clusterId, factory, null);
+    this(conf, clusterId, factory, null, null);
   }
 
   /**
@@ -1257,8 +1277,10 @@ public class RpcClient {
    * @param clusterId
    * @param factory socket factory
    * @param localAddr client socket bind address
+   * @param metrics the connection metrics
    */
-  RpcClient(Configuration conf, String clusterId, SocketFactory factory, SocketAddress localAddr) {
+  RpcClient(Configuration conf, String clusterId, SocketFactory factory, SocketAddress localAddr,
+      MetricsConnection metrics) {
     this.maxIdleTime = conf.getInt("hbase.ipc.client.connection.maxidletime", 10000); //10s
     this.maxRetries = conf.getInt("hbase.ipc.client.connect.max.retries", 0);
     this.failureSleep = conf.getLong(HConstants.HBASE_CLIENT_PAUSE,
@@ -1278,6 +1300,8 @@ public class RpcClient {
         IPC_CLIENT_FALLBACK_TO_SIMPLE_AUTH_ALLOWED_DEFAULT);
     this.localAddr = localAddr;
     this.userProvider = UserProvider.instantiate(conf);
+    this.metrics = metrics;
+
     // login the server principal (if using secure Hadoop)
     if (LOG.isDebugEnabled()) {
       LOG.debug("Codec=" + this.codec + ", compressor=" + this.compressor +
@@ -1292,12 +1316,20 @@ public class RpcClient {
   }
 
   /**
-   * Construct an IPC client for the cluster <code>clusterId</code> with the default SocketFactory
+   * Helper method for tests only. Creates an {@code RpcClient} without metrics.
+   */
+  @VisibleForTesting
+  public RpcClient(Configuration conf, String clusterId) {
+    this(conf, clusterId, NetUtils.getDefaultSocketFactory(conf), null, null);
+  }
+
+  /**
+   * Construct an IPC client for the cluster {@code clusterId} with the default SocketFactory
    * @param conf configuration
    * @param clusterId
    */
-  public RpcClient(Configuration conf, String clusterId) {
-    this(conf, clusterId, NetUtils.getDefaultSocketFactory(conf), null);
+  public RpcClient(Configuration conf, String clusterId, MetricsConnection metrics) {
+    this(conf, clusterId, NetUtils.getDefaultSocketFactory(conf), null, metrics);
   }
 
   /**
@@ -1306,8 +1338,9 @@ public class RpcClient {
    * @param clusterId
    * @param localAddr client socket bind address.
    */
-  public RpcClient(Configuration conf, String clusterId, SocketAddress localAddr) {
-    this(conf, clusterId, NetUtils.getDefaultSocketFactory(conf), localAddr);
+  public RpcClient(Configuration conf, String clusterId, SocketAddress localAddr,
+      MetricsConnection metrics) {
+    this(conf, clusterId, NetUtils.getDefaultSocketFactory(conf), localAddr, metrics);
   }
 
   /**
@@ -1410,10 +1443,12 @@ public class RpcClient {
     }
   }
 
+  @VisibleForTesting
   Pair<Message, CellScanner> call(MethodDescriptor md, Message param, CellScanner cells,
       Message returnType, User ticket, InetSocketAddress addr, int rpcTimeout)
   throws InterruptedException, IOException {
-    return call(md, param, cells, returnType, ticket, addr, rpcTimeout, HConstants.NORMAL_QOS);
+    return call(md, param, cells, returnType, ticket, addr, rpcTimeout, HConstants.NORMAL_QOS,
+        MetricsConnection.newCallStats());
   }
 
   /** Make a call, passing <code>param</code>, to the IPC server running at
@@ -1436,9 +1471,9 @@ public class RpcClient {
    */
   Pair<Message, CellScanner> call(MethodDescriptor md, Message param, CellScanner cells,
       Message returnType, User ticket, InetSocketAddress addr,
-      int rpcTimeout, int priority)
+      int rpcTimeout, int priority, MetricsConnection.CallStats callStats)
   throws InterruptedException, IOException {
-    Call call = new Call(md, param, cells, returnType);
+    Call call = new Call(md, param, cells, returnType, callStats);
     Connection connection =
       getConnection(ticket, call, addr, rpcTimeout, this.codec, this.compressor);
     connection.writeRequest(call, priority);                 // send the parameter
@@ -1645,10 +1680,6 @@ public class RpcClient {
       Message param, Message returnType, final User ticket, final InetSocketAddress isa,
       final int rpcTimeout)
   throws ServiceException {
-    long startTime = 0;
-    if (LOG.isTraceEnabled()) {
-      startTime = System.currentTimeMillis();
-    }
     PayloadCarryingRpcController pcrc = (PayloadCarryingRpcController)controller;
     CellScanner cells = null;
     if (pcrc != null) {
@@ -1658,8 +1689,10 @@ public class RpcClient {
     }
     Pair<Message, CellScanner> val = null;
     try {
+      final MetricsConnection.CallStats cs = MetricsConnection.newCallStats();
+      cs.setStartTime(System.currentTimeMillis());
       val = call(md, param, cells, returnType, ticket, isa, rpcTimeout,
-        pcrc != null? pcrc.getPriority(): HConstants.NORMAL_QOS);
+        pcrc != null? pcrc.getPriority(): HConstants.NORMAL_QOS, cs);
       if (pcrc != null) {
         // Shove the results into controller so can be carried across the proxy/pb service void.
         if (val.getSecond() != null) pcrc.setCellScanner(val.getSecond());
@@ -1667,11 +1700,12 @@ public class RpcClient {
         throw new ServiceException("Client dropping data on the floor!");
       }
 
+      cs.setCallTimeMs(System.currentTimeMillis() - cs.getStartTime());
+      if (metrics != null) {
+        metrics.updateRpc(md, param, cs);
+      }
       if (LOG.isTraceEnabled()) {
-        long callTime = System.currentTimeMillis() - startTime;
-        if (LOG.isTraceEnabled()) {
-          LOG.trace("Call: " + md.getName() + ", callTime: " + callTime + "ms");
-        }
+        LOG.trace("Call: " + md.getName() + ", callTime: " + cs.getCallTimeMs() + "ms");
       }
       return val.getFirst();
     } catch (Throwable e) {
@@ -1688,8 +1722,16 @@ public class RpcClient {
    * @return A blocking rpc channel that goes via this rpc client instance.
    */
   public BlockingRpcChannel createBlockingRpcChannel(final ServerName sn,
-      final User ticket, final int rpcTimeout) {
+      final User ticket, final int rpcTimeout) throws UnknownHostException {
     return new BlockingRpcChannelImplementation(this, sn, ticket, rpcTimeout);
+  }
+
+  /**
+   * @return true when this client uses a {@link org.apache.hadoop.hbase.codec.Codec} and so
+   *         supports cell blocks.
+   */
+  public boolean hasCellBlockSupport() {
+    return this.codec != null;
   }
 
   /**
@@ -1703,8 +1745,11 @@ public class RpcClient {
     private final User ticket;
 
     protected BlockingRpcChannelImplementation(final RpcClient rpcClient, final ServerName sn,
-        final User ticket, final int rpcTimeout) {
+        final User ticket, final int rpcTimeout) throws UnknownHostException {
       this.isa = new InetSocketAddress(sn.getHostname(), sn.getPort());
+      if (this.isa.isUnresolved()) {
+        throw new UnknownHostException(sn.getHostname());
+      }
       this.rpcClient = rpcClient;
       // Set the rpc timeout to be the minimum of configured timeout and whatever the current
       // thread local setting is.

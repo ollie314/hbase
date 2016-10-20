@@ -223,6 +223,8 @@ struct TScan {
   8: optional i32 batchSize,
   9: optional map<binary, binary> attributes
   10: optional TAuthorization authorizations
+  11: optional bool reversed
+  12: optional bool cacheBlocks
 }
 
 /**

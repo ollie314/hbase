@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.regionserver;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.lang.Math;
 import java.lang.Thread.UncaughtExceptionHandler;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
@@ -28,6 +29,7 @@ import java.lang.management.MemoryUsage;
 import java.lang.reflect.Constructor;
 import java.net.BindException;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -124,6 +126,7 @@ import org.apache.hadoop.hbase.ipc.RpcServer.BlockingServiceAndInterface;
 import org.apache.hadoop.hbase.ipc.RpcServerInterface;
 import org.apache.hadoop.hbase.ipc.ServerNotRunningYetException;
 import org.apache.hadoop.hbase.ipc.ServerRpcController;
+import org.apache.hadoop.hbase.master.RegionState.State;
 import org.apache.hadoop.hbase.master.SplitLogManager;
 import org.apache.hadoop.hbase.master.TableLockManager;
 import org.apache.hadoop.hbase.procedure.RegionServerProcedureManagerHost;
@@ -186,6 +189,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanResponse;
 import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos.RegionLoad;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.Coprocessor;
+import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.Coprocessor.Builder;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameStringPair;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionServerInfo;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier;
@@ -208,6 +212,7 @@ import org.apache.hadoop.hbase.regionserver.compactions.CompactionProgress;
 import org.apache.hadoop.hbase.regionserver.handler.CloseMetaHandler;
 import org.apache.hadoop.hbase.regionserver.handler.CloseRegionHandler;
 import org.apache.hadoop.hbase.regionserver.handler.OpenMetaHandler;
+import org.apache.hadoop.hbase.regionserver.handler.OpenPriorityRegionHandler;
 import org.apache.hadoop.hbase.regionserver.handler.OpenRegionHandler;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.regionserver.wal.HLogFactory;
@@ -216,11 +221,14 @@ import org.apache.hadoop.hbase.regionserver.wal.HLogSplitter;
 import org.apache.hadoop.hbase.regionserver.wal.HLogUtil;
 import org.apache.hadoop.hbase.regionserver.wal.WALActionsListener;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.replication.regionserver.ReplicationLoad;
+import org.apache.hadoop.hbase.security.Superusers;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.trace.SpanReceiverHost;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CompressionTest;
 import org.apache.hadoop.hbase.util.ConfigUtil;
+import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
 import org.apache.hadoop.hbase.util.FSUtils;
@@ -241,7 +249,6 @@ import org.apache.hadoop.hbase.zookeeper.ZooKeeperNodeTracker;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.metrics.util.MBeanUtil;
-import org.apache.hadoop.net.DNS;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.zookeeper.KeeperException;
@@ -296,6 +303,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
   // Cache flushing
   protected MemStoreFlusher cacheFlusher;
+
+  protected HeapMemoryManager hMemManager;
 
   // catalog tracker
   protected CatalogTracker catalogTracker;
@@ -571,8 +580,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     this.nonceManager = isNoncesEnabled ? new ServerNonceManager(this.conf) : null;
 
     this.maxScannerResultSize = conf.getLong(
-      HConstants.HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE_KEY,
-      HConstants.DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE);
+      HConstants.HBASE_SERVER_SCANNER_MAX_RESULT_SIZE_KEY,
+      HConstants.DEFAULT_HBASE_SERVER_SCANNER_MAX_RESULT_SIZE);
 
     this.numRegionsToReport = conf.getInt(
       "hbase.regionserver.numregionstoreport", 10);
@@ -590,10 +599,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       HConstants.DEFAULT_HBASE_CLIENT_SCANNER_TIMEOUT_PERIOD);
 
     // Server to handle client requests.
-    String hostname = conf.get("hbase.regionserver.ipc.address",
-      Strings.domainNamePointerToHostName(DNS.getDefaultHost(
-        conf.get("hbase.regionserver.dns.interface", "default"),
-        conf.get("hbase.regionserver.dns.nameserver", "default"))));
+    String hostname = getHostname(conf);
     int port = conf.getInt(HConstants.REGIONSERVER_PORT,
       HConstants.DEFAULT_REGIONSERVER_PORT);
     // Creation of a HSA will force a resolve.
@@ -633,12 +639,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     useZKForAssignment = ConfigUtil.useZKForAssignment(conf);
 
     // login the zookeeper client principal (if using security)
-    ZKUtil.loginClient(this.conf, "hbase.zookeeper.client.keytab.file",
-      "hbase.zookeeper.client.kerberos.principal", this.isa.getHostName());
+    ZKUtil.loginClient(this.conf, HConstants.ZK_CLIENT_KEYTAB_FILE,
+      HConstants.ZK_CLIENT_KERBEROS_PRINCIPAL, this.isa.getHostName());
 
     // login the server principal (if using secure Hadoop)
     userProvider.login("hbase.regionserver.keytab.file",
       "hbase.regionserver.kerberos.principal", this.isa.getHostName());
+    Superusers.initialize(conf);
+
     regionServerAccounting = new RegionServerAccounting();
     cacheConfig = new CacheConfig(conf);
     uncaughtExceptionHandler = new UncaughtExceptionHandler() {
@@ -652,6 +660,13 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     // Put up the webui. Webui may come up on port other than configured if
     // that port is occupied. Adjust serverInfo if this is the case.
     this.rsInfo.setInfoPort(putUpWebUI());
+  }
+
+  public static String getHostname(Configuration conf) throws UnknownHostException {
+    return conf.get("hbase.regionserver.ipc.address",
+        Strings.domainNamePointerToHostName(DNS.getDefaultHost(
+            conf.get("hbase.regionserver.dns.interface", "default"),
+            conf.get("hbase.regionserver.dns.nameserver", "default"))));
   }
 
   @Override
@@ -859,10 +874,9 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     }
 
     // Setup RPC client for master communication
+    // TODO: no single connection managed anywhere, so no central metrics object to obtain.
     rpcClient = new RpcClient(conf, clusterId, new InetSocketAddress(
-        this.isa.getAddress(), 0));
-    this.pauseMonitor = new JvmPauseMonitor(conf);
-    pauseMonitor.start();
+        this.isa.getAddress(), 0), null);
   }
 
   /**
@@ -890,11 +904,6 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           break;
         }
       }
-
-      // Initialize the RegionServerCoprocessorHost now that our ephemeral
-      // node was created by reportForDuty, in case any coprocessors want
-      // to use ZooKeeper
-      this.rsHost = new RegionServerCoprocessorHost(this, this.conf);
 
       if (!this.stopped && isHealthy()){
         // start the snapshot handler and other procedure handlers,
@@ -953,6 +962,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       mxBean = null;
     }
     if (this.leases != null) this.leases.closeAfterLeasesExpire();
+    if (this.pauseMonitor != null) pauseMonitor.stop();
     this.rpcServer.stop();
     if (this.splitLogWorker != null) {
       splitLogWorker.stop();
@@ -976,6 +986,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
     // Send interrupts to wake up threads if sleeping so they notice shutdown.
     // TODO: Should we check they are alive? If OOME could have exited already
+    if (this.hMemManager != null) this.hMemManager.stop();
     if (this.cacheFlusher != null) this.cacheFlusher.interruptIfNecessary();
     if (this.compactSplitThread != null) this.compactSplitThread.interruptIfNecessary();
     if (this.hlogRoller != null) this.hlogRoller.interruptIfNecessary();
@@ -1121,11 +1132,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       }
       // Couldn't connect to the master, get location from zk and reconnect
       // Method blocks until new master is found or we are stopped
-      createRegionServerStatusStub();
+      createRegionServerStatusStub(true);
     }
   }
 
-  ClusterStatusProtos.ServerLoad buildServerLoad(long reportStartTime, long reportEndTime) {
+  ClusterStatusProtos.ServerLoad buildServerLoad(long reportStartTime, long reportEndTime) 
+      throws IOException {
     // We're getting the MetricsRegionServerWrapper here because the wrapper computes requests
     // per second, and other metrics  As long as metrics are part of ServerLoad it's best to use
     // the wrapper to compute those numbers in one place.
@@ -1144,15 +1156,26 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     serverLoad.setTotalNumberOfRequests((int) regionServerWrapper.getTotalRequestCount());
     serverLoad.setUsedHeapMB((int)(memory.getUsed() / 1024 / 1024));
     serverLoad.setMaxHeapMB((int) (memory.getMax() / 1024 / 1024));
-    Set<String> coprocessors = this.hlog.getCoprocessorHost().getCoprocessors();
+    Set<String> coprocessors = getWAL(null).getCoprocessorHost().getCoprocessors();
+    Builder coprocessorBuilder = Coprocessor.newBuilder();
     for (String coprocessor : coprocessors) {
-      serverLoad.addCoprocessors(
-        Coprocessor.newBuilder().setName(coprocessor).build());
+      serverLoad.addCoprocessors(coprocessorBuilder.setName(coprocessor).build());
     }
     RegionLoad.Builder regionLoadBldr = RegionLoad.newBuilder();
     RegionSpecifier.Builder regionSpecifier = RegionSpecifier.newBuilder();
     for (HRegion region : regions) {
+      if (region.getCoprocessorHost() != null) {
+        Set<String> regionCoprocessors = region.getCoprocessorHost().getCoprocessors();
+        Iterator<String> iterator = regionCoprocessors.iterator();
+        while (iterator.hasNext()) {
+          serverLoad.addCoprocessors(coprocessorBuilder.setName(iterator.next()).build());
+        }
+      }
       serverLoad.addRegionLoads(createRegionLoad(region, regionLoadBldr, regionSpecifier));
+      for (String coprocessor : getWAL(region.getRegionInfo()).getCoprocessorHost()
+          .getCoprocessors()) {
+        serverLoad.addCoprocessors(coprocessorBuilder.setName(coprocessor).build());
+      }
     }
     serverLoad.setReportStartTime(reportStartTime);
     serverLoad.setReportEndTime(reportEndTime);
@@ -1161,6 +1184,22 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     } else {
       serverLoad.setInfoServerPort(-1);
     }
+
+    // for the replicationLoad purpose. Only need to get from one service
+    // either source or sink will get the same info
+    ReplicationSourceService rsources = getReplicationSourceService();
+
+    if (rsources != null) {
+      // always refresh first to get the latest value
+      ReplicationLoad rLoad = rsources.refreshAndGetReplicationLoad();
+      if (rLoad != null) {
+        serverLoad.setReplLoadSink(rLoad.getReplicationLoadSink());
+        for (ClusterStatusProtos.ReplicationLoadSource rLS : rLoad.getReplicationLoadSourceList()) {
+          serverLoad.addReplLoadSource(rLS);
+        }
+      }
+    }
+
     return serverLoad.build();
   }
 
@@ -1295,6 +1334,10 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       // Set our ephemeral znode up in zookeeper now we have a name.
       createMyEphemeralNode();
 
+      // Initialize the RegionServerCoprocessorHost now that our ephemeral
+      // node was created, in case any coprocessors want to use ZooKeeper
+      this.rsHost = new RegionServerCoprocessorHost(this, this.conf);
+
       // Save it in a file, this will allow to see if we crash
       ZNodeClearer.writeMyEphemeralNodeOnDisk(getMyEphemeralNodePath());
 
@@ -1313,10 +1356,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       this.hlog = setupWALAndReplication();
       // Init in here rather than in constructor after thread name has been set
       this.metricsRegionServer = new MetricsRegionServer(new MetricsRegionServerWrapperImpl(this));
+      // Metrics are up, now we can init the pause monitor
+      this.pauseMonitor = new JvmPauseMonitor(conf, metricsRegionServer.getMetricsSource());
+      pauseMonitor.start();
 
       spanReceiverHost = SpanReceiverHost.getInstance(getConfiguration());
 
       startServiceThreads();
+      startHeapMemoryManager();
       LOG.info("Serving as " + this.serverNameFromMasterPOV +
         ", RpcServer on " + this.isa +
         ", sessionid=0x" +
@@ -1329,6 +1376,13 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           "Region server startup failed");
     } finally {
       sleeper.skipSleepCycle();
+    }
+  }
+
+  private void startHeapMemoryManager() {
+    this.hMemManager = HeapMemoryManager.create(this);
+    if (this.hMemManager != null) {
+      this.hMemManager.start();
     }
   }
 
@@ -1483,7 +1537,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
               } else {
                 this.instance.compactSplitThread.requestCompaction(r, s, getName()
                     + " requests major compaction; use configured priority",
-                  this.majorCompactPriority, null);
+                  this.majorCompactPriority, null, null);
               }
             }
           } catch (IOException e) {
@@ -1651,6 +1705,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       conf.getInt("hbase.regionserver.executor.openregion.threads", 3));
     this.service.startExecutorService(ExecutorType.RS_OPEN_META,
       conf.getInt("hbase.regionserver.executor.openmeta.threads", 1));
+    this.service.startExecutorService(ExecutorType.RS_OPEN_PRIORITY_REGION,
+      conf.getInt("hbase.regionserver.executor.openpriorityregion.threads", 3));
     this.service.startExecutorService(ExecutorType.RS_CLOSE_REGION,
       conf.getInt("hbase.regionserver.executor.closeregion.threads", 3));
     this.service.startExecutorService(ExecutorType.RS_CLOSE_META,
@@ -1680,8 +1736,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
     // Leases is not a Thread. Internally it runs a daemon thread. If it gets
     // an unhandled exception, it will just exit.
-    this.leases.setName(n + ".leaseChecker");
-    this.leases.start();
+    Threads.setDaemonThreadRunning(this.leases.getThread(), n + ".leaseChecker",
+      uncaughtExceptionHandler);
 
     if (this.replicationSourceHandler == this.replicationSinkHandler &&
         this.replicationSourceHandler != null) {
@@ -1823,7 +1879,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
   @Override
   public void postOpenDeployTasks(final HRegion r, final CatalogTracker ct)
-  throws KeeperException, IOException {
+      throws KeeperException, IOException {
+    postOpenDeployTasks(new PostOpenDeployContext(r, -1), ct);
+  }
+
+  @Override
+  public void postOpenDeployTasks(final PostOpenDeployContext context, final CatalogTracker ct)
+      throws KeeperException, IOException {
+    HRegion r = context.getRegion();
+    long masterSystemTime = context.getMasterSystemTime();
     checkOpen();
     LOG.info("Post open deploy tasks for region=" + r.getRegionNameAsString());
     // Do checks to see if we need to compact (references or too many files)
@@ -1842,16 +1906,20 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     // Update flushed sequence id of a recovering region in ZK
     updateRecoveringRegionLastFlushedSequenceId(r);
 
-    // Update ZK, or META
-    if (r.getRegionInfo().isMetaRegion()) {
-      MetaRegionTracker.setMetaLocation(getZooKeeper(),
-          this.serverNameFromMasterPOV);
-    } else if (useZKForAssignment) {
-      MetaEditor.updateRegionLocation(ct, r.getRegionInfo(),
-        this.serverNameFromMasterPOV, openSeqNum);
+    if (useZKForAssignment) {
+      if (r.getRegionInfo().isMetaRegion()) {
+        LOG.info("Updating zk with meta location");
+        // The state field is for zk less assignment
+        // For zk assignment, always set it to OPEN
+        MetaRegionTracker.setMetaLocation(getZooKeeper(), this.serverNameFromMasterPOV, State.OPEN);
+      } else {
+        MetaEditor.updateRegionLocation(ct, r.getRegionInfo(), this.serverNameFromMasterPOV,
+          openSeqNum, masterSystemTime);
+      }
     }
-    if (!useZKForAssignment
-        && !reportRegionStateTransition(TransitionCode.OPENED, openSeqNum, r.getRegionInfo())) {
+     if (!useZKForAssignment
+        && !reportRegionStateTransition(new RegionStateTransitionContext(
+              TransitionCode.OPENED, openSeqNum, masterSystemTime, r.getRegionInfo()))) {
       throw new IOException("Failed to report opened region to master: "
           + r.getRegionNameAsString());
     }
@@ -1985,6 +2053,16 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
   @Override
   public boolean reportRegionStateTransition(TransitionCode code, long openSeqNum, HRegionInfo... hris) {
+    return reportRegionStateTransition(
+      new RegionStateTransitionContext(code, HConstants.NO_SEQNUM, -1, hris));
+  }
+
+  @Override
+  public boolean reportRegionStateTransition(RegionStateTransitionContext context) {
+    TransitionCode code = context.getCode();
+    long openSeqNum = context.getOpenSeqNum();
+    long masterSystemTime = context.getMasterSystemTime();
+    HRegionInfo[] hris = context.getHris();
     ReportRegionStateTransitionRequest.Builder builder = ReportRegionStateTransitionRequest.newBuilder();
     builder.setServer(ProtobufUtil.toServerName(serverName));
     RegionStateTransition.Builder transition = builder.addTransitionBuilder();
@@ -2023,21 +2101,33 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
   /**
    * Get the current master from ZooKeeper and open the RPC connection to it.
-   *
+   * To get a fresh connection, the current rssStub must be null.
    * Method will block until a master is available. You can break from this
    * block by requesting the server stop.
    *
    * @return master + port, or null if server has been stopped
    */
-  private synchronized ServerName
-  createRegionServerStatusStub() {
+  @VisibleForTesting
+  protected synchronized ServerName createRegionServerStatusStub() {
+    // Create RS stub without refreshing the master node from ZK, use cached data
+    return createRegionServerStatusStub(false);
+  }
+
+  /**
+   * Get the current master from ZooKeeper and open the RPC connection to it. To get a fresh
+   * connection, the current rssStub must be null. Method will block until a master is available.
+   * You can break from this block by requesting the server stop.
+   * @param refresh If true then master address will be read from ZK, otherwise use cached data
+   * @return master + port, or null if server has been stopped
+   */
+  @VisibleForTesting
+  protected synchronized ServerName createRegionServerStatusStub(boolean refresh) {
     if (rssStub != null) {
       return masterAddressTracker.getMasterAddress();
     }
     ServerName sn = null;
     long previousLogTime = 0;
     RegionServerStatusService.BlockingInterface master = null;
-    boolean refresh = false; // for the first time, use cached data
     RegionServerStatusService.BlockingInterface intf = null;
     while (keepLooping() && master == null) {
       sn = this.masterAddressTracker.getMasterAddress(refresh);
@@ -2100,7 +2190,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
    * @throws IOException
    */
   private RegionServerStartupResponse reportForDuty() throws IOException {
-    ServerName masterServerName = createRegionServerStatusStub();
+    ServerName masterServerName = createRegionServerStatusStub(true);
     if (masterServerName == null) return null;
     RegionServerStartupResponse result = null;
     try {
@@ -2124,21 +2214,22 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         LOG.debug("Master is not running yet");
       } else {
         LOG.warn("error telling master we are up", se);
+        rssStub = null;
       }
     }
     return result;
   }
 
   @Override
-  public long getLastSequenceId(byte[] region) {
-    Long lastFlushedSequenceId = -1l;
+  public long getLastSequenceId(byte[] encodedRegionName) {
+    long lastFlushedSequenceId = -1L;
     try {
       GetLastFlushedSequenceIdRequest req = RequestConverter
-          .buildGetLastFlushedSequenceIdRequest(region);
+          .buildGetLastFlushedSequenceIdRequest(encodedRegionName);
       lastFlushedSequenceId = rssStub.getLastFlushedSequenceId(null, req)
           .getLastFlushedSequenceId();
     } catch (ServiceException e) {
-      lastFlushedSequenceId = -1l;
+      lastFlushedSequenceId = -1L;
       LOG.warn("Unable to connect to the master to check " + "the last flushed sequence id", e);
     }
     return lastFlushedSequenceId;
@@ -2556,19 +2647,23 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         RegionScanner s = rsh.s;
         LOG.info("Scanner " + this.scannerName + " lease expired on region "
             + s.getRegionInfo().getRegionNameAsString());
+        HRegion region = null;
         try {
-          HRegion region = getRegion(s.getRegionInfo().getRegionName());
+          region = getRegion(s.getRegionInfo().getRegionName());
           if (region != null && region.getCoprocessorHost() != null) {
             region.getCoprocessorHost().preScannerClose(s);
           }
-
-          s.close();
-          if (region != null && region.getCoprocessorHost() != null) {
-            region.getCoprocessorHost().postScannerClose(s);
-          }
         } catch (IOException e) {
-          LOG.error("Closing scanner for "
-              + s.getRegionInfo().getRegionNameAsString(), e);
+          LOG.error("Closing scanner for " + s.getRegionInfo().getRegionNameAsString(), e);
+        } finally {
+          try {
+            s.close();
+            if (region != null && region.getCoprocessorHost() != null) {
+              region.getCoprocessorHost().postScannerClose(s);
+            }
+          } catch (IOException e) {
+            LOG.error("Closing scanner for " + s.getRegionInfo().getRegionNameAsString(), e);
+          }
         }
       } else {
         LOG.info("Scanner " + this.scannerName + " lease expired");
@@ -3142,9 +3237,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       if (request.hasScannerId()) {
         rsh = scanners.get(scannerName);
         if (rsh == null) {
-          LOG.info("Client tried to access missing scanner " + scannerName);
+          LOG.warn("Client tried to access missing scanner " + scannerName);
           throw new UnknownScannerException(
-            "Name: " + scannerName + ", already closed?");
+            "Unknown scanner '" + scannerName + "'. This can happen due to any of the following "
+                + "reasons: a) Scanner id given is wrong, b) Scanner lease expired because of "
+                + "long wait between consecutive client checkins, c) Server may be closing down, "
+                + "d) RegionServer restart during upgrade.\nIf the issue is due to reason (b), a "
+                + "possible fix would be increasing the value of"
+                + "'hbase.client.scanner.timeout.period' configuration.");
         }
         scanner = rsh.s;
         HRegionInfo hri = scanner.getRegionInfo();
@@ -3177,7 +3277,16 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         scannerName = String.valueOf(scannerId);
         ttl = this.scannerLeaseTimeoutPeriod;
       }
-
+      if (request.hasRenew() && request.getRenew()) {
+        rsh = scanners.get(scannerName);
+        lease = leases.removeLease(scannerName);
+        if (lease != null && rsh != null) {
+          leases.addLease(lease);
+          // Increment the nextCallSeq value which is the next expected from client.
+          rsh.incNextCallSeq();
+        }
+        return builder.build();
+      }
       if (rows > 0) {
         // if nextCallSeq does not match throw Exception straight away. This needs to be
         // performed even before checking of Lease.
@@ -3187,20 +3296,22 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
             rsh = scanners.get(scannerName);
           }
           if (rsh != null) {
-            if (request.getNextCallSeq() != rsh.nextCallSeq) {
-              throw new OutOfOrderScannerNextException("Expected nextCallSeq: " + rsh.nextCallSeq
+            if (request.getNextCallSeq() != rsh.getNextCallSeq()) {
+              throw new OutOfOrderScannerNextException("Expected nextCallSeq: " + rsh.getNextCallSeq()
                 + " But the nextCallSeq got from client: " + request.getNextCallSeq() +
                 "; request=" + TextFormat.shortDebugString(request));
             }
             // Increment the nextCallSeq value which is the next expected from client.
-            rsh.nextCallSeq++;
+            rsh.incNextCallSeq();
           }
         }
         try {
           // Remove lease while its being processed in server; protects against case
           // where processing of request takes > lease expiration time.
           lease = leases.removeLease(scannerName);
-          List<Result> results = new ArrayList<Result>(rows);
+          // Limit the initial allocation of the result array to the minimum
+          // of 'rows' or 100
+          List<Result> results = new ArrayList<Result>(Math.min(rows, 100));
           long currentScanResultSize = 0;
           long totalKvSize = 0;
 
@@ -3214,7 +3325,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
                 if (maxScannerResultSize < Long.MAX_VALUE){
                   for (Cell cell : r.rawCells()) {
                     KeyValue kv = KeyValueUtil.ensureKeyValue(cell);
-                    currentScanResultSize += kv.heapSize();
+                    currentScanResultSize += kv.heapSizeWithoutTags();
                     totalKvSize += kv.getLength();
                   }
                 }
@@ -3235,18 +3346,20 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
             try {
               int i = 0;
               synchronized(scanner) {
+                boolean moreRows = false;
                 while (i < rows) {
                   // Stop collecting results if maxScannerResultSize is set and we have exceeded it
-                  if ((maxScannerResultSize < Long.MAX_VALUE) &&
+                  if ((maxResultSize < Long.MAX_VALUE) &&
                       (currentScanResultSize >= maxResultSize)) {
+                    builder.setMoreResultsInRegion(true);
                     break;
                   }
                   // Collect values to be returned here
-                  boolean moreRows = scanner.nextRaw(values);
+                  moreRows = scanner.nextRaw(values);
                   if (!values.isEmpty()) {
                     for (Cell cell : values) {
                       KeyValue kv = KeyValueUtil.ensureKeyValue(cell);
-                      currentScanResultSize += kv.heapSize();
+                      currentScanResultSize += kv.heapSizeWithoutTags();
                       totalKvSize += kv.getLength();
                     }
                     results.add(Result.create(values));
@@ -3257,9 +3370,19 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
                   }
                   values.clear();
                 }
+                if (currentScanResultSize >= maxResultSize || i >= rows || moreRows) {
+                  // We stopped prematurely
+                  builder.setMoreResultsInRegion(true);
+                } else {
+                  // We didn't get a single batch
+                  builder.setMoreResultsInRegion(false);
+                }
               }
               region.readRequestsCount.add(i);
               region.getMetrics().updateScanNext(totalKvSize);
+              if (metricsRegionServer != null) {
+                metricsRegionServer.updateScannerNext(totalKvSize);
+              }
             } finally {
               region.closeRegionOperation();
             }
@@ -3279,6 +3402,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           } else {
             addResults(builder, results, controller);
           }
+        } catch (IOException e) {
+          // if we have an exception on scanner next and we are using the callSeq
+          // we should rollback because the client will retry with the same callSeq
+          // and get an OutOfOrderScannerNextException if we don't do so.
+          if (rsh != null && request.hasNextCallSeq()) {
+            rsh.rollbackNextCallSeq();
+          }
+          throw e;
         } finally {
           // We're done. On way out re-add the above removed lease.
           // Adding resets expiration time on lease.
@@ -3418,10 +3549,11 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   }
 
   @Override
-  public CoprocessorServiceResponse execRegionServerService(final RpcController controller,
+  public CoprocessorServiceResponse execRegionServerService(
+      @SuppressWarnings("UnusedParameters") final RpcController controller,
       final CoprocessorServiceRequest serviceRequest) throws ServiceException {
     try {
-      ServerRpcController execController = new ServerRpcController();
+      ServerRpcController serviceController = new ServerRpcController();
       CoprocessorServiceCall call = serviceRequest.getCall();
       String serviceName = call.getServiceName();
       String methodName = call.getMethodName();
@@ -3436,12 +3568,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         throw new UnknownProtocolException(service.getClass(), "Unknown method " + methodName
             + " called on service " + serviceName);
       }
-      Message request =
-          service.getRequestPrototype(methodDesc).newBuilderForType().mergeFrom(call.getRequest())
-              .build();
+      Message.Builder builderForType = service.getRequestPrototype(methodDesc).newBuilderForType();
+      ProtobufUtil.mergeFrom(builderForType, call.getRequest());
+      Message request = builderForType.build();
       final Message.Builder responseBuilder =
           service.getResponsePrototype(methodDesc).newBuilderForType();
-      service.callMethod(methodDesc, controller, request, new RpcCallback<Message>() {
+      service.callMethod(methodDesc, serviceController, request, new RpcCallback<Message>() {
         @Override
         public void run(Message message) {
           if (message != null) {
@@ -3449,10 +3581,11 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           }
         }
       });
-      Message execResult = responseBuilder.build();
-      if (execController.getFailedOn() != null) {
-        throw execController.getFailedOn();
+      IOException exception = ResponseConverter.getControllerException(serviceController);
+      if (exception != null) {
+        throw exception;
       }
+      Message execResult = responseBuilder.build();
       ClientProtos.CoprocessorServiceResponse.Builder builder =
           ClientProtos.CoprocessorServiceResponse.newBuilder();
       builder.setRegion(RequestConverter.buildRegionSpecifier(RegionSpecifierType.REGION_NAME,
@@ -3510,16 +3643,22 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     MultiResponse.Builder responseBuilder = MultiResponse.newBuilder();
     RegionActionResult.Builder regionActionResultBuilder = RegionActionResult.newBuilder();
     Boolean processed = null;
-
+    Map<RegionSpecifier, ClientProtos.RegionLoadStats> regionStats =
+      new HashMap<RegionSpecifier, ClientProtos.RegionLoadStats>(request.getRegionActionCount());
     for (RegionAction regionAction : request.getRegionActionList()) {
       this.requestCount.add(regionAction.getActionCount());
       HRegion region;
       regionActionResultBuilder.clear();
+      RegionSpecifier regionSpecifier = regionAction.getRegion();
       try {
-        region = getRegion(regionAction.getRegion());
+        region = getRegion(regionSpecifier);
       } catch (IOException e) {
+        rpcServer.getMetrics().exception(e);
         regionActionResultBuilder.setException(ResponseConverter.buildException(e));
         responseBuilder.addRegionActionResult(regionActionResultBuilder.build());
+        if (cellScanner != null) {
+          skipCellsForMutations(regionAction.getActionList(), cellScanner);
+        }
         continue;  // For this region it's a failure.
       }
 
@@ -3536,12 +3675,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
             ByteArrayComparable comparator =
               ProtobufUtil.toComparator(condition.getComparator());
             processed = checkAndRowMutate(region, regionAction.getActionList(),
-              cellScanner, row, family, qualifier, compareOp, comparator);
+              cellScanner, row, family, qualifier, compareOp, comparator, regionActionResultBuilder);
           } else {
-            mutateRows(region, regionAction.getActionList(), cellScanner);
+            mutateRows(region, regionAction.getActionList(),
+              cellScanner, regionActionResultBuilder);
             processed = Boolean.TRUE;
           }
         } catch (IOException e) {
+          rpcServer.getMetrics().exception(e);
           // As it's atomic, we may expect it's a global failure.
           regionActionResultBuilder.setException(ResponseConverter.buildException(e));
         }
@@ -3551,13 +3692,48 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
             regionActionResultBuilder, cellsToReturn, nonceGroup);
       }
       responseBuilder.addRegionActionResult(regionActionResultBuilder.build());
+      ClientProtos.RegionLoadStats regionLoadStats = ((HRegion)region).getLoadStatistics();
+      if(regionLoadStats != null) {
+        regionStats.put(regionSpecifier, regionLoadStats);
+      }
     }
     // Load the controller with the Cells to return.
     if (cellsToReturn != null && !cellsToReturn.isEmpty() && controller != null) {
       controller.setCellScanner(CellUtil.createCellScanner(cellsToReturn));
     }
     if (processed != null) responseBuilder.setProcessed(processed);
+    ClientProtos.MultiRegionLoadStats.Builder builder =
+      ClientProtos.MultiRegionLoadStats.newBuilder();
+    for(Entry<RegionSpecifier, ClientProtos.RegionLoadStats> stat: regionStats.entrySet()){
+      builder.addRegion(stat.getKey());
+      builder.addStat(stat.getValue());
+    }
+    responseBuilder.setRegionStatistics(builder);
     return responseBuilder.build();
+  }
+
+  private void skipCellsForMutations(List<ClientProtos.Action> actions, CellScanner cellScanner) {
+    for (ClientProtos.Action action : actions) {
+      skipCellsForMutation(action, cellScanner);
+    }
+  }
+
+  private void skipCellsForMutation(ClientProtos.Action action, CellScanner cellScanner) {
+    try {
+      if (action.hasMutation()) {
+        MutationProto m = action.getMutation();
+        if (m.hasAssociatedCellCount()) {
+          for (int i = 0; i < m.getAssociatedCellCount(); i++) {
+            cellScanner.advance();
+          }
+        }
+      }
+    } catch (IOException e) {
+      // No need to handle these Individual Muatation level issue. Any way this entire RegionAction
+      // marked as failed as we could not see the Region here. At client side the top level
+      // RegionAction exception will be considered first.
+      LOG.error("Error while skipping Cells in CellScanner for invalid Region Mutations", e);
+    }
   }
 
   /**
@@ -3584,8 +3760,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       try {
         Result r = null;
         if (action.hasGet()) {
-          Get get = ProtobufUtil.toGet(action.getGet());
-          r = region.get(get);
+          long before = EnvironmentEdgeManager.currentTimeMillis();
+          try {
+            Get get = ProtobufUtil.toGet(action.getGet());
+            r = region.get(get);
+          } finally {
+            if (metricsRegionServer != null) {
+              metricsRegionServer.updateGet(EnvironmentEdgeManager.currentTimeMillis() - before);
+            }
+          }
         } else if (action.hasServiceCall()) {
           resultOrExceptionBuilder = ResultOrException.newBuilder();
           try {
@@ -3598,6 +3781,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
                     .setName(result.getClass().getName())
                     .setValue(result.toByteString())));
           } catch (IOException ioe) {
+            rpcServer.getMetrics().exception(ioe);
             resultOrExceptionBuilder.setException(ResponseConverter.buildException(ioe));
           }
         } else if (action.hasMutation()) {
@@ -3647,6 +3831,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         // case the corresponding ResultOrException instance for the Put or Delete will be added
         // down in the doBatchOp method call rather than up here.
       } catch (IOException ie) {
+        rpcServer.getMetrics().exception(ie);
         resultOrExceptionBuilder = ResultOrException.newBuilder().
           setException(ResponseConverter.buildException(ie));
       }
@@ -3781,6 +3966,9 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     final Map<TableName, HTableDescriptor> htds =
         new HashMap<TableName, HTableDescriptor>(regionCount);
     final boolean isBulkAssign = regionCount > 1;
+
+    long masterSystemTime = request.hasMasterSystemTime() ? request.getMasterSystemTime() : -1;
+
     for (RegionOpenInfo regionOpenInfo : request.getOpenInfoList()) {
       final HRegionInfo region = HRegionInfo.convert(regionOpenInfo.getRegion());
 
@@ -3871,12 +4059,17 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           // Need to pass the expected version in the constructor.
           if (region.isMetaRegion()) {
             this.service.submit(new OpenMetaHandler(this, this, region, htd,
-                versionOfOfflineNode));
+                versionOfOfflineNode, masterSystemTime));
           } else {
             updateRegionFavoredNodesMapping(region.getEncodedName(),
                 regionOpenInfo.getFavoredNodesList());
-            this.service.submit(new OpenRegionHandler(this, this, region, htd,
-                versionOfOfflineNode));
+            if (htd.getPriority() >= HConstants.ADMIN_QOS || region.getTable().isSystemTable()) {
+              this.service.submit(new OpenPriorityRegionHandler(this, this, region, htd,
+                versionOfOfflineNode, masterSystemTime));
+            } else {
+              this.service.submit(new OpenRegionHandler(this, this, region, htd,
+                versionOfOfflineNode, masterSystemTime));
+            }
           }
         }
 
@@ -3953,12 +4146,6 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         }
       }
       final String encodedRegionName = ProtobufUtil.getRegionEncodedName(request.getRegion());
-
-      // Can be null if we're calling close on a region that's not online
-      final HRegion region = this.getFromOnlineRegions(encodedRegionName);
-      if ((region  != null) && (region .getCoprocessorHost() != null)) {
-        region.getCoprocessorHost().preClose(false);
-      }
 
       requestCount.increment();
       LOG.info("Close " + encodedRegionName + ", via zk=" + (zk ? "yes" : "no") +
@@ -4049,8 +4236,11 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         splitPoint = request.getSplitPoint().toByteArray();
       }
       region.forceSplit(splitPoint);
-      compactSplitThread.requestSplit(region, region.checkSplit());
+      compactSplitThread.requestSplit(region, region.checkSplit(), RpcServer.getRequestUser());
       return SplitRegionResponse.newBuilder().build();
+    } catch (DroppedSnapshotException ex) {
+      abort("Replay of WAL required. Forcing server shutdown", ex);
+      throw new ServiceException(ex);
     } catch (IOException ie) {
       throw new ServiceException(ie);
     }
@@ -4074,6 +4264,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       HRegion regionA = getRegion(request.getRegionA());
       HRegion regionB = getRegion(request.getRegionB());
       boolean forcible = request.getForcible();
+      long masterSystemTime = request.hasMasterSystemTime() ? request.getMasterSystemTime() : -1;
       regionA.startRegionOperation(Operation.MERGE_REGION);
       regionB.startRegionOperation(Operation.MERGE_REGION);
       LOG.info("Receiving merging request for  " + regionA + ", " + regionB
@@ -4090,8 +4281,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         long endTime = EnvironmentEdgeManager.currentTimeMillis();
         metricsRegionServer.updateFlushTime(endTime - startTime);
       }
-      compactSplitThread.requestRegionsMerge(regionA, regionB, forcible);
+      compactSplitThread.requestRegionsMerge(regionA, regionB, forcible, masterSystemTime,
+        RpcServer.getRequestUser());
       return MergeRegionsResponse.newBuilder().build();
+    } catch (DroppedSnapshotException ex) {
+      abort("Replay of WAL required. Forcing server shutdown", ex);
+      throw new ServiceException(ex);
     } catch (IOException ie) {
       throw new ServiceException(ie);
     }
@@ -4142,10 +4337,10 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       String log = "User-triggered " + (major ? "major " : "") + "compaction" + familyLogMsg;
       if(family != null) {
         compactSplitThread.requestCompaction(region, store, log,
-          Store.PRIORITY_USER, null);
+          Store.PRIORITY_USER, null, RpcServer.getRequestUser());
       } else {
         compactSplitThread.requestCompaction(region, log,
-          Store.PRIORITY_USER, null);
+          Store.PRIORITY_USER, null, RpcServer.getRequestUser());
       }
       return CompactRegionResponse.newBuilder().build();
     } catch (IOException ie) {
@@ -4166,13 +4361,18 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       final ReplicateWALEntryRequest request)
   throws ServiceException {
     try {
+      checkOpen();
       if (replicationSinkHandler != null) {
-        checkOpen();
         requestCount.increment();
-        this.replicationSinkHandler.replicateLogEntries(request.getEntryList(),
-          ((PayloadCarryingRpcController)controller).cellScanner());
+        List<WALEntry> entries = request.getEntryList();
+        CellScanner cellScanner = ((PayloadCarryingRpcController)controller).cellScanner();
+        rsHost.preReplicateLogEntries(entries, cellScanner);
+        replicationSinkHandler.replicateLogEntries(entries, cellScanner);
+        rsHost.postReplicateLogEntries(entries, cellScanner);
+        return ReplicateWALEntryResponse.newBuilder().build();
+      } else {
+        throw new ServiceException("Replication services are not initialized yet");
       }
-      return ReplicateWALEntryResponse.newBuilder().build();
     } catch (IOException ie) {
       throw new ServiceException(ie);
     }
@@ -4330,8 +4530,19 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
    */
   protected HRegion getRegion(
       final RegionSpecifier regionSpecifier) throws IOException {
-    return getRegionByEncodedName(regionSpecifier.getValue().toByteArray(),
-        ProtobufUtil.getRegionEncodedName(regionSpecifier));
+    ByteString value = regionSpecifier.getValue();
+    RegionSpecifierType type = regionSpecifier.getType();
+    switch (type) {
+    case REGION_NAME:
+      byte[] regionName = value.toByteArray();
+      String encodedRegionName = HRegionInfo.encodeRegionName(regionName);
+      return getRegionByEncodedName(regionName, encodedRegionName);
+    case ENCODED_REGION_NAME:
+      return getRegionByEncodedName(value.toStringUtf8());
+    default:
+      throw new DoNotRetryIOException(
+        "Unsupported region specifier type: " + type);
+    }
   }
 
   /**
@@ -4496,7 +4707,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
             break;
 
           case SUCCESS:
-            builder.addResultOrException(getResultOrException(ClientProtos.Result.getDefaultInstance(), index));
+            builder.addResultOrException(getResultOrException(
+              ClientProtos.Result.getDefaultInstance(), index));
             break;
         }
       }
@@ -4513,10 +4725,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       metricsRegionServer.updateDelete(after - before);
     }
   }
+
   private static ResultOrException getResultOrException(final ClientProtos.Result r,
       final int index) {
     return getResultOrException(ResponseConverter.buildActionResult(r), index);
   }
+
   private static ResultOrException getResultOrException(final Exception e, final int index) {
     return getResultOrException(ResponseConverter.buildActionResult(e), index);
   }
@@ -4585,13 +4799,17 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
    * @param cellScanner if non-null, the mutation data -- the Cell content.
    * @throws IOException
    */
-  protected void mutateRows(final HRegion region, final List<ClientProtos.Action> actions,
-      final CellScanner cellScanner)
-  throws IOException {
+  protected ClientProtos.RegionLoadStats mutateRows(final HRegion region,
+      final List<ClientProtos.Action> actions, final CellScanner cellScanner,
+      RegionActionResult.Builder builder)
+      throws IOException {
     if (!region.getRegionInfo().isMetaTable()) {
       cacheFlusher.reclaimMemStoreMemory();
     }
     RowMutations rm = null;
+    int i = 0;
+    ClientProtos.ResultOrException.Builder resultOrExceptionOrBuilder =
+      ClientProtos.ResultOrException.newBuilder();
     for (ClientProtos.Action action: actions) {
       if (action.hasGet()) {
         throw new DoNotRetryIOException("Atomic put and/or delete only, not a Get=" +
@@ -4611,8 +4829,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       default:
           throw new DoNotRetryIOException("Atomic put and/or delete only, not " + type.name());
       }
+      // To unify the response format with doNonAtomicRegionMutation and read through client's
+      // AsyncProcess we have to add an empty result instance per operation
+      resultOrExceptionOrBuilder.clear();
+      resultOrExceptionOrBuilder.setIndex(i++);
+      builder.addResultOrException(
+        resultOrExceptionOrBuilder.build());
     }
     region.mutateRow(rm);
+    return region.getLoadStatistics();
   }
 
   /**
@@ -4630,11 +4855,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
    */
   private boolean checkAndRowMutate(final HRegion region, final List<ClientProtos.Action> actions,
       final CellScanner cellScanner, byte[] row, byte[] family, byte[] qualifier,
-      CompareOp compareOp, ByteArrayComparable comparator) throws IOException {
+      CompareOp compareOp, ByteArrayComparable comparator,
+      RegionActionResult.Builder builder) throws IOException {
     if (!region.getRegionInfo().isMetaTable()) {
       cacheFlusher.reclaimMemStoreMemory();
     }
     RowMutations rm = null;
+    int i = 0;
+    ClientProtos.ResultOrException.Builder resultOrExceptionOrBuilder =
+      ClientProtos.ResultOrException.newBuilder();
     for (ClientProtos.Action action: actions) {
       if (action.hasGet()) {
         throw new DoNotRetryIOException("Atomic put and/or delete only, not a Get=" +
@@ -4654,8 +4883,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       default:
         throw new DoNotRetryIOException("Atomic put and/or delete only, not " + type.name());
       }
+      // To unify the response format with doNonAtomicRegionMutation and read through client's
+      // AsyncProcess we have to add an empty result instance per operation
+      resultOrExceptionOrBuilder.clear();
+      resultOrExceptionOrBuilder.setIndex(i++);
+      builder.addResultOrException(
+        resultOrExceptionOrBuilder.build());
     }
-    return region.checkAndRowMutate(row, family, qualifier, compareOp, comparator, rm, Boolean.TRUE);
+    return region.checkAndRowMutate(row, family, qualifier, compareOp,
+      comparator, rm, Boolean.TRUE);
   }
 
   private static class MovedRegionInfo {
@@ -4784,13 +5020,25 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
    * Holder class which holds the RegionScanner and nextCallSeq together.
    */
   private static class RegionScannerHolder {
+    private AtomicLong nextCallSeq = new AtomicLong(0);
     private RegionScanner s;
-    private long nextCallSeq = 0L;
     private HRegion r;
 
     public RegionScannerHolder(RegionScanner s, HRegion r) {
       this.s = s;
       this.r = r;
+    }
+
+    private long getNextCallSeq() {
+      return nextCallSeq.get();
+    }
+
+    private void incNextCallSeq() {
+      nextCallSeq.incrementAndGet();
+    }
+
+    private void rollbackNextCallSeq() {
+      nextCallSeq.decrementAndGet();
     }
   }
 
@@ -4906,4 +5154,22 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     return this.cacheConfig;
   }
 
+  @Override
+  public HeapMemoryManager getHeapMemoryManager() {
+    return hMemManager;
+  }
+
+  @Override
+  public double getCompactionPressure() {
+    double max = 0;
+    for (HRegion region : onlineRegions.values()) {
+      for (Store store : region.getStores().values()) {
+        double normCount = store.getCompactionPressure();
+        if (normCount > max) {
+          max = normCount;
+        }
+      }
+    }
+    return max;
+  }
 }

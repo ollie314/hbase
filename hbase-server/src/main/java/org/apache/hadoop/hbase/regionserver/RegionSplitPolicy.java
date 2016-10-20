@@ -106,7 +106,7 @@ public abstract class RegionSplitPolicy extends Configured {
     return policy;
   }
 
-  static Class<? extends RegionSplitPolicy> getSplitPolicyClass(
+  public static Class<? extends RegionSplitPolicy> getSplitPolicyClass(
       HTableDescriptor htd, Configuration conf) throws IOException {
     String className = htd.getRegionSplitPolicyClassName();
     if (className == null) {
@@ -124,5 +124,28 @@ public abstract class RegionSplitPolicy extends Configured {
           className + "' for table '" + htd.getTableName() + "'",
           e);
     }
+  }
+
+  /**
+   * In {@link HRegionFileSystem#splitStoreFile(org.apache.hadoop.hbase.HRegionInfo, String,
+   * StoreFile, byte[], boolean, RegionSplitPolicy)} we are not creating the split reference
+   * if split row not lies in the StoreFile range. But in some use cases we may need to create
+   * the split reference even when the split row not lies in the range. This method can be used
+   * to decide, whether to skip the the StoreFile range check or not.
+   * @return whether to skip the StoreFile range check or not
+   * @deprecated Use {@link #skipStoreFileRangeCheck(String)}} instead
+   */
+  @Deprecated
+  protected boolean skipStoreFileRangeCheck() {
+    return false;
+  }
+
+  /**
+   * See {@link #skipStoreFileRangeCheck()} javadoc.
+   * @param familyName
+   * @return whether to skip the StoreFile range check or not
+   */
+  protected boolean skipStoreFileRangeCheck(String familyName) {
+    return skipStoreFileRangeCheck();
   }
 }

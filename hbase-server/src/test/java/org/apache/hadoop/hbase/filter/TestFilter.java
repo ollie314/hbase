@@ -38,7 +38,6 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
@@ -50,6 +49,7 @@ import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.InternalScanner;
 import org.apache.hadoop.hbase.regionserver.RegionScanner;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.After;
 import org.junit.Assert;
@@ -708,6 +708,43 @@ public class TestFilter {
     expectedRows = this.numRows / 2;
     s = new Scan(Bytes.toBytes("testRowTwo-0"));
     s.setFilter(new InclusiveStopFilter(Bytes.toBytes("testRowTwo-3")));
+    verifyScan(s, expectedRows, expectedKeys);
+
+  }
+
+  @Test
+  public void testInclusiveStopFilterWithReverseScan() throws IOException {
+
+    // Grab rows from group one
+
+    // If we just use start/stop row, we get total/2 - 1 rows
+    long expectedRows = (this.numRows / 2) - 1;
+    long expectedKeys = this.colsPerRow;
+    Scan s = new Scan(Bytes.toBytes("testRowOne-3"), Bytes.toBytes("testRowOne-0"));
+    s.setReversed(true);
+    verifyScan(s, expectedRows, expectedKeys);
+
+    // Now use start row with inclusive stop filter
+    expectedRows = this.numRows / 2;
+    s = new Scan(Bytes.toBytes("testRowOne-3"));
+    s.setReversed(true);
+    s.setFilter(new InclusiveStopFilter(Bytes.toBytes("testRowOne-0")));
+    verifyScan(s, expectedRows, expectedKeys);
+
+    // Grab rows from group two
+
+    // If we just use start/stop row, we get total/2 - 1 rows
+    expectedRows = (this.numRows / 2) - 1;
+    expectedKeys = this.colsPerRow;
+    s = new Scan(Bytes.toBytes("testRowTwo-3"), Bytes.toBytes("testRowTwo-0"));
+    s.setReversed(true);
+    verifyScan(s, expectedRows, expectedKeys);
+
+    // Now use start row with inclusive stop filter
+    expectedRows = this.numRows / 2;
+    s = new Scan(Bytes.toBytes("testRowTwo-3"));
+    s.setReversed(true);
+    s.setFilter(new InclusiveStopFilter(Bytes.toBytes("testRowTwo-0")));
     verifyScan(s, expectedRows, expectedKeys);
 
   }

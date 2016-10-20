@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.hbase.snapshot;
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.util.ArrayList;
@@ -59,7 +60,7 @@ public class SnapshotManifestV2 {
 
   public static final int DESCRIPTOR_VERSION = 2;
 
-  private static final String SNAPSHOT_MANIFEST_PREFIX = "region-manifest.";
+  public static final String SNAPSHOT_MANIFEST_PREFIX = "region-manifest.";
 
   static class ManifestBuilder implements SnapshotManifest.RegionVisitor<
                     SnapshotRegionManifest.Builder, SnapshotRegionManifest.FamilyFiles.Builder> {
@@ -80,12 +81,18 @@ public class SnapshotManifestV2 {
     }
 
     public void regionClose(final SnapshotRegionManifest.Builder region) throws IOException {
-      SnapshotRegionManifest manifest = region.build();
-      FSDataOutputStream stream = fs.create(getRegionManifestPath(snapshotDir, manifest));
-      try {
-        manifest.writeTo(stream);
-      } finally {
-        stream.close();
+      // we should ensure the snapshot dir exist, maybe it has been deleted by master
+      // see HBASE-16464
+      if (fs.exists(snapshotDir)) {
+        SnapshotRegionManifest manifest = region.build();
+        FSDataOutputStream stream = fs.create(getRegionManifestPath(snapshotDir, manifest));
+        try {
+          manifest.writeTo(stream);
+        } finally {
+          stream.close();
+        }
+      } else {
+        LOG.warn("can't write manifest without parent dir, maybe it has been deleted by master?");
       }
     }
 
@@ -153,9 +160,15 @@ public class SnapshotManifestV2 {
     } catch (InterruptedException e) {
       throw new InterruptedIOException(e.getMessage());
     } catch (ExecutionException e) {
-      IOException ex = new IOException();
-      ex.initCause(e.getCause());
-      throw ex;
+      Throwable t = e.getCause();
+
+      if(t instanceof InvalidProtocolBufferException) {
+        throw (InvalidProtocolBufferException)t;
+      } else {
+        IOException ex = new IOException("ExecutionException");
+        ex.initCause(e.getCause());
+        throw ex;
+      }
     }
     return regionsManifest;
   }

@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -46,7 +47,6 @@ import org.apache.hadoop.io.WritableComparable;
 
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.hbase.util.ByteStringer;
-import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
  * An HColumnDescriptor contains information about a column family such as the
@@ -107,8 +107,13 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   public static final String KEEP_DELETED_CELLS = "KEEP_DELETED_CELLS";
   public static final String COMPRESS_TAGS = "COMPRESS_TAGS";
 
+  @InterfaceStability.Unstable
   public static final String ENCRYPTION = "ENCRYPTION";
+  @InterfaceStability.Unstable
   public static final String ENCRYPTION_KEY = "ENCRYPTION_KEY";
+
+  public static final String DFS_REPLICATION = "DFS_REPLICATION";
+  public static final short DEFAULT_DFS_REPLICATION = 0;
 
   /**
    * Default compression type.
@@ -441,11 +446,11 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     setBlockCacheEnabled(blockCacheEnabled);
     setTimeToLive(timeToLive);
     setCompressionType(Compression.Algorithm.
-      valueOf(compression.toUpperCase()));
+      valueOf(compression.toUpperCase(Locale.ROOT)));
     setDataBlockEncoding(DataBlockEncoding.
-        valueOf(dataBlockEncoding.toUpperCase()));
+        valueOf(dataBlockEncoding.toUpperCase(Locale.ROOT)));
     setBloomFilterType(BloomType.
-      valueOf(bloomFilter.toUpperCase()));
+      valueOf(bloomFilter.toUpperCase(Locale.ROOT)));
     setBlocksize(blocksize);
     setScope(scope);
   }
@@ -564,7 +569,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     if (n == null) {
       return Compression.Algorithm.NONE;
     }
-    return Compression.Algorithm.valueOf(n.toUpperCase());
+    return Compression.Algorithm.valueOf(n.toUpperCase(Locale.ROOT));
   }
 
   /** @return compression type being used for the column family for major
@@ -574,7 +579,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     if (n == null) {
       return getCompression();
     }
-    return Compression.Algorithm.valueOf(n.toUpperCase());
+    return Compression.Algorithm.valueOf(n.toUpperCase(Locale.ROOT));
   }
 
   /** @return maximum number of versions */
@@ -603,6 +608,30 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     }
     setValue(HConstants.VERSIONS, Integer.toString(maxVersions));
     cachedMaxVersions = maxVersions;
+    return this;
+  }
+
+  /**
+   * Set minimum and maximum versions to keep
+   *
+   * @param minVersions minimal number of versions
+   * @param maxVersions maximum number of versions
+   * @return this (for chained invocation)
+   */
+  public HColumnDescriptor setVersions(int minVersions, int maxVersions) {
+    if (minVersions <= 0) {
+      // TODO: Allow minVersion and maxVersion of 0 to be the way you say "Keep all versions".
+      // Until there is support, consider 0 or < 0 -- a configuration error.
+      throw new IllegalArgumentException("Minimum versions must be positive");
+    }
+
+    if (maxVersions < minVersions) {
+      throw new IllegalArgumentException("Unable to set MaxVersion to " + maxVersions
+        + " and set MinVersion to " + minVersions
+        + ", as maximum versions must be >= minimum versions.");
+    }
+    setMinVersions(minVersions);
+    setMaxVersions(maxVersions);
     return this;
   }
 
@@ -645,7 +674,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
    * @return this (for chained invocation)
    */
   public HColumnDescriptor setCompressionType(Compression.Algorithm type) {
-    return setValue(COMPRESSION, type.getName().toUpperCase());
+    return setValue(COMPRESSION, type.getName().toUpperCase(Locale.ROOT));
   }
 
   /** @return data block encoding algorithm used on disk */
@@ -732,7 +761,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
    */
   public HColumnDescriptor setCompactionCompressionType(
       Compression.Algorithm type) {
-    return setValue(COMPRESSION_COMPACT, type.getName().toUpperCase());
+    return setValue(COMPRESSION_COMPACT, type.getName().toUpperCase(Locale.ROOT));
   }
 
   /**
@@ -758,7 +787,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     String value = getValue(KEEP_DELETED_CELLS);
     if (value != null) {
       // toUpperCase for backwards compatibility
-      return KeepDeletedCells.valueOf(value.toUpperCase());
+      return KeepDeletedCells.valueOf(value.toUpperCase(Locale.ROOT));
     }
     return DEFAULT_KEEP_DELETED;
   }
@@ -843,7 +872,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     if (n == null) {
       n = DEFAULT_BLOOMFILTER;
     }
-    return BloomType.valueOf(n.toUpperCase());
+    return BloomType.valueOf(n.toUpperCase(Locale.ROOT));
   }
 
   /**
@@ -1254,8 +1283,9 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
     ColumnFamilySchema.Builder builder = ColumnFamilySchema.newBuilder();
     ColumnFamilySchema cfs = null;
     try {
-      cfs = builder.mergeFrom(bytes, pblen, bytes.length - pblen).build();
-    } catch (InvalidProtocolBufferException e) {
+      ProtobufUtil.mergeFrom(builder, bytes, pblen, bytes.length - pblen);
+      cfs = builder.build();
+    } catch (IOException e) {
       throw new DeserializationException(e);
     }
     return convert(cfs);
@@ -1339,6 +1369,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
   /**
    * Return the encryption algorithm in use by this family
    */
+  @InterfaceStability.Unstable
   public String getEncryptionType() {
     return getValue(ENCRYPTION);
   }
@@ -1347,19 +1378,50 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor> 
    * Set the encryption algorithm for use with this family
    * @param algorithm
    */
+  @InterfaceStability.Unstable
   public HColumnDescriptor setEncryptionType(String algorithm) {
     setValue(ENCRYPTION, algorithm);
     return this;
   }
 
   /** Return the raw crypto key attribute for the family, or null if not set  */
+  @InterfaceStability.Unstable
   public byte[] getEncryptionKey() {
     return getValue(Bytes.toBytes(ENCRYPTION_KEY));
   }
 
   /** Set the raw crypto key attribute for the family */
+  @InterfaceStability.Unstable
   public HColumnDescriptor setEncryptionKey(byte[] keyBytes) {
     setValue(Bytes.toBytes(ENCRYPTION_KEY), keyBytes);
+    return this;
+  }
+
+  /**
+   * @return replication factor set for this CF or {@link #DEFAULT_DFS_REPLICATION} if not set.
+   *         <p>
+   *         {@link #DEFAULT_DFS_REPLICATION} value indicates that user has explicitly not set any
+   *         block replication factor for this CF, hence use the default replication factor set in
+   *         the file system.
+   */
+  public short getDFSReplication() {
+    String rf = getValue(DFS_REPLICATION);
+    return rf == null ? DEFAULT_DFS_REPLICATION : Short.valueOf(rf);
+  }
+
+  /**
+   * Set the replication factor to hfile(s) belonging to this family
+   * @param replication number of replicas the blocks(s) belonging to this CF should have, or
+   *          {@link #DEFAULT_DFS_REPLICATION} for the default replication factor set in the
+   *          filesystem
+   * @return this (for chained invocation)
+   */
+  public HColumnDescriptor setDFSReplication(short replication) {
+    if (replication < 1 && replication != DEFAULT_DFS_REPLICATION) {
+      throw new IllegalArgumentException(
+          "DFS replication factor cannot be less than 1 if explictly set.");
+    }
+    setValue(DFS_REPLICATION, Short.toString(replication));
     return this;
   }
 }

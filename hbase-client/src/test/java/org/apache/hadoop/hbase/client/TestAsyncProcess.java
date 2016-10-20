@@ -25,7 +25,7 @@ import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -41,7 +41,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -104,8 +107,14 @@ public class TestAsyncProcess {
     }
 
     @Override
-    protected RpcRetryingCaller<MultiResponse> createCaller(MultiServerCallable<Row> callable) {
-      final MultiResponse mr = createMultiResponse(callable.getLocation(), callable.getMulti(),
+    protected RpcRetryingCaller<MultiResponse> createCaller(
+      PayloadCarryingServerCallable callable) {
+      if (!(callable instanceof MultiServerCallable)) {
+        throw new RuntimeException(
+          "can't cast PayloadCarryingServerCallable to be MultiServerCallable!");
+      }
+      final MultiResponse mr = createMultiResponse(callable.getLocation(),
+        ((MultiServerCallable<Row>)callable).getMulti(),
           nbMultiResponse, nbActions);
       return new RpcRetryingCaller<MultiResponse>(100, 10, 9) {
         @Override
@@ -145,11 +154,11 @@ public class TestAsyncProcess {
     }
 
     @Override
-    protected RpcRetryingCaller<MultiResponse> createCaller(MultiServerCallable<Row> callable) {
+    protected RpcRetryingCaller<MultiResponse> createCaller(
+      PayloadCarryingServerCallable callable) {
       return new CallerWithFailure();
     }
   }
-
 
   static MultiResponse createMultiResponse(final HRegionLocation loc,
       final MultiAction<Row> multi, AtomicInteger nbMultiResponse, AtomicInteger nbActions) {
@@ -200,6 +209,11 @@ public class TestAsyncProcess {
     public HRegionLocation locateRegion(final TableName tableName,
                                         final byte[] row) {
       return loc1;
+    }
+
+    @Override
+    public boolean hasCellBlockSupport() {
+      return false;
     }
   }
 
@@ -824,5 +838,42 @@ public class TestAsyncProcess {
     p.add(DUMMY_BYTES_1, DUMMY_BYTES_1, DUMMY_BYTES_1);
 
     return p;
+  }
+
+  static class MyThreadPoolExecutor extends ThreadPoolExecutor {
+    public MyThreadPoolExecutor(int coreThreads, int maxThreads, long keepAliveTime,
+        TimeUnit timeunit, BlockingQueue<Runnable> blockingqueue) {
+      super(coreThreads, maxThreads, keepAliveTime, timeunit, blockingqueue);
+    }
+
+    @Override
+    public Future submit(Runnable runnable) {
+      throw new OutOfMemoryError("OutOfMemory error thrown by means");
+    }
+  }
+
+  static class AsyncProcessForThrowableCheck extends AsyncProcess {
+    public AsyncProcessForThrowableCheck(HConnection hc, Configuration conf, ExecutorService pool) {
+      super(hc, DUMMY_TABLE, pool, null, conf, new RpcRetryingCallerFactory(conf),
+          new RpcControllerFactory(conf));
+    }
+  }
+
+  @Test
+  public void testUncheckedException() throws Exception {
+    // Test the case pool.submit throws unchecked exception
+    HConnection hc = createHConnection();
+    MyThreadPoolExecutor myPool =
+        new MyThreadPoolExecutor(1, 20, 60, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<Runnable>(200));
+    Configuration myConf = new Configuration(conf);
+    myConf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 3);
+    AsyncProcess ap = new AsyncProcessForThrowableCheck(hc, myConf, myPool);
+
+    List<Put> puts = new ArrayList<Put>();
+    puts.add(createPut(1, true));
+
+    ap.submit(puts, false, null);
+    Assert.assertTrue(puts.isEmpty());
   }
 }

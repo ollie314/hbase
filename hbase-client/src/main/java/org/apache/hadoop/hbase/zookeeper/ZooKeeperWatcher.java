@@ -24,20 +24,30 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
+import org.apache.hadoop.hbase.AuthUtil;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
-import org.apache.hadoop.hbase.util.Threads;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.security.Superusers;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooDefs.Ids;
+import org.apache.zookeeper.ZooDefs.Perms;
 import org.apache.zookeeper.data.ACL;
+import org.apache.zookeeper.data.Id;
+import org.apache.zookeeper.data.Stat;
 
 /**
  * Acts as the single ZooKeeper Watcher.  One instance of this is instantiated
@@ -56,13 +66,14 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
 
   // Identifier for this watcher (for logging only).  It is made of the prefix
   // passed on construction and the zookeeper sessionid.
+  private String prefix;
   private String identifier;
 
   // zookeeper quorum
   private String quorum;
 
   // zookeeper connection
-  private RecoverableZooKeeper recoverableZooKeeper;
+  private final RecoverableZooKeeper recoverableZooKeeper;
 
   // abortable in case of zk failure
   protected Abortable abortable;
@@ -110,7 +121,6 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
   // znode containing namespace descriptors
   public static String namespaceZNode = "namespace";
 
-
   // Certain ZooKeeper nodes need to be world-readable
   public static final ArrayList<ACL> CREATOR_ALL_AND_WORLD_READABLE =
     new ArrayList<ACL>() { {
@@ -120,7 +130,8 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
 
   private final Configuration conf;
 
-  private final Exception constructorCaller;
+  /* A pattern that matches a Kerberos name, borrowed from Hadoop's KerberosName */
+  private static final Pattern NAME_PATTERN = Pattern.compile("([^/@]*)(/([^/@]*))?@([^/@]*)");
 
   /**
    * Instantiate a ZooKeeper connection and watcher.
@@ -149,22 +160,28 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
       Abortable abortable, boolean canCreateBaseZNode)
   throws IOException, ZooKeeperConnectionException {
     this.conf = conf;
-    // Capture a stack trace now.  Will print it out later if problem so we can
-    // distingush amongst the myriad ZKWs.
-    try {
-      throw new Exception("ZKW CONSTRUCTOR STACK TRACE FOR DEBUGGING");
-    } catch (Exception e) {
-      this.constructorCaller = e;
-    }
     this.quorum = ZKConfig.getZKQuorumServersString(conf);
+    this.prefix = identifier;
     // Identifier will get the sessionid appended later below down when we
     // handle the syncconnect event.
-    this.identifier = identifier;
+    this.identifier = identifier + "0x0";
     this.abortable = abortable;
     setNodeNames(conf);
-    this.recoverableZooKeeper = ZKUtil.connect(conf, quorum, this, identifier);
+    PendingWatcher pendingWatcher = new PendingWatcher();
+    this.recoverableZooKeeper = ZKUtil.connect(conf, quorum, pendingWatcher, identifier);
+    pendingWatcher.prepare(this);
     if (canCreateBaseZNode) {
-      createBaseZNodes();
+      try {
+        createBaseZNodes();
+      } catch (ZooKeeperConnectionException zce) {
+        try {
+          this.recoverableZooKeeper.close();
+        } catch (InterruptedException ie) {
+          LOG.debug("Encountered InterruptedException when closing " + this.recoverableZooKeeper);
+          Thread.currentThread().interrupt();
+        }
+        throw zce;
+      }
     }
   }
 
@@ -186,6 +203,193 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
       throw new ZooKeeperConnectionException(
           prefix("Unexpected KeeperException creating base node"), e);
     }
+  }
+
+  /** Returns whether the znode is supposed to be readable by the client
+   * and DOES NOT contain sensitive information (world readable).*/
+  public boolean isClientReadable(String node) {
+    // Developer notice: These znodes are world readable. DO NOT add more znodes here UNLESS
+    // all clients need to access this data to work. Using zk for sharing data to clients (other
+    // than service lookup case is not a recommended design pattern.
+    return
+        node.equals(baseZNode) ||
+        node.equals(metaServerZNode) ||
+        node.equals(getMasterAddressZNode()) ||
+        node.equals(clusterIdZNode)||
+        node.equals(rsZNode) ||
+        // /hbase/table and /hbase/table/foo is allowed, /hbase/table-lock is not
+        node.equals(tableZNode) ||
+        node.startsWith(tableZNode + "/");
+  }
+
+  /**
+   * On master start, we check the znode ACLs under the root directory and set the ACLs properly
+   * if needed. If the cluster goes from an unsecure setup to a secure setup, this step is needed
+   * so that the existing znodes created with open permissions are now changed with restrictive
+   * perms.
+   */
+  public void checkAndSetZNodeAcls() {
+    if (!ZKUtil.isSecureZooKeeper(getConfiguration())) {
+      LOG.info("not a secure deployment, proceeding");
+      return;
+    }
+
+    // Check the base znodes permission first. Only do the recursion if base znode's perms are not
+    // correct.
+    try {
+      List<ACL> actualAcls = recoverableZooKeeper.getAcl(baseZNode, new Stat());
+
+      if (!isBaseZnodeAclSetup(actualAcls)) {
+        LOG.info("setting znode ACLs");
+        setZnodeAclsRecursive(baseZNode);
+      }
+    } catch(KeeperException.NoNodeException nne) {
+      return;
+    } catch(InterruptedException ie) {
+      interruptedException(ie);
+    } catch (IOException e) {
+      LOG.warn("Received exception while checking and setting zookeeper ACLs", e);
+    } catch (KeeperException e) {
+      LOG.warn("Received exception while checking and setting zookeeper ACLs", e);
+    }
+  }
+
+  /**
+   * Set the znode perms recursively. This will do post-order recursion, so that baseZnode ACLs
+   * will be set last in case the master fails in between.
+   * @param znode
+   */
+  private void setZnodeAclsRecursive(String znode) throws KeeperException, InterruptedException {
+    List<String> children = recoverableZooKeeper.getChildren(znode, false);
+
+    for (String child : children) {
+      setZnodeAclsRecursive(ZKUtil.joinZNode(znode, child));
+    }
+    List<ACL> acls = ZKUtil.createACL(this, znode, true);
+    LOG.info("Setting ACLs for znode:" + znode + " , acl:" + acls);
+    recoverableZooKeeper.setAcl(znode, acls, -1);
+  }
+
+  /**
+   * Checks whether the ACLs returned from the base znode (/hbase) is set for secure setup.
+   * @param acls acls from zookeeper
+   * @return whether ACLs are set for the base znode
+   * @throws IOException
+   */
+  private boolean isBaseZnodeAclSetup(List<ACL> acls) throws IOException {
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Checking znode ACLs");
+    }
+    String[] superUsers = conf.getStrings(Superusers.SUPERUSER_CONF_KEY);
+    // Check whether ACL set for all superusers
+    if (superUsers != null && !checkACLForSuperUsers(superUsers, acls)) {
+      return false;
+    }
+
+    // this assumes that current authenticated user is the same as zookeeper client user
+    // configured via JAAS
+    String hbaseUser = UserGroupInformation.getCurrentUser().getShortUserName();
+
+    if (acls.isEmpty()) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("ACL is empty");
+      }
+      return false;
+    }
+
+    for (ACL acl : acls) {
+      int perms = acl.getPerms();
+      Id id = acl.getId();
+      // We should only set at most 3 possible ACLs for 3 Ids. One for everyone, one for superuser
+      // and one for the hbase user
+      if (Ids.ANYONE_ID_UNSAFE.equals(id)) {
+        if (perms != Perms.READ) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",
+              id, perms, Perms.READ));
+          }
+          return false;
+        }
+      } else if (superUsers != null && isSuperUserId(superUsers, id)) {
+        if (perms != Perms.ALL) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",
+              id, perms, Perms.ALL));
+          }
+          return false;
+        }
+      } else if ("sasl".equals(id.getScheme())) {
+        String name = id.getId();
+        // If ZooKeeper recorded the Kerberos full name in the ACL, use only the shortname
+        Matcher match = NAME_PATTERN.matcher(name);
+        if (match.matches()) {
+          name = match.group(1);
+        }
+        if (name.equals(hbaseUser)) {
+          if (perms != Perms.ALL) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug(String.format("permissions for '%s' are not correct: have 0x%x, want 0x%x",
+                id, perms, Perms.ALL));
+            }
+            return false;
+          }
+        } else {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Unexpected shortname in SASL ACL: " + id);
+          }
+          return false;
+        }
+      } else {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("unexpected ACL id '" + id + "'");
+        }
+        return false;
+      }
+    }
+    return true;
+  }
+  
+  /*
+   * Validate whether ACL set for all superusers.
+   */
+  private boolean checkACLForSuperUsers(String[] superUsers, List<ACL> acls) {
+    for (String user : superUsers) {
+      boolean hasAccess = false;
+      // TODO: Validate super group members also when ZK supports setting node ACL for groups.
+      if (!user.startsWith(AuthUtil.GROUP_PREFIX)) {
+        for (ACL acl : acls) {
+          if (user.equals(acl.getId().getId())) {
+            if (acl.getPerms() == Perms.ALL) {
+              hasAccess = true;
+            } else {
+              if (LOG.isDebugEnabled()) {
+                LOG.debug(String.format(
+                  "superuser '%s' does not have correct permissions: have 0x%x, want 0x%x",
+                  acl.getId().getId(), acl.getPerms(), Perms.ALL));
+              }
+            }
+            break;
+          }
+        }
+        if (!hasAccess) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+  
+  /*
+   * Validate whether ACL ID is superuser.
+   */
+  public static boolean isSuperUserId(String[] superUsers, Id id) {
+    for (String user : superUsers) {
+      // TODO: Validate super group members also when ZK supports setting node ACL for groups.
+      if (!user.startsWith(AuthUtil.GROUP_PREFIX) && new Id("sasl", user).equals(id)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   @Override
@@ -302,6 +506,13 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
   }
 
   /**
+   * @return the base znode of this zookeeper connection instance.
+   */
+  public String getBaseZNode() {
+    return baseZNode;
+  }
+
+  /**
    * Method called from ZooKeeper for events and connection status.
    * <p>
    * Valid events are passed along to listeners.  Connection status changes
@@ -369,21 +580,7 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
   private void connectionEvent(WatchedEvent event) {
     switch(event.getState()) {
       case SyncConnected:
-        // Now, this callback can be invoked before the this.zookeeper is set.
-        // Wait a little while.
-        long finished = System.currentTimeMillis() +
-          this.conf.getLong("hbase.zookeeper.watcher.sync.connected.wait", 2000);
-        while (System.currentTimeMillis() < finished) {
-          Threads.sleep(1);
-          if (this.recoverableZooKeeper != null) break;
-        }
-        if (this.recoverableZooKeeper == null) {
-          LOG.error("ZK is null on connection event -- see stack trace " +
-            "for the stack trace when constructor was called on this zkw",
-            this.constructorCaller);
-          throw new NullPointerException("ZK is null");
-        }
-        this.identifier = this.identifier + "-0x" +
+        this.identifier = this.prefix + "-0x" +
           Long.toHexString(this.recoverableZooKeeper.getSessionId());
         // Update our identifier.  Otherwise ignore.
         LOG.debug(this.identifier + " connected");
@@ -469,11 +666,10 @@ public class ZooKeeperWatcher implements Watcher, Abortable, Closeable {
    *
    * @throws InterruptedException
    */
+  @Override
   public void close() {
     try {
-      if (recoverableZooKeeper != null) {
-        recoverableZooKeeper.close();
-      }
+      recoverableZooKeeper.close();
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }

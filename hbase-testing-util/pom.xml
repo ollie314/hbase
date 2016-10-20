@@ -23,11 +23,11 @@
     <parent>
         <artifactId>hbase</artifactId>
         <groupId>org.apache.hbase</groupId>
-        <version>0.98.9-SNAPSHOT</version>
+        <version>0.98.23</version>
         <relativePath>..</relativePath>
     </parent>
     <artifactId>hbase-testing-util</artifactId>
-    <name>HBase - Testing Util</name>
+    <name>Apache HBase - Testing Util</name>
     <description>HBase Testing Utilities.</description>
     <build>
       <plugins>
@@ -59,6 +59,12 @@
             <artifactId>hbase-annotations</artifactId>
             <type>test-jar</type>
             <scope>compile</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>jdk.tools</groupId>
+                    <artifactId>jdk.tools</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
             <groupId>org.apache.hbase</groupId>

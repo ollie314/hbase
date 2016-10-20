@@ -23,6 +23,8 @@ import static org.apache.hadoop.hbase.executor.EventType.RS_ZK_REGION_MERGING;
 import static org.apache.hadoop.hbase.executor.EventType.RS_ZK_REQUEST_REGION_MERGE;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.ListIterator;
@@ -42,12 +44,12 @@ import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.catalog.MetaEditor;
 import org.apache.hadoop.hbase.catalog.MetaReader;
 import org.apache.hadoop.hbase.client.Delete;
-import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.executor.EventType;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.RegionStateTransition.TransitionCode;
 import org.apache.hadoop.hbase.regionserver.SplitTransaction.LoggingProgressable;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ConfigUtil;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
@@ -102,6 +104,7 @@ public class RegionMergeTransaction {
   // We only merge adjacent regions if forcible is false
   private final boolean forcible;
   private boolean useZKForAssignment;
+  private final long masterSystemTime;
 
   /**
    * Types to add to the transaction journal. Each enum is a step in the merge
@@ -161,6 +164,18 @@ public class RegionMergeTransaction {
    */
   public RegionMergeTransaction(final HRegion a, final HRegion b,
       final boolean forcible) {
+    this(a, b, forcible, EnvironmentEdgeManager.currentTimeMillis());
+  }
+
+  /**
+   * Constructor
+   * @param a region a to merge
+   * @param b region b to merge
+   * @param forcible if false, we will only merge adjacent regions
+   * @param masterSystemTime the time at the master side
+   */
+  public RegionMergeTransaction(final HRegion a, final HRegion b,
+      final boolean forcible, long masterSystemTime) {
     if (a.getRegionInfo().compareTo(b.getRegionInfo()) <= 0) {
       this.region_a = a;
       this.region_b = b;
@@ -169,6 +184,7 @@ public class RegionMergeTransaction {
       this.region_b = a;
     }
     this.forcible = forcible;
+    this.masterSystemTime = masterSystemTime;
     this.mergesdir = region_a.getRegionFileSystem().getMergesDir();
   }
 
@@ -242,23 +258,53 @@ public class RegionMergeTransaction {
    */
   public HRegion execute(final Server server,
       final RegionServerServices services) throws IOException {
+    if (User.isHBaseSecurityEnabled(region_a.getBaseConf())) {
+      LOG.warn("Should use execute(Server, RegionServerServices, User)");
+    }
+    return execute(server, services, null);
+  }
+
+  public HRegion execute(final Server server, final RegionServerServices services, User user)
+      throws IOException {
     useZKForAssignment = server == null ? true :
       ConfigUtil.useZKForAssignment(server.getConfiguration());
     if (rsCoprocessorHost == null) {
       rsCoprocessorHost = server != null ? ((HRegionServer) server).getCoprocessorHost() : null;
     }
-    HRegion mergedRegion = createMergedRegion(server, services);
+    final HRegion mergedRegion = createMergedRegion(server, services, user);
     if (rsCoprocessorHost != null) {
-      rsCoprocessorHost.postMergeCommit(this.region_a, this.region_b, mergedRegion);
+      if (user == null) {
+        rsCoprocessorHost.postMergeCommit(this.region_a, this.region_b, mergedRegion);
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              rsCoprocessorHost.postMergeCommit(region_a, region_b, mergedRegion);
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
-    return stepsAfterPONR(server, services, mergedRegion);
+    stepsAfterPONR(server, services, mergedRegion, user);
+    return mergedRegion;
   }
 
-  public HRegion stepsAfterPONR(final Server server, final RegionServerServices services,
-      HRegion mergedRegion) throws IOException {
+  @Deprecated
+  public void stepsAfterPONR(final Server server, final RegionServerServices services,
+      final HRegion mergedRegion) throws IOException {
+    stepsAfterPONR(server, services, mergedRegion, null);
+  }
+
+  public void stepsAfterPONR(final Server server, final RegionServerServices services,
+      final HRegion mergedRegion, User user) throws IOException {
     openMergedRegion(server, services, mergedRegion);
-    transitionZKNode(server, services, mergedRegion);
-    return mergedRegion;
+    transitionZKNode(server, services, mergedRegion, user);
   }
 
   /**
@@ -271,7 +317,7 @@ public class RegionMergeTransaction {
    *           {@link #rollback(Server, RegionServerServices)}
    */
   HRegion createMergedRegion(final Server server,
-      final RegionServerServices services) throws IOException {
+      final RegionServerServices services, User user) throws IOException {
     LOG.info("Starting merge of " + region_a + " and "
         + region_b.getRegionNameAsString() + ", forcible=" + forcible);
     if ((server != null && server.isStopped())
@@ -280,7 +326,24 @@ public class RegionMergeTransaction {
     }
 
     if (rsCoprocessorHost != null) {
-      if (rsCoprocessorHost.preMerge(this.region_a, this.region_b)) {
+      boolean ret = false;
+      if (user == null) {
+        ret = rsCoprocessorHost.preMerge(region_a, region_b);
+      } else {
+        try {
+          ret = user.getUGI().doAs(new PrivilegedExceptionAction<Boolean>() {
+            @Override
+            public Boolean run() throws Exception {
+              return rsCoprocessorHost.preMerge(region_a, region_b);
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
+      if (ret) {
         throw new IOException("Coprocessor bypassing regions " + this.region_a + " "
             + this.region_b + " merge.");
       }
@@ -293,9 +356,27 @@ public class RegionMergeTransaction {
     HRegion mergedRegion = stepsBeforePONR(server, services, testing);
 
     @MetaMutationAnnotation
-    List<Mutation> metaEntries = new ArrayList<Mutation>();
+    final List<Mutation> metaEntries = new ArrayList<Mutation>();
     if (rsCoprocessorHost != null) {
-      if (rsCoprocessorHost.preMergeCommit(this.region_a, this.region_b, metaEntries)) {
+      boolean ret = false;
+      if (user == null) {
+        ret = rsCoprocessorHost.preMergeCommit(region_a, region_b, metaEntries);
+      } else {
+        try {
+          ret = user.getUGI().doAs(new PrivilegedExceptionAction<Boolean>() {
+            @Override
+            public Boolean run() throws Exception {
+              return rsCoprocessorHost.preMergeCommit(region_a, region_b, metaEntries);
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
+
+      if (ret) {
         throw new IOException("Coprocessor bypassing regions " + this.region_a + " "
             + this.region_b + " merge.");
       }
@@ -323,7 +404,7 @@ public class RegionMergeTransaction {
     if (!testing && useZKForAssignment) {
       if (metaEntries.isEmpty()) {
         MetaEditor.mergeRegions(server.getCatalogTracker(), mergedRegion.getRegionInfo(), region_a
-            .getRegionInfo(), region_b.getRegionInfo(), server.getServerName());
+            .getRegionInfo(), region_b.getRegionInfo(), server.getServerName(), masterSystemTime);
       } else {
         mergeRegionsAndPutMetaEntries(server.getCatalogTracker(), mergedRegion.getRegionInfo(),
           region_a.getRegionInfo(), region_b.getRegionInfo(), server.getServerName(), metaEntries);
@@ -351,14 +432,17 @@ public class RegionMergeTransaction {
       HRegionInfo regionB, ServerName serverName, List<Mutation> mutations) throws IOException {
     HRegionInfo copyOfMerged = new HRegionInfo(mergedRegion);
 
+    // use the maximum of what master passed us vs local time.
+    long time = Math.max(EnvironmentEdgeManager.currentTimeMillis(), masterSystemTime);
+
     // Put for parent
-    Put putOfMerged = MetaEditor.makePutFromRegionInfo(copyOfMerged);
+    Put putOfMerged = MetaEditor.makePutFromRegionInfo(copyOfMerged, time);
     putOfMerged.add(HConstants.CATALOG_FAMILY, HConstants.MERGEA_QUALIFIER, regionA.toByteArray());
     putOfMerged.add(HConstants.CATALOG_FAMILY, HConstants.MERGEB_QUALIFIER, regionB.toByteArray());
     mutations.add(putOfMerged);
     // Deletes for merging regions
-    Delete deleteA = MetaEditor.makeDeleteFromRegionInfo(regionA);
-    Delete deleteB = MetaEditor.makeDeleteFromRegionInfo(regionB);
+    Delete deleteA = MetaEditor.makeDeleteFromRegionInfo(regionA, time);
+    Delete deleteB = MetaEditor.makeDeleteFromRegionInfo(regionB, time);
     mutations.add(deleteA);
     mutations.add(deleteB);
     // The merged is a new region, openSeqNum = 1 is fine.
@@ -593,7 +677,7 @@ public class RegionMergeTransaction {
    *           {@link #rollback(Server, RegionServerServices)}
    */
   void transitionZKNode(final Server server, final RegionServerServices services,
-      HRegion mergedRegion) throws IOException {
+      final HRegion mergedRegion, User user) throws IOException {
     if (useZKAndZKIsSet(server)) {
       // Tell master about merge by updating zk. If we fail, abort.
       try {
@@ -632,7 +716,23 @@ public class RegionMergeTransaction {
     }
 
     if (rsCoprocessorHost != null) {
-      rsCoprocessorHost.postMerge(this.region_a, this.region_b, mergedRegion);
+      if (user == null) {
+        rsCoprocessorHost.postMerge(region_a, region_b, mergedRegion);
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              rsCoprocessorHost.postMerge(region_a, region_b, mergedRegion);
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
 
     // Leaving here, the mergedir with its dross will be in place but since the
@@ -755,10 +855,34 @@ public class RegionMergeTransaction {
   @SuppressWarnings("deprecation")
   public boolean rollback(final Server server,
       final RegionServerServices services) throws IOException {
+    if (User.isHBaseSecurityEnabled(region_a.getBaseConf())) {
+      LOG.warn("Should use execute(Server, RegionServerServices, User)");
+    }
+    return rollback(server, services, null);
+  }
+
+  public boolean rollback(final Server server,
+      final RegionServerServices services, User user) throws IOException {
     assert this.mergedRegionInfo != null;
     // Coprocessor callback
     if (rsCoprocessorHost != null) {
-      rsCoprocessorHost.preRollBackMerge(this.region_a, this.region_b);
+      if (user == null) {
+        rsCoprocessorHost.preRollBackMerge(region_a, region_b);
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              rsCoprocessorHost.preRollBackMerge(region_a, region_b);
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
 
     boolean result = true;
@@ -836,7 +960,23 @@ public class RegionMergeTransaction {
     }
     // Coprocessor callback
     if (rsCoprocessorHost != null) {
-      rsCoprocessorHost.postRollBackMerge(this.region_a, this.region_b);
+      if (user == null) {
+        rsCoprocessorHost.postRollBackMerge(region_a, region_b);
+      } else {
+        try {
+          user.getUGI().doAs(new PrivilegedExceptionAction<Void>() {
+            @Override
+            public Void run() throws Exception {
+              rsCoprocessorHost.postRollBackMerge(region_a, region_b);
+              return null;
+            }
+          });
+        } catch (InterruptedException ie) {
+          InterruptedIOException iioe = new InterruptedIOException();
+          iioe.initCause(ie);
+          throw iioe;
+        }
+      }
     }
 
     return result;

@@ -63,6 +63,20 @@ possible configurations would overwhelm and obscure the important.
     machine restart.</description>
   </property>
   <property >
+    <name>hbase.fs.tmp.dir</name>
+    <value>/user/${user.name}/hbase-staging</value>
+    <description>A staging directory in default file system (HDFS)
+    for keeping temporary data.
+    </description>
+  </property>
+  <property >
+    <name>hbase.bulkload.staging.dir</name>
+    <value>${hbase.fs.tmp.dir}</value>
+    <description>A staging directory in default file system (HDFS)
+    for bulk loading.
+    </description>
+  </property>
+  <property >
     <name>hbase.cluster.distributed</name>
     <value>false</value>
     <description>The mode the cluster will be in. Possible values are
@@ -301,6 +315,15 @@ possible configurations would overwhelm and obscure the important.
       A split policy determines when a region should be split. The various other split policies that
       are available currently are ConstantSizeRegionSplitPolicy, DisabledRegionSplitPolicy, 
       DelimitedKeyPrefixRegionSplitPolicy, KeyPrefixRegionSplitPolicy etc.  
+    </description>
+  </property>
+  <property>
+    <name>hbase.regionserver.regionSplitLimit</name>
+    <value>1000</value>
+    <description>
+      Limit for the number of regions after which no more region splitting should take place.
+      This is not hard limit for the number of regions but acts as a guideline for the regionserver
+      to stop splitting after a certain limit. Default is set to 1000.
     </description>
   </property>
 
@@ -747,9 +770,18 @@ possible configurations would overwhelm and obscure the important.
   <property>
     <name>hbase.rpc.timeout</name>
     <value>60000</value>
-    <description>This is for the RPC layer to define how long HBase client applications
+    <description>This is for the RPC layer to define how long (millisecond) HBase client applications
         take for a remote call to time out. It uses pings to check connections
         but will eventually throw a TimeoutException.</description>
+  </property>
+  <property>
+    <name>hbase.client.operation.timeout</name>
+    <value>1200000</value>
+    <description>Operation timeout is a top-level restriction (millisecond) that makes sure a
+        blocking operation in Table will not be blocked more than this. In each operation, if rpc
+        request fails because of timeout or other reason, it will retry until success or throw
+        RetriesExhaustedException. But if the total time being blocking reach the operation timeout
+        before retries exhausted, it will break early and throw SocketTimeoutException.</description>
   </property>
   <property>
     <name>hbase.rpc.shortoperation.timeout</name>
@@ -835,6 +867,33 @@ possible configurations would overwhelm and obscure the important.
       whether or not the client will accept this instruction from the server.
       When false (the default), the client will not allow the fallback to SIMPLE
       authentication, and will abort the connection.</description>
+  </property>
+  <property>
+    <name>hbase.ipc.server.fallback-to-simple-auth-allowed</name>
+    <value>false</value>
+    <description>When a server is configured to require secure connections, it will
+      reject connection attempts from clients using SASL SIMPLE (unsecure) authentication.
+      This setting allows secure servers to accept SASL SIMPLE connections from clients
+      when the client requests.  When false (the default), the server will not allow the fallback
+      to SIMPLE authentication, and will reject the connection.  WARNING: This setting should ONLY
+      be used as a temporary measure while converting clients over to secure authentication.  It
+      MUST BE DISABLED for secure operation.</description>
+  </property>
+  <property>
+    <name>hbase.coprocessor.enabled</name>
+    <value>true</value>
+    <description>Enables or disables coprocessor loading. If 'false'
+    (disabled), any other coprocessor related configuration will be ignored.
+    </description>
+  </property>
+  <property>
+    <name>hbase.coprocessor.user.enabled</name>
+    <value>true</value>
+    <description>Enables or disables user (aka. table) coprocessor loading.
+    If 'false' (disabled), any table coprocessor attributes in table
+    descriptors will be ignored. If "hbase.coprocessor.enabled" is 'false'
+    this setting has no effect.
+    </description>
   </property>
   <property>
     <name>hbase.coprocessor.region.classes</name>
@@ -984,6 +1043,13 @@ possible configurations would overwhelm and obscure the important.
     <description>The amount of off heap space to be allocated towards the experimental
      off heap cache. If you desire the cache to be disabled, simply set this
      value to 0.</description>
+  </property>
+  <property>
+    <name>hbase.rootdir.perms</name>
+    <value>700</value>
+    <description>FS Permissions for the root directory in a secure(kerberos) setup.
+    When master starts, it creates the rootdir with this permissions or sets the permissions
+    if it does not match.</description>
   </property>
   <property>
     <name>hbase.data.umask.enable</name>
@@ -1239,4 +1305,26 @@ possible configurations would overwhelm and obscure the important.
       with the user issuing the mutation
     </description>
   </property>
+  <property>
+    <name>hbase.regionserver.handler.abort.on.error.percent</name>
+    <value>-1</value>
+    <description>The percent of region server RPC threads failed to abort RS.
+    -1 Disable aborting; 0 Abort if even a single handler has died;
+    0.x Abort only when this percent of handlers have died;
+    1 Abort only all of the handers have died.</description>
+  </property>
+  <property>
+    <name>hbase.snapshot.master.timeout.millis</name>
+    <value>300000</value>
+    <description>
+       Timeout for master for the snapshot procedure execution
+    </description>
+   </property>
+     <property>
+    <name>hbase.snapshot.region.timeout</name>
+    <value>300000</value>
+    <description>
+       Timeout for regionservers to keep threads in snapshot request pool waiting
+    </description>
+   </property>
 </configuration>

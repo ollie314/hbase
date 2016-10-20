@@ -19,8 +19,8 @@
 package org.apache.hadoop.hbase.regionserver;
 
 import org.apache.hadoop.hbase.CompatibilityFactory;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.test.MetricsAssertHelper;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
@@ -35,9 +35,27 @@ public class TestMetricsRegion {
     MetricsRegion mr = new MetricsRegion(new MetricsRegionWrapperStub());
     MetricsRegionAggregateSource agg = mr.getSource().getAggregateSource();
 
-    HELPER.assertGauge("namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_storeCount", 101, agg);
-    HELPER.assertGauge("namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_storeFileCount", 102, agg);
-    HELPER.assertGauge("namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_memstoreSize", 103, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_storeCount", 
+      101, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_storeFileCount",
+      102, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_memstoreSize",
+      103, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_maxStoreFileAge",
+      2, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_minStoreFileAge",
+      2, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_avgStoreFileAge",
+      2, agg);
+    HELPER.assertGauge(
+      "namespace_TestNS_table_MetricsRegionWrapperStub_region_DEADBEEF001_metric_numReferenceFiles",
+      2, agg);
     mr.close();
   }
 }

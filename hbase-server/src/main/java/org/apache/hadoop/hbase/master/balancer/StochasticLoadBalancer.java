@@ -198,8 +198,17 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
 
     long startTime = EnvironmentEdgeManager.currentTimeMillis();
 
+    // On clusters with lots of HFileLinks or lots of reference files,
+    // instantiating the storefile infos can be quite expensive.
+    // Allow turning this feature off if the locality cost is not going to
+    // be used in any computations.
+    RegionLocationFinder finder = null;
+    if (this.localityCost != null && this.localityCost.getMultiplier() > 0) {
+      finder = this.regionFinder;
+    }
+    
     // Keep track of servers to iterate through them.
-    Cluster cluster = new Cluster(clusterState, loads, regionFinder);
+    Cluster cluster = new Cluster(clusterState, loads, finder);
     double currentCost = computeCost(cluster, Double.MAX_VALUE);
 
     double initCost = currentCost;
@@ -695,7 +704,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
         moveCost += META_MOVE_COST_MULT * cluster.numMovedMetaRegions;
       }
 
-      return scale(0, cluster.numRegions + META_MOVE_COST_MULT, moveCost);
+      return scale(0, Math.min(cluster.numRegions, maxMoves) + META_MOVE_COST_MULT, moveCost);
     }
   }
 
@@ -811,7 +820,9 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
         }
 
         if (index < 0) {
-          cost += 1;
+          if (regionLocations.length > 0) {
+            cost += 1;
+          }
         } else {
           cost += (double) index / (double) regionLocations.length;
         }

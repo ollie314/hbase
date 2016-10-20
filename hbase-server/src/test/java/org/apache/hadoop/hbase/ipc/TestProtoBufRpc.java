@@ -24,7 +24,7 @@ import com.google.common.collect.Lists;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.ipc.protobuf.generated.TestProtos;
 import org.apache.hadoop.hbase.ipc.protobuf.generated.TestRpcServiceProtos;
@@ -100,7 +100,11 @@ public class TestProtoBufRpc {
         Lists.newArrayList(new RpcServer.BlockingServiceAndInterface(service, null)),
         new InetSocketAddress(ADDRESS, PORT), conf,
         new FifoRpcScheduler(conf, 10));
-    this.isa = server.getListenerAddress();
+    InetSocketAddress address = server.getListenerAddress();
+    if (address == null) {
+      throw new IOException("Listener channel is closed");
+    }
+    this.isa = address;
     this.server.start();
   }
 

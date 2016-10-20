@@ -24,14 +24,11 @@ import static com.google.common.base.Preconditions.checkPositionIndex;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.Charset;
-import java.security.AccessController;
-import java.security.PrivilegedAction;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.Collection;
@@ -124,7 +121,8 @@ public class Bytes {
   // SizeOf which uses java.lang.instrument says 24 bytes. (3 longs?)
   public static final int ESTIMATED_HEAP_TAX = 16;
 
-  
+  private static final boolean UNSAFE_UNALIGNED = UnsafeAvailChecker.unaligned();
+
   /**
    * Returns length of the byte array, returning 0 if the array is null.
    * Useful for calculating sizes.
@@ -414,6 +412,10 @@ public class Bytes {
     return toStringBinary(toBytes(buf));
   }
 
+  private static final char[] HEX_CHARS_UPPER = {
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
+  };
+
   /**
    * Write a printable representation of a byte array. Non-printable
    * characters are hex escaped in the format \\x%02X, eg:
@@ -431,13 +433,12 @@ public class Bytes {
     if (off + len > b.length) len = b.length - off;
     for (int i = off; i < off + len ; ++i ) {
       int ch = b[i] & 0xFF;
-      if ( (ch >= '0' && ch <= '9')
-          || (ch >= 'A' && ch <= 'Z')
-          || (ch >= 'a' && ch <= 'z')
-          || " `~!@#$%^&*()-_=+[]{}|;:'\",.<>/?".indexOf(ch) >= 0 ) {
+      if (ch >= ' ' && ch <= '~' && ch != '\\') {
         result.append((char)ch);
       } else {
-        result.append(String.format("\\x%02X", ch));
+        result.append("\\x");
+        result.append(HEX_CHARS_UPPER[ch / 0x10]);
+        result.append(HEX_CHARS_UPPER[ch % 0x10]);
       }
     }
     return result.toString();
@@ -578,7 +579,7 @@ public class Bytes {
     if (length != SIZEOF_LONG || offset + length > bytes.length) {
       throw explainWrongLengthOrOffset(bytes, offset, length, SIZEOF_LONG);
     }
-    if (UnsafeComparer.isAvailable()) {
+    if (UNSAFE_UNALIGNED) {
       return toLongUnsafe(bytes, offset);
     } else {
       long l = 0;
@@ -619,7 +620,7 @@ public class Bytes {
       throw new IllegalArgumentException("Not enough room to put a long at"
           + " offset " + offset + " in a " + bytes.length + " byte array");
     }
-    if (UnsafeComparer.isAvailable()) {
+    if (UNSAFE_UNALIGNED) {
       return putLongUnsafe(bytes, offset, val);
     } else {
       for(int i = offset + 7; i > offset; i--) {
@@ -774,7 +775,7 @@ public class Bytes {
     if (length != SIZEOF_INT || offset + length > bytes.length) {
       throw explainWrongLengthOrOffset(bytes, offset, length, SIZEOF_INT);
     }
-    if (UnsafeComparer.isAvailable()) {
+    if (UNSAFE_UNALIGNED) {
       return toIntUnsafe(bytes, offset);
     } else {
       int n = 0;
@@ -870,7 +871,7 @@ public class Bytes {
       throw new IllegalArgumentException("Not enough room to put an int at"
           + " offset " + offset + " in a " + bytes.length + " byte array");
     }
-    if (UnsafeComparer.isAvailable()) {
+    if (UNSAFE_UNALIGNED) {
       return putIntUnsafe(bytes, offset, val);
     } else {
       for(int i= offset + 3; i > offset; i--) {
@@ -944,7 +945,7 @@ public class Bytes {
     if (length != SIZEOF_SHORT || offset + length > bytes.length) {
       throw explainWrongLengthOrOffset(bytes, offset, length, SIZEOF_SHORT);
     }
-    if (UnsafeComparer.isAvailable()) {
+    if (UNSAFE_UNALIGNED) {
       return toShortUnsafe(bytes, offset);
     } else {
       short n = 0;
@@ -982,7 +983,7 @@ public class Bytes {
       throw new IllegalArgumentException("Not enough room to put a short at"
           + " offset " + offset + " in a " + bytes.length + " byte array");
     }
-    if (UnsafeComparer.isAvailable()) {
+    if (UNSAFE_UNALIGNED) {
       return putShortUnsafe(bytes, offset, val);
     } else {
       bytes[offset+1] = (byte) val;
@@ -1155,14 +1156,26 @@ public class Bytes {
   }
 
   /**
-   * Reads a zero-compressed encoded long from input stream and returns it.
+   * Reads a zero-compressed encoded long from input buffer and returns it.
    * @param buffer Binary array
    * @param offset Offset into array at which vint begins.
    * @throws java.io.IOException e
-   * @return deserialized long from stream.
+   * @return deserialized long from buffer.
+   * @deprecated Use {@link #readAsVLong()} instead.
    */
+  @Deprecated
   public static long readVLong(final byte [] buffer, final int offset)
   throws IOException {
+    return readAsVLong(buffer, offset);
+  }
+
+  /**
+   * Reads a zero-compressed encoded long from input buffer and returns it.
+   * @param buffer Binary array
+   * @param offset Offset into array at which vint begins.
+   * @return deserialized long from buffer.
+   */
+  public static long readAsVLong(final byte [] buffer, final int offset) {
     byte firstByte = buffer[offset];
     int len = WritableUtils.decodeVIntSize(firstByte);
     if (len == 1) {
@@ -1282,23 +1295,13 @@ public class Bytes {
       static final int BYTE_ARRAY_BASE_OFFSET;
 
       static {
-        theUnsafe = (Unsafe) AccessController.doPrivileged(
-            new PrivilegedAction<Object>() {
-              @Override
-              public Object run() {
-                try {
-                  Field f = Unsafe.class.getDeclaredField("theUnsafe");
-                  f.setAccessible(true);
-                  return f.get(null);
-                } catch (NoSuchFieldException e) {
-                  // It doesn't matter what we throw;
-                  // it's swallowed in getBestComparer().
-                  throw new Error();
-                } catch (IllegalAccessException e) {
-                  throw new Error();
-                }
-              }
-            });
+        if (UNSAFE_UNALIGNED) {
+          theUnsafe = UnsafeAccess.theUnsafe;
+        } else {
+          // It doesn't matter what we throw;
+          // it's swallowed in getBestComparer().
+          throw new Error();
+        }
 
         BYTE_ARRAY_BASE_OFFSET = theUnsafe.arrayBaseOffset(byte[].class);
 
@@ -1314,34 +1317,46 @@ public class Bytes {
       /**
        * Returns true if x1 is less than x2, when both values are treated as
        * unsigned long.
+       * Both values are passed as is read by Unsafe. When platform is Little Endian, have to
+       * convert to corresponding Big Endian value and then do compare. We do all writes in
+       * Big Endian format.
        */
       static boolean lessThanUnsignedLong(long x1, long x2) {
+        if (littleEndian) {
+          x1 = Long.reverseBytes(x1);
+          x2 = Long.reverseBytes(x2);
+        }
         return (x1 + Long.MIN_VALUE) < (x2 + Long.MIN_VALUE);
       }
 
       /**
        * Returns true if x1 is less than x2, when both values are treated as
        * unsigned int.
+       * Both values are passed as is read by Unsafe. When platform is Little Endian, have to
+       * convert to corresponding Big Endian value and then do compare. We do all writes in
+       * Big Endian format.
        */
       static boolean lessThanUnsignedInt(int x1, int x2) {
+        if (littleEndian) {
+          x1 = Integer.reverseBytes(x1);
+          x2 = Integer.reverseBytes(x2);
+        }
         return (x1 & 0xffffffffL) < (x2 & 0xffffffffL);
       }
 
       /**
        * Returns true if x1 is less than x2, when both values are treated as
        * unsigned short.
+       * Both values are passed as is read by Unsafe. When platform is Little Endian, have to
+       * convert to corresponding Big Endian value and then do compare. We do all writes in
+       * Big Endian format.
        */
       static boolean lessThanUnsignedShort(short x1, short x2) {
+        if (littleEndian) {
+          x1 = Short.reverseBytes(x1);
+          x2 = Short.reverseBytes(x2);
+        }
         return (x1 & 0xffff) < (x2 & 0xffff);
-      }
-
-      /**
-       * Checks if Unsafe is available
-       * @return true, if available, false - otherwise
-       */
-      public static boolean isAvailable()
-      {
-        return theUnsafe != null;
       }
 
       /**
@@ -1375,40 +1390,30 @@ public class Bytes {
          * time is no slower than comparing 4 bytes at a time even on 32-bit.
          * On the other hand, it is substantially faster on 64-bit.
          */
-        for (int i = 0; i < minWords * SIZEOF_LONG; i += SIZEOF_LONG) {
+        // This is the end offset of long parts.
+        int j = minWords << 3; // Same as minWords * SIZEOF_LONG
+        for (int i = 0; i < j; i += SIZEOF_LONG) {
           long lw = theUnsafe.getLong(buffer1, offset1Adj + (long) i);
           long rw = theUnsafe.getLong(buffer2, offset2Adj + (long) i);
           long diff = lw ^ rw;
-          if(littleEndian){
-            lw = Long.reverseBytes(lw);
-            rw = Long.reverseBytes(rw);
-          }
           if (diff != 0) {
               return lessThanUnsignedLong(lw, rw) ? -1 : 1;
           }
         }
-        int offset = minWords * SIZEOF_LONG;
+        int offset = j;
 
         if (minLength - offset >= SIZEOF_INT) {
           int il = theUnsafe.getInt(buffer1, offset1Adj + offset);
           int ir = theUnsafe.getInt(buffer2, offset2Adj + offset);
-          if(littleEndian){
-            il = Integer.reverseBytes(il);
-            ir = Integer.reverseBytes(ir);
-          }
-          if(il != ir){
+          if (il != ir) {
             return lessThanUnsignedInt(il, ir) ? -1: 1;
           }
-           offset += SIZEOF_INT;
+          offset += SIZEOF_INT;
         }
         if (minLength - offset >= SIZEOF_SHORT) {
           short sl = theUnsafe.getShort(buffer1, offset1Adj + offset);
           short sr = theUnsafe.getShort(buffer2, offset2Adj + offset);
-          if(littleEndian){
-            sl = Short.reverseBytes(sl);
-            sr = Short.reverseBytes(sr);
-          }
-          if(sl != sr){
+          if (sl != sr) {
             return lessThanUnsignedShort(sl, sr) ? -1: 1;
           }
           offset += SIZEOF_SHORT;
@@ -1568,6 +1573,24 @@ public class Bytes {
   }
 
   /**
+   * @param arrays all the arrays to concatenate together.
+   * @return New array made from the concatenation of the given arrays.
+   */
+  public static byte [] add(final byte [][] arrays) {
+    int length = 0;
+    for (int i = 0; i < arrays.length; i++) {
+      length += arrays[i].length;
+    }
+    byte [] result = new byte[length];
+    int index = 0;
+    for (int i = 0; i < arrays.length; i++) {
+      System.arraycopy(arrays[i], 0, result, index, arrays[i].length);
+      index += arrays[i].length;
+    }
+    return result;
+  }
+
+  /**
    * @param a array
    * @param length amount of bytes to grab
    * @return First <code>length</code> bytes from <code>a</code>
@@ -1700,8 +1723,19 @@ public class Bytes {
       diffBI = diffBI.add(BigInteger.ONE);
     }
     final BigInteger splitsBI = BigInteger.valueOf(num + 1);
+    //when diffBI < splitBI, use an additional byte to increase diffBI
     if(diffBI.compareTo(splitsBI) < 0) {
-      return null;
+      byte[] aPaddedAdditional = new byte[aPadded.length+1];
+      byte[] bPaddedAdditional = new byte[bPadded.length+1];
+      for (int i = 0; i < aPadded.length; i++){
+        aPaddedAdditional[i] = aPadded[i];
+      }
+      for (int j = 0; j < bPadded.length; j++){
+        bPaddedAdditional[j] = bPadded[j];
+      }
+      aPaddedAdditional[aPadded.length] = 0;
+      bPaddedAdditional[bPadded.length] = 0;
+      return iterateOnSplits(aPaddedAdditional, bPaddedAdditional, inclusive,  num);
     }
     final BigInteger intervalBI;
     try {
@@ -1769,6 +1803,18 @@ public class Bytes {
     byte [][] result = new byte[t.length][];
     for (int i = 0; i < t.length; i++) {
       result[i] = Bytes.toBytes(t[i]);
+    }
+    return result;
+  }
+
+  /**
+   * @param t operands
+   * @return Array of binary byte arrays made from passed array of binary strings
+   */
+  public static byte[][] toBinaryByteArrays(final String[] t) {
+    byte[][] result = new byte[t.length][];
+    for (int i = 0; i < t.length; i++) {
+      result[i] = Bytes.toBytesBinary(t[i]);
     }
     return result;
   }
@@ -2212,14 +2258,47 @@ public class Bytes {
     }
     return result;
   }
-  
+
+  private static final char[] HEX_CHARS = {
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
+  };
+
+  /**
+   * Convert a byte range into a hex string
+   */
+  public static String toHex(byte[] b, int offset, int length) {
+    checkArgument(length <= Integer.MAX_VALUE / 2);
+    int numChars = length * 2;
+    char[] ch = new char[numChars];
+    for (int i = 0; i < numChars; i += 2)
+    {
+      byte d = b[offset + i/2];
+      ch[i] = HEX_CHARS[(d >> 4) & 0x0F];
+      ch[i+1] = HEX_CHARS[d & 0x0F];
+    }
+    return new String(ch);
+  }
+
   /**
    * Convert a byte array into a hex string
-   * @param b
    */
   public static String toHex(byte[] b) {
-    checkArgument(b.length > 0, "length must be greater than 0");
-    return String.format("%x", new BigInteger(1, b));
+    return toHex(b, 0, b.length);
+  }
+
+  private static int hexCharToNibble(char ch) {
+    if (ch <= '9' && ch >= '0') {
+      return ch - '0';
+    } else if (ch >= 'a' && ch <= 'f') {
+      return ch - 'a' + 10;
+    } else if (ch >= 'A' && ch <= 'F') {
+      return ch - 'A' + 10;
+    }
+    throw new IllegalArgumentException("Invalid hex char: " + ch);
+  }
+
+  private static byte hexCharsToByte(char c1, char c2) {
+    return (byte) ((hexCharToNibble(c1) << 4) | hexCharToNibble(c2));
   }
 
   /**
@@ -2228,14 +2307,11 @@ public class Bytes {
    * @param hex
    */
   public static byte[] fromHex(String hex) {
-    checkArgument(hex.length() > 0, "length must be greater than 0");
     checkArgument(hex.length() % 2 == 0, "length must be a multiple of 2");
-    // Make sure letters are upper case
-    hex = hex.toUpperCase();
-    byte[] b = new byte[hex.length() / 2];
-    for (int i = 0; i < b.length; i++) {
-      b[i] = (byte)((toBinaryFromHex((byte)hex.charAt(2 * i)) << 4) +
-        toBinaryFromHex((byte)hex.charAt((2 * i + 1))));
+    int len = hex.length();
+    byte[] b = new byte[len / 2];
+    for (int i = 0; i < len; i += 2) {
+        b[i / 2] = hexCharsToByte(hex.charAt(i),hex.charAt(i+1));
     }
     return b;
   }

@@ -22,6 +22,7 @@ import static org.junit.Assert.assertEquals;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.StringWriter;
+import java.util.*;
 
 import javax.ws.rs.core.MediaType;
 import javax.xml.bind.JAXBContext;
@@ -29,6 +30,7 @@ import javax.xml.bind.JAXBException;
 import javax.xml.bind.Marshaller;
 import javax.xml.bind.Unmarshaller;
 
+import org.apache.commons.collections.keyvalue.AbstractMapEntry;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
@@ -228,13 +230,22 @@ public class RowResourceBase {
   }
 
   protected static Response checkAndPutValuePB(String url, String table,
-      String row, String column, String valueToCheck, String valueToPut)
+      String row, String column, String valueToCheck, String valueToPut, HashMap<String,String> otherCells)
         throws IOException {
     RowModel rowModel = new RowModel(row);
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(valueToPut)));
+
+    if(otherCells != null) {
+      for (Map.Entry<String,String> entry :otherCells.entrySet()) {
+        rowModel.addCell(new CellModel(Bytes.toBytes(entry.getKey()), Bytes.toBytes(entry.getValue())));
+      }
+    }
+
+    // This Cell need to be added as last cell.
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(valueToCheck)));
+
     CellSetModel cellSetModel = new CellSetModel();
     cellSetModel.addRow(rowModel);
     Response response = client.put(url, Constants.MIMETYPE_PROTOBUF,
@@ -245,6 +256,10 @@ public class RowResourceBase {
 
   protected static Response checkAndPutValuePB(String table, String row,
       String column, String valueToCheck, String valueToPut) throws IOException {
+    return checkAndPutValuePB(table,row,column,valueToCheck,valueToPut,null);
+  }
+    protected static Response checkAndPutValuePB(String table, String row,
+      String column, String valueToCheck, String valueToPut, HashMap<String,String> otherCells) throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
@@ -252,15 +267,23 @@ public class RowResourceBase {
     path.append(row);
     path.append("?check=put");
     return checkAndPutValuePB(path.toString(), table, row, column,
-      valueToCheck, valueToPut);
+      valueToCheck, valueToPut, otherCells);
   }
 
   protected static Response checkAndPutValueXML(String url, String table,
-      String row, String column, String valueToCheck, String valueToPut)
+      String row, String column, String valueToCheck, String valueToPut, HashMap<String,String> otherCells)
         throws IOException, JAXBException {
     RowModel rowModel = new RowModel(row);
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(valueToPut)));
+
+    if(otherCells != null) {
+      for (Map.Entry<String,String> entry :otherCells.entrySet()) {
+        rowModel.addCell(new CellModel(Bytes.toBytes(entry.getKey()), Bytes.toBytes(entry.getValue())));
+      }
+    }
+
+    // This Cell need to be added as last cell.
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(valueToCheck)));
     CellSetModel cellSetModel = new CellSetModel();
@@ -274,7 +297,13 @@ public class RowResourceBase {
   }
 
   protected static Response checkAndPutValueXML(String table, String row,
-      String column, String valueToCheck, String valueToPut)
+                                                String column, String valueToCheck, String valueToPut)
+          throws IOException, JAXBException {
+    return checkAndPutValueXML(table,row,column,valueToCheck,valueToPut, null);
+  }
+
+  protected static Response checkAndPutValueXML(String table, String row,
+      String column, String valueToCheck, String valueToPut, HashMap<String,String> otherCells)
         throws IOException, JAXBException {
     StringBuilder path = new StringBuilder();
     path.append('/');
@@ -283,13 +312,20 @@ public class RowResourceBase {
     path.append(row);
     path.append("?check=put");
     return checkAndPutValueXML(path.toString(), table, row, column,
-      valueToCheck, valueToPut);
+      valueToCheck, valueToPut, otherCells);
   }
 
   protected static Response checkAndDeleteXML(String url, String table,
-      String row, String column, String valueToCheck)
+      String row, String column, String valueToCheck, HashMap<String,String> cellsToDelete)
         throws IOException, JAXBException {
     RowModel rowModel = new RowModel(row);
+
+    if(cellsToDelete != null) {
+      for (Map.Entry<String,String> entry :cellsToDelete.entrySet()) {
+        rowModel.addCell(new CellModel(Bytes.toBytes(entry.getKey()), Bytes.toBytes(entry.getValue())));
+      }
+    }
+    // Add this at the end
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(valueToCheck)));
     CellSetModel cellSetModel = new CellSetModel();
@@ -304,30 +340,46 @@ public class RowResourceBase {
 
   protected static Response checkAndDeleteXML(String table, String row,
       String column, String valueToCheck) throws IOException, JAXBException {
+    return checkAndDeleteXML(table, row, column, valueToCheck, null);
+  }
+  protected static Response checkAndDeleteXML(String table, String row,
+      String column, String valueToCheck, HashMap<String,String> cellsToDelete) throws IOException, JAXBException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
     path.append('/');
     path.append(row);
     path.append("?check=delete");
-    return checkAndDeleteXML(path.toString(), table, row, column, valueToCheck);
+    return checkAndDeleteXML(path.toString(), table, row, column, valueToCheck, cellsToDelete);
   }
 
   protected static Response checkAndDeleteJson(String table, String row,
       String column, String valueToCheck) throws IOException, JAXBException {
+    return checkAndDeleteJson(table, row, column, valueToCheck, null);
+  }
+
+  protected static Response checkAndDeleteJson(String table, String row,
+      String column, String valueToCheck, HashMap<String,String> cellsToDelete) throws IOException, JAXBException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
     path.append('/');
     path.append(row);
     path.append("?check=delete");
-    return checkAndDeleteJson(path.toString(), table, row, column, valueToCheck);
+    return checkAndDeleteJson(path.toString(), table, row, column, valueToCheck, cellsToDelete);
   }
 
   protected static Response checkAndDeleteJson(String url, String table,
-      String row, String column, String valueToCheck)
+      String row, String column, String valueToCheck, HashMap<String,String> cellsToDelete)
         throws IOException, JAXBException {
     RowModel rowModel = new RowModel(row);
+
+    if(cellsToDelete != null) {
+      for (Map.Entry<String,String> entry :cellsToDelete.entrySet()) {
+        rowModel.addCell(new CellModel(Bytes.toBytes(entry.getKey()), Bytes.toBytes(entry.getValue())));
+      }
+    }
+    // Add this at the end
     rowModel.addCell(new CellModel(Bytes.toBytes(column),
       Bytes.toBytes(valueToCheck)));
     CellSetModel cellSetModel = new CellSetModel();
@@ -341,19 +393,31 @@ public class RowResourceBase {
 
   protected static Response checkAndDeletePB(String table, String row,
       String column, String value) throws IOException {
+
+    return checkAndDeletePB(table, row, column, value, null);
+  }
+
+  protected static Response checkAndDeletePB(String table, String row,
+      String column, String value, HashMap<String,String> cellsToDelete) throws IOException {
     StringBuilder path = new StringBuilder();
     path.append('/');
     path.append(table);
     path.append('/');
     path.append(row);
     path.append("?check=delete");
-    return checkAndDeleteValuePB(path.toString(), table, row, column, value);
+    return checkAndDeleteValuePB(path.toString(), table, row, column, value, cellsToDelete);
   }
-
   protected static Response checkAndDeleteValuePB(String url, String table,
-      String row, String column, String valueToCheck)
+      String row, String column, String valueToCheck, HashMap<String,String> cellsToDelete)
       throws IOException {
     RowModel rowModel = new RowModel(row);
+
+    if(cellsToDelete != null) {
+      for (Map.Entry<String,String> entry :cellsToDelete.entrySet()) {
+        rowModel.addCell(new CellModel(Bytes.toBytes(entry.getKey()), Bytes.toBytes(entry.getValue())));
+      }
+    }
+    // Add this at the end
     rowModel.addCell(new CellModel(Bytes.toBytes(column), Bytes
         .toBytes(valueToCheck)));
     CellSetModel cellSetModel = new CellSetModel();

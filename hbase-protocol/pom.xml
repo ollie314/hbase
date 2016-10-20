@@ -23,13 +23,17 @@
     <parent>
         <artifactId>hbase</artifactId>
         <groupId>org.apache.hbase</groupId>
-        <version>0.98.9-SNAPSHOT</version>
+        <version>0.98.23</version>
         <relativePath>..</relativePath>
     </parent>
 
     <artifactId>hbase-protocol</artifactId>
-    <name>HBase - Protocol</name>
+    <name>Apache HBase - Protocol</name>
     <description>Protobuf protocol classes used by HBase to communicate.</description>
+
+    <properties>
+      <maven.javadoc.skip>true</maven.javadoc.skip>
+    </properties>
 
     <build>
       <plugins>
@@ -103,6 +107,16 @@
 
     <dependencies>
       <!-- Intra-project dependencies -->
+      <dependency>
+        <groupId>org.apache.hbase</groupId>
+        <artifactId>hbase-annotations</artifactId>
+        <exclusions>
+          <exclusion>
+            <groupId>jdk.tools</groupId>
+            <artifactId>jdk.tools</artifactId>
+          </exclusion>
+        </exclusions>
+      </dependency>
       <!-- General dependencies -->
       <dependency>
         <groupId>com.google.protobuf</groupId>
@@ -152,6 +166,8 @@
                       </imports>
                       <source>
                         <directory>${basedir}/src/main/protobuf</directory>
+                        <!-- Unfortunately, Hadoop plugin does not support *.proto.
+                             We have to individually list every proto file here -->
                         <includes>
                           <include>AccessControl.proto</include>
                           <include>Admin.proto</include>
@@ -164,18 +180,19 @@
                           <include>Comparator.proto</include>
                           <include>Encryption.proto</include>
                           <include>ErrorHandling.proto</include>
-                          <include>Filter.proto</include>
                           <include>FS.proto</include>
+                          <include>Filter.proto</include>
                           <include>HBase.proto</include>
                           <include>HFile.proto</include>
                           <include>LoadBalancer.proto</include>
                           <include>MapReduce.proto</include>
                           <include>Master.proto</include>
                           <include>MultiRowMutation.proto</include>
+                          <include>RPC.proto</include>
                           <include>RegionServerStatus.proto</include>
                           <include>RowProcessor.proto</include>
-                          <include>RPC.proto</include>
                           <include>SecureBulkLoad.proto</include>
+                          <include>Snapshot.proto</include>
                           <include>Tracing.proto</include>
                           <include>VisibilityLabels.proto</include>
                           <include>WAL.proto</include>

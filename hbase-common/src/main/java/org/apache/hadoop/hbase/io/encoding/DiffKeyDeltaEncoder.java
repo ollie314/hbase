@@ -392,6 +392,10 @@ public class DiffKeyDeltaEncoder extends BufferedDataBlockEncoder {
     private int rowLengthWithSize;
     private long timestamp;
 
+    public DiffSeekerState() {
+      super();
+    }
+
     @Override
     protected void copyFromNext(SeekerState that) {
       super.copyFromNext(that);

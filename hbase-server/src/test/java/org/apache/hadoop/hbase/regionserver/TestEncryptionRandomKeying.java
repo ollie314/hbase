@@ -29,7 +29,7 @@ import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Put;
@@ -90,7 +90,9 @@ public class TestEncryptionRandomKeying {
     // Specify an encryption algorithm without a key
     htd = new HTableDescriptor(TableName.valueOf("default", "TestEncryptionRandomKeying"));
     HColumnDescriptor hcd = new HColumnDescriptor("cf");
-    hcd.setEncryptionType("AES");
+    String algorithm =
+        conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY, HConstants.CIPHER_AES);
+    hcd.setEncryptionType(algorithm);
     htd.addFamily(hcd);
 
     // Start the minicluster

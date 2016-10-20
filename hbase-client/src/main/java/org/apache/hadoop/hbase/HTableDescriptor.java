@@ -55,8 +55,6 @@ import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Writables;
 import org.apache.hadoop.io.WritableComparable;
 
-import com.google.protobuf.InvalidProtocolBufferException;
-
 /**
  * HTableDescriptor contains the details about an HBase table  such as the descriptors of
  * all the column families, is the table a catalog table, <code> -ROOT- </code> or
@@ -186,6 +184,13 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
   /** Default durability for HTD is USE_DEFAULT, which defaults to HBase-global default value */
   private static final Durability DEFAULT_DURABLITY = Durability.USE_DEFAULT;
 
+  public static final String PRIORITY = "PRIORITY";
+  private static final ImmutableBytesWritable PRIORITY_KEY =
+    new ImmutableBytesWritable(Bytes.toBytes(PRIORITY));
+
+  /** Relative priority of the table used for rpc scheduling */
+  private static final int DEFAULT_PRIORITY = HConstants.NORMAL_QOS;
+
   /*
    *  The below are ugly but better than creating them each time till we
    *  replace booleans being saved as Strings with plain booleans.  Need a
@@ -228,6 +233,7 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
     DEFAULT_VALUES.put(DEFERRED_LOG_FLUSH,
         String.valueOf(DEFAULT_DEFERRED_LOG_FLUSH));
     DEFAULT_VALUES.put(DURABILITY, DEFAULT_DURABLITY.name()); //use the enum name
+    DEFAULT_VALUES.put(PRIORITY, String.valueOf(DEFAULT_PRIORITY));
     for (String s : DEFAULT_VALUES.keySet()) {
       RESERVED_KEYWORDS.add(new ImmutableBytesWritable(Bytes.toBytes(s)));
     }
@@ -686,7 +692,17 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
   }
 
   /**
-   * This get the class associated with the region split policy which
+   * This sets the class associated with the region split policy which
+   * determines when a region split should occur.  The class used by
+   * default is defined in {@link org.apache.hadoop.hbase.regionserver.RegionSplitPolicy}
+   * @param clazz the class name
+   */
+  public void setRegionSplitPolicyClassName(String clazz) {
+    setValue(SPLIT_POLICY, clazz);
+  }
+
+  /**
+   * This gets the class associated with the region split policy which
    * determines when a region split should occur.  The class used by
    * default is defined in {@link org.apache.hadoop.hbase.regionserver.RegionSplitPolicy}
    *
@@ -822,6 +838,13 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
       s.append(", ").append(hcd.toStringCustomizedValues());
     }
     return s.toString();
+  }
+
+  /**
+   * @return map of all table attributes formatted into string.
+   */
+  public String toStringTableAttributes() {
+   return getValues(true).toString();
   }
 
   private StringBuilder getValues(boolean printDefaults) {
@@ -1088,6 +1111,23 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
     return Collections.unmodifiableCollection(this.families.values());
   }
 
+  private int getIntValue(ImmutableBytesWritable key, int defaultVal) {
+    byte[] val = getValue(key);
+    if (val == null || val.length == 0) {
+      return defaultVal;
+    }
+    return Integer.parseInt(Bytes.toString(val));
+  }
+
+  public HTableDescriptor setPriority(int priority) {
+    setValue(PRIORITY_KEY, Integer.toString(priority));
+    return this;
+  }
+
+  public int getPriority() {
+    return getIntValue(PRIORITY_KEY, DEFAULT_PRIORITY);
+  }
+
   /**
    * Returns all the column family names of the current table. The map of
    * HTableDescriptor contains mapping of family name to HColumnDescriptors.
@@ -1139,7 +1179,6 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
     return this.families.remove(column);
   }
 
-
   /**
    * Add a table coprocessor to this table. The coprocessor
    * type must be {@link org.apache.hadoop.hbase.coprocessor.RegionObserver}
@@ -1153,7 +1192,6 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
   public void addCoprocessor(String className) throws IOException {
     addCoprocessor(className, null, Coprocessor.PRIORITY_USER, null);
   }
-
 
   /**
    * Add a table coprocessor to this table. The coprocessor
@@ -1172,10 +1210,9 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
   public void addCoprocessor(String className, Path jarFilePath,
                              int priority, final Map<String, String> kvs)
   throws IOException {
-    if (hasCoprocessor(className)) {
-      throw new IOException("Coprocessor " + className + " already exists.");
-    }
-    // validate parameter kvs
+    checkHasCoprocessor(className);
+
+    // Validate parameter kvs and then add key/values to kvString.
     StringBuilder kvString = new StringBuilder();
     if (kvs != null) {
       for (Map.Entry<String, String> e: kvs.entrySet()) {
@@ -1195,6 +1232,47 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
       }
     }
 
+    String value = ((jarFilePath == null)? "" : jarFilePath.toString()) +
+        "|" + className + "|" + Integer.toString(priority) + "|" +
+        kvString.toString();
+    addCoprocessorToMap(value);
+  }
+
+  /**
+   * Add a table coprocessor to this table. The coprocessor
+   * type must be {@link org.apache.hadoop.hbase.coprocessor.RegionObserver}
+   * or Endpoint.
+   * It won't check if the class can be loaded or not.
+   * Whether a coprocessor is loadable or not will be determined when
+   * a region is opened.
+   * @param specStr The Coprocessor specification all in in one String formatted so matches
+   * {@link HConstants#CP_HTD_ATTR_VALUE_PATTERN}
+   * @throws IOException
+   */
+  public HTableDescriptor addCoprocessorWithSpec(final String specStr) throws IOException {
+    String className = getCoprocessorClassNameFromSpecStr(specStr);
+    if (className == null) {
+      throw new IllegalArgumentException("Format does not match " +
+        HConstants.CP_HTD_ATTR_VALUE_PATTERN + ": " + specStr);
+    }
+    checkHasCoprocessor(className);
+    return addCoprocessorToMap(specStr);
+  }
+
+  private void checkHasCoprocessor(final String className) throws IOException {
+    if (hasCoprocessor(className)) {
+      throw new IOException("Coprocessor " + className + " already exists.");
+    }
+  }
+
+  /**
+   * Add coprocessor to values Map
+   * @param specStr The Coprocessor specification all in in one String formatted so matches
+   * {@link HConstants#CP_HTD_ATTR_VALUE_PATTERN}
+   * @return Returns <code>this</code>
+   */
+  private HTableDescriptor addCoprocessorToMap(final String specStr) {
+    if (specStr == null) return this;
     // generate a coprocessor key
     int maxCoprocessorNumber = 0;
     Matcher keyMatcher;
@@ -1206,26 +1284,22 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
       if (!keyMatcher.matches()) {
         continue;
       }
-      maxCoprocessorNumber = Math.max(Integer.parseInt(keyMatcher.group(1)),
-          maxCoprocessorNumber);
+      maxCoprocessorNumber = Math.max(Integer.parseInt(keyMatcher.group(1)), maxCoprocessorNumber);
     }
     maxCoprocessorNumber++;
-
     String key = "coprocessor$" + Integer.toString(maxCoprocessorNumber);
-    String value = ((jarFilePath == null)? "" : jarFilePath.toString()) +
-        "|" + className + "|" + Integer.toString(priority) + "|" +
-        kvString.toString();
-    setValue(key, value);
+    this.values.put(new ImmutableBytesWritable(Bytes.toBytes(key)),
+      new ImmutableBytesWritable(Bytes.toBytes(specStr)));
+    return this;
   }
-
 
   /**
    * Check if the table has an attached co-processor represented by the name className
    *
-   * @param className - Class name of the co-processor
+   * @param classNameToMatch - Class name of the co-processor
    * @return true of the table has a co-processor className
    */
-  public boolean hasCoprocessor(String className) {
+  public boolean hasCoprocessor(String classNameToMatch) {
     Matcher keyMatcher;
     Matcher valueMatcher;
     for (Map.Entry<ImmutableBytesWritable, ImmutableBytesWritable> e:
@@ -1236,15 +1310,9 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
       if (!keyMatcher.matches()) {
         continue;
       }
-      valueMatcher =
-        HConstants.CP_HTD_ATTR_VALUE_PATTERN.matcher(
-            Bytes.toString(e.getValue().get()));
-      if (!valueMatcher.matches()) {
-        continue;
-      }
-      // get className and compare
-      String clazz = valueMatcher.group(2).trim(); // classname is the 2nd field
-      if (clazz.equals(className.trim())) {
+      String className = getCoprocessorClassNameFromSpecStr(Bytes.toString(e.getValue().get()));
+      if (className == null) continue;
+      if (className.equals(classNameToMatch.trim())) {
         return true;
       }
     }
@@ -1265,14 +1333,21 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
       if (!keyMatcher.matches()) {
         continue;
       }
-      valueMatcher = HConstants.CP_HTD_ATTR_VALUE_PATTERN.matcher(Bytes
-          .toString(e.getValue().get()));
-      if (!valueMatcher.matches()) {
-        continue;
-      }
-      result.add(valueMatcher.group(2).trim()); // classname is the 2nd field
+      String className = getCoprocessorClassNameFromSpecStr(Bytes.toString(e.getValue().get()));
+      if (className == null) continue;
+      result.add(className); // classname is the 2nd field
     }
     return result;
+  }
+
+  /**
+   * @param spec String formatted as per {@link HConstants#CP_HTD_ATTR_VALUE_PATTERN}
+   * @return Class parsed from passed in <code>spec</code> or null if no match or classpath found
+   */
+  private static String getCoprocessorClassNameFromSpecStr(final String spec) {
+    Matcher matcher = HConstants.CP_HTD_ATTR_VALUE_PATTERN.matcher(spec);
+    // Classname is the 2nd field
+    return matcher != null && matcher.matches()? matcher.group(2).trim(): null;
   }
 
   /**
@@ -1423,8 +1498,9 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
     TableSchema.Builder builder = TableSchema.newBuilder();
     TableSchema ts;
     try {
-      ts = builder.mergeFrom(bytes, pblen, bytes.length - pblen).build();
-    } catch (InvalidProtocolBufferException e) {
+      ProtobufUtil.mergeFrom(builder, bytes, pblen, bytes.length - pblen);
+      ts = builder.build();
+    } catch (IOException e) {
       throw new DeserializationException(e);
     }
     return convert(ts);

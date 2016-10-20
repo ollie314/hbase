@@ -45,6 +45,7 @@ import org.apache.hadoop.hbase.catalog.MetaMockingUtil;
 import org.apache.hadoop.hbase.client.HConnection;
 import org.apache.hadoop.hbase.client.HConnectionTestingUtility;
 import org.apache.hadoop.hbase.client.Result;
+import org.apache.hadoop.hbase.master.RegionState.State;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.regionserver.RegionOpeningState;
 import org.apache.hadoop.hbase.util.FSUtils;
@@ -52,7 +53,7 @@ import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.hbase.zookeeper.MetaRegionTracker;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.zookeeper.KeeperException;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameStringPair;
@@ -156,7 +157,7 @@ public class TestMasterNoCluster {
     final MockRegionServer rs2 = new MockRegionServer(conf, sn2);
     // Put some data into the servers.  Make it look like sn0 has the metaH
     // Put data into sn2 so it looks like it has a few regions for a table named 't'.
-    MetaRegionTracker.setMetaLocation(rs0.getZooKeeper(), rs0.getServerName());
+    MetaRegionTracker.setMetaLocation(rs0.getZooKeeper(), rs0.getServerName(), State.OPEN);
     final TableName tableName = TableName.valueOf("t");
     Result [] results = new Result [] {
       MetaMockingUtil.getMetaTableRowResult(
@@ -171,6 +172,12 @@ public class TestMasterNoCluster {
     };
     rs1.setNextResults(HRegionInfo.FIRST_META_REGIONINFO.getRegionName(), results);
 
+    // Insert a mock for the connection, use TESTUTIL.getConfiguration rather than
+    // the conf from the master; the conf will already have an HConnection
+    // associate so the below mocking of a connection will fail.
+    final HConnection mockedConnection = HConnectionTestingUtility.getMockedConnectionAndDecorate(
+        TESTUTIL.getConfiguration(), rs0, rs0, rs0.getServerName(),
+        HRegionInfo.FIRST_META_REGIONINFO);
     // Create master.  Subclass to override a few methods so we can insert mocks
     // and get notification on transitions.  We need to fake out any rpcs the
     // master does opening/closing regions.  Also need to fake out the address
@@ -201,14 +208,7 @@ public class TestMasterNoCluster {
       CatalogTracker createCatalogTracker(ZooKeeperWatcher zk,
           Configuration conf, Abortable abortable)
       throws IOException {
-        // Insert a mock for the connection used by the CatalogTracker.  Any
-        // regionserver should do.  Use TESTUTIL.getConfiguration rather than
-        // the conf from the master; the conf will already have an HConnection
-        // associate so the below mocking of a connection will fail.
-        HConnection connection =
-          HConnectionTestingUtility.getMockedConnectionAndDecorate(TESTUTIL.getConfiguration(),
-            rs0, rs0, rs0.getServerName(), HRegionInfo.FIRST_META_REGIONINFO);
-        return new CatalogTracker(zk, conf, connection, abortable);
+        return new CatalogTracker(zk, conf, mockedConnection, abortable);
       }
 
       @Override
@@ -343,7 +343,7 @@ public class TestMasterNoCluster {
       // when its figured it just opened the meta region by setting the meta
       // location up into zk.  Since we're mocking regionserver, need to do this
       // ourselves.
-      MetaRegionTracker.setMetaLocation(rs0.getZooKeeper(), rs0.getServerName());
+      MetaRegionTracker.setMetaLocation(rs0.getZooKeeper(), rs0.getServerName(), State.OPEN);
       // Master should now come up.
       while (!master.isInitialized()) {Threads.sleep(10);}
       assertTrue(master.isInitialized());

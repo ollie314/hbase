@@ -53,6 +53,7 @@ public final class CellUtil {
       cell.getQualifierLength());
   }
 
+  @InterfaceStability.Unstable
   public static ByteRange fillTagRange(Cell cell, ByteRange range) {
     return range.set(cell.getTagsArray(), cell.getTagsOffset(), cell.getTagsLengthUnsigned());
   }
@@ -90,6 +91,7 @@ public final class CellUtil {
    * @param cell
    * @return tag value in a new byte array.
    */
+  @InterfaceStability.Unstable
   public static byte[] getTagArray(Cell cell){
     byte[] output = new byte[cell.getTagsLengthUnsigned()];
     copyTagTo(cell, output, 0);
@@ -130,6 +132,7 @@ public final class CellUtil {
    * @param destinationOffset
    * @return position after tags
    */
+  @InterfaceStability.Unstable
   public static int copyTagTo(Cell cell, byte[] destination, int destinationOffset) {
     System.arraycopy(cell.getTagsArray(), cell.getTagsOffset(), destination, destinationOffset,
         cell.getTagsLengthUnsigned());
@@ -361,6 +364,11 @@ public final class CellUtil {
     return Bytes.equals(left.getValueArray(), left.getValueOffset(), left.getValueLength(),
         buf, 0, buf.length);
   }
+
+  public static boolean matchingTimestamp(Cell a, Cell b) {
+    return CellComparator.compareTimestamps(a.getTimestamp(), b.getTimestamp()) == 0;
+  }
+
   /**
    * @return True if a delete type, a {@link KeyValue.Type#Delete} or
    * a {KeyValue.Type#DeleteFamily} or a {@link KeyValue.Type#DeleteColumn}
@@ -372,6 +380,19 @@ public final class CellUtil {
 
   public static boolean isDeleteFamily(final Cell cell) {
     return cell.getTypeByte() == Type.DeleteFamily.getCode();
+  }
+
+  public static boolean isDeleteFamilyVersion(final Cell cell) {
+    return cell.getTypeByte() == Type.DeleteFamilyVersion.getCode();
+  }
+
+  /**
+   *
+   * @return True if this cell is a delete family or column type.
+   */
+  public static boolean isDeleteColumnOrFamily(Cell cell) {
+    int t = cell.getTypeByte();
+    return t == Type.DeleteColumn.getCode() || t == Type.DeleteFamily.getCode();
   }
 
   /**
@@ -405,6 +426,7 @@ public final class CellUtil {
    * @param length
    * @return iterator for the tags
    */
+  @InterfaceStability.Unstable
   public static Iterator<Tag> tagsIterator(final byte[] tags, final int offset, final int length) {
     return new Iterator<Tag>() {
       private int pos = offset;

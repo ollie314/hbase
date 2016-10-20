@@ -23,8 +23,10 @@ import java.io.IOException;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.RemoteExceptionHandler;
 import org.apache.hadoop.hbase.master.TableLockManager.TableLock;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.Strings;
@@ -41,13 +43,15 @@ class SplitRequest implements Runnable {
   private final HRegion parent;
   private final byte[] midKey;
   private final HRegionServer server;
+  private final User user;
   private TableLock tableLock;
 
-  SplitRequest(HRegion region, byte[] midKey, HRegionServer hrs) {
+  SplitRequest(HRegion region, byte[] midKey, HRegionServer hrs, User user) {
     Preconditions.checkNotNull(hrs);
     this.parent = region;
     this.midKey = midKey;
     this.server = hrs;
+    this.user = user;
   }
 
   @Override
@@ -55,14 +59,9 @@ class SplitRequest implements Runnable {
     return "regionName=" + parent + ", midKey=" + Bytes.toStringBinary(midKey);
   }
 
-  @Override
-  public void run() {
-    if (this.server.isStopping() || this.server.isStopped()) {
-      LOG.debug("Skipping split because server is stopping=" +
-        this.server.isStopping() + " or stopped=" + this.server.isStopped());
-      return;
-    }
+  private void doSplitting(User user) {
     boolean success = false;
+    server.getMetrics().incrSplitRequest();
     long startTime = EnvironmentEdgeManager.currentTimeMillis();
     SplitTransaction st = new SplitTransaction(parent, midKey);
     try {
@@ -81,7 +80,7 @@ class SplitRequest implements Runnable {
       // the prepare call -- we are not ready to split just now. Just return.
       if (!st.prepare()) return;
       try {
-        st.execute(this.server, this.server);
+        st.execute(this.server, this.server, user);
         success = true;
       } catch (Exception e) {
         if (this.server.isStopping() || this.server.isStopped()) {
@@ -89,6 +88,10 @@ class SplitRequest implements Runnable {
               "Skip rollback/cleanup of failed split of "
                   + parent.getRegionNameAsString() + " because server is"
                   + (this.server.isStopping() ? " stopping" : " stopped"), e);
+          return;
+        }
+        if (e instanceof DroppedSnapshotException) {
+          server.abort("Replay of WAL required. Forcing server shutdown", e);
           return;
         }
         try {
@@ -129,6 +132,7 @@ class SplitRequest implements Runnable {
       // Update regionserver metrics with the split transaction total running time
       server.getMetrics().updateSplitTime(endTime - startTime);
       if (success) {
+        server.getMetrics().incrSplitSuccess();
         // Log success
         LOG.info("Region split, hbase:meta updated, and report to master. Parent="
             + parent.getRegionNameAsString() + ", new regions: "
@@ -141,12 +145,22 @@ class SplitRequest implements Runnable {
     }
   }
 
+  @Override
+  public void run() {
+    if (this.server.isStopping() || this.server.isStopped()) {
+      LOG.debug("Skipping split because server is stopping=" +
+        this.server.isStopping() + " or stopped=" + this.server.isStopped());
+      return;
+    }
+    doSplitting(user);
+  }
+
   protected void releaseTableLock() {
     if (this.tableLock != null) {
       try {
         this.tableLock.release();
       } catch (IOException ex) {
-        LOG.error("Could not release the table lock (something is really wrong). " 
+        LOG.error("Could not release the table lock (something is really wrong). "
            + "Aborting this server to avoid holding the lock forever.");
         this.server.abort("Abort; we got an error when releasing the table lock "
                          + "on " + parent.getRegionNameAsString());

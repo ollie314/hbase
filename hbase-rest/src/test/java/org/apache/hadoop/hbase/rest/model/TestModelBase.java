@@ -1,6 +1,4 @@
 /*
- * Copyright 2010 The Apache Software Foundation
- *
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -21,9 +19,9 @@
 package org.apache.hadoop.hbase.rest.model;
 
 import junit.framework.TestCase;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.rest.ProtobufMessageHandler;
 import org.apache.hadoop.hbase.rest.provider.JAXBContextResolver;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Base64;
 import org.codehaus.jackson.jaxrs.JacksonJaxbJsonProvider;
 import org.codehaus.jackson.map.ObjectMapper;
@@ -114,7 +112,8 @@ public abstract class TestModelBase<T> extends TestCase {
   }
 
   public void testToXML() throws Exception {
-    assertEquals(AS_XML, toXML(buildTestModel()));
+    // Uses fromXML to check model because XML element ordering can be random.
+    checkModel(fromXML(toXML(buildTestModel())));
   }
 
   public void testToJSON() throws Exception {

@@ -28,7 +28,6 @@ import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -44,15 +43,12 @@ import org.apache.hadoop.hbase.regionserver.RegionServerServices;
 import org.apache.hadoop.hbase.regionserver.Store;
 import org.apache.hadoop.hbase.regionserver.StoreFile;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.regionserver.wal.HLogUtil;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.JVMClusterUtil.RegionServerThread;
-import org.apache.hadoop.hdfs.DFSClient;
-import org.apache.hadoop.hdfs.server.datanode.DataNode;
-import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
-import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
-import org.apache.log4j.Level;
 import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
@@ -122,14 +118,17 @@ public class TestIOFencing {
         throw new IOException(ex);
       }
     }
+
     @Override
-    public boolean compact(CompactionContext compaction, Store store) throws IOException {
+    public boolean compact(CompactionContext compaction, Store store,
+        CompactionThroughputController throughputController) throws IOException {
       try {
-        return super.compact(compaction, store);
+        return super.compact(compaction, store, throughputController);
       } finally {
         compactCount++;
       }
     }
+
     public int countStoreFiles() {
       int count = 0;
       for (Store store : stores.values()) {
@@ -312,6 +311,12 @@ public class TestIOFencing {
 
       newRegion = (CompactionBlockerRegion)newServer.getOnlineRegion(REGION_NAME);
 
+      // After compaction of old region finishes on the server that was going down, make sure that
+      // all the files we expect are still working when region is up in new location.
+      FileSystem fs = newRegion.getFilesystem();
+      for (String f: newRegion.getStoreFileList(new byte [][] {FAMILY})) {
+        assertTrue("After compaction, does not exist: " + f, fs.exists(new Path(f)));
+      }
       LOG.info("Allowing compaction to proceed");
       compactingRegion.allowCompactions();
       while (compactingRegion.compactCount == 0) {
@@ -320,12 +325,7 @@ public class TestIOFencing {
       // The server we killed stays up until the compaction that was started before it was killed completes.  In logs
       // you should see the old regionserver now going down.
       LOG.info("Compaction finished");
-      // After compaction of old region finishes on the server that was going down, make sure that
-      // all the files we expect are still working when region is up in new location.
-      FileSystem fs = newRegion.getFilesystem();
-      for (String f: newRegion.getStoreFileList(new byte [][] {FAMILY})) {
-        assertTrue("After compaction, does not exist: " + f, fs.exists(new Path(f)));
-      }
+
       // If we survive the split keep going...
       // Now we make sure that the region isn't totally confused.  Load up more rows.
       TEST_UTIL.loadNumericRows(table, FAMILY, FIRST_BATCH_COUNT, FIRST_BATCH_COUNT + SECOND_BATCH_COUNT);

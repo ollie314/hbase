@@ -20,7 +20,6 @@ package org.apache.hadoop.hbase.zookeeper;
 
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
-import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
@@ -127,7 +126,7 @@ public class RecoverableZooKeeper {
     this.sessionTimeout = sessionTimeout;
     this.quorumServers = quorumServers;
     try {checkZk();} catch (Exception x) {/* ignore */}
-    salter = new SecureRandom();
+    salter = new Random();
   }
 
   /**
@@ -182,11 +181,11 @@ public class RecoverableZooKeeper {
           switch (e.code()) {
             case NONODE:
               if (isRetry) {
-                LOG.info("Node " + path + " already deleted. Assuming a " +
+                LOG.debug("Node " + path + " already deleted. Assuming a " +
                     "previous attempt succeeded.");
                 return;
               }
-              LOG.warn("Node " + path + " already deleted, retry=" + isRetry);
+              LOG.debug("Node " + path + " already deleted, retry=" + isRetry);
               throw e;
 
             case CONNECTIONLOSS:
@@ -273,7 +272,7 @@ public class RecoverableZooKeeper {
 
   private void retryOrThrow(RetryCounter retryCounter, KeeperException e,
       String opName) throws KeeperException {
-    LOG.warn("Possibly transient ZooKeeper, quorum=" + quorumServers + ", exception=" + e);
+    LOG.debug("Possibly transient ZooKeeper, quorum=" + quorumServers + ", exception=" + e);
     if (!retryCounter.shouldRetry()) {
       LOG.error("ZooKeeper " + opName + " failed after "
         + retryCounter.getMaxAttempts() + " attempts");
@@ -457,6 +456,70 @@ public class RecoverableZooKeeper {
         }
         retryCounter.sleepUntilNextRetry();
         isRetry = true;
+      }
+    } finally {
+      if (traceScope != null) traceScope.close();
+    }
+  }
+
+  /**
+   * getAcl is an idempotent operation. Retry before throwing exception
+   * @return list of ACLs
+   */
+  public List<ACL> getAcl(String path, Stat stat)
+  throws KeeperException, InterruptedException {
+    TraceScope traceScope = null;
+    try {
+      traceScope = Trace.startSpan("RecoverableZookeeper.getAcl");
+      RetryCounter retryCounter = retryCounterFactory.create();
+      while (true) {
+        try {
+          return checkZk().getACL(path, stat);
+        } catch (KeeperException e) {
+          switch (e.code()) {
+            case CONNECTIONLOSS:
+            case SESSIONEXPIRED:
+            case OPERATIONTIMEOUT:
+              retryOrThrow(retryCounter, e, "getAcl");
+              break;
+
+            default:
+              throw e;
+          }
+        }
+        retryCounter.sleepUntilNextRetry();
+      }
+    } finally {
+      if (traceScope != null) traceScope.close();
+    }
+  }
+
+  /**
+   * setAcl is an idempotent operation. Retry before throwing exception
+   * @return list of ACLs
+   */
+  public Stat setAcl(String path, List<ACL> acls, int version)
+  throws KeeperException, InterruptedException {
+    TraceScope traceScope = null;
+    try {
+      traceScope = Trace.startSpan("RecoverableZookeeper.setAcl");
+      RetryCounter retryCounter = retryCounterFactory.create();
+      while (true) {
+        try {
+          return checkZk().setACL(path, acls, version);
+        } catch (KeeperException e) {
+          switch (e.code()) {
+            case CONNECTIONLOSS:
+            case SESSIONEXPIRED:
+            case OPERATIONTIMEOUT:
+              retryOrThrow(retryCounter, e, "setAcl");
+              break;
+
+            default:
+              throw e;
+          }
+        }
+        retryCounter.sleepUntilNextRetry();
       }
     } finally {
       if (traceScope != null) traceScope.close();

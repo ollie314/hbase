@@ -16,14 +16,13 @@ package org.apache.hadoop.hbase.ipc;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+import java.net.InetSocketAddress;
 import java.nio.channels.ClosedChannelException;
 
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.ipc.RpcServer.Call;
 import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandler;
-import org.apache.hadoop.hbase.monitoring.TaskMonitor;
-import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.StringUtils;
@@ -42,27 +41,26 @@ public class CallRunner {
   private Call call;
   private RpcServerInterface rpcServer;
   private MonitoredRPCHandler status;
-  private UserProvider userProvider;
 
   /**
    * On construction, adds the size of this call to the running count of outstanding call sizes.
    * Presumption is that we are put on a queue while we wait on an executor to run us.  During this
    * time we occupy heap.
-   * @param call The call to run.
-   * @param rpcServer
    */
   // The constructor is shutdown so only RpcServer in this class can make one of these.
-  CallRunner(final RpcServerInterface rpcServer, final Call call, UserProvider userProvider) {
+  CallRunner(final RpcServerInterface rpcServer, final Call call) {
     this.call = call;
     this.rpcServer = rpcServer;
     // Add size of the call to queue size.
     this.rpcServer.addCallSize(call.getSize());
-    this.status = getStatus();
-    this.userProvider = userProvider;
   }
 
   public Call getCall() {
     return call;
+  }
+
+  public void setStatus(MonitoredRPCHandler status) {
+    this.status = status;
   }
 
   /**
@@ -71,8 +69,6 @@ public class CallRunner {
   private void cleanup() {
     this.call = null;
     this.rpcServer = null;
-    this.status = null;
-    this.userProvider = null;
   }
 
   public void run() {
@@ -85,9 +81,9 @@ public class CallRunner {
       }
       this.status.setStatus("Setting up call");
       this.status.setConnection(call.connection.getHostAddress(), call.connection.getRemotePort());
-      if (RpcServer.LOG.isDebugEnabled()) {
-        UserGroupInformation remoteUser = call.connection.user;
-        RpcServer.LOG.debug(call.toShortString() + " executing as " +
+      if (RpcServer.LOG.isTraceEnabled()) {
+        UserGroupInformation remoteUser = call.connection.ugi;
+        RpcServer.LOG.trace(call.toShortString() + " executing as " +
             ((remoteUser == null) ? "NULL principal" : remoteUser.getUserName()));
       }
       Throwable errorThrowable = null;
@@ -97,13 +93,13 @@ public class CallRunner {
       TraceScope traceScope = null;
       try {
         if (!this.rpcServer.isStarted()) {
-          throw new ServerNotRunningYetException("Server is not running yet");
+          InetSocketAddress address = rpcServer.getListenerAddress();
+          throw new ServerNotRunningYetException("Server " +
+              (address != null ? address : "(channel closed)") + " is not running yet");
         }
         if (call.tinfo != null) {
           traceScope = Trace.startSpan(call.toTraceString(), call.tinfo);
         }
-        RequestContext.set(userProvider.create(call.connection.user), RpcServer.getRemoteIp(),
-          call.connection.service);
         // make the call
         resultPair = this.rpcServer.call(call.service, call.md, call.param, call.cellScanner,
           call.timestamp, this.status);
@@ -111,13 +107,13 @@ public class CallRunner {
         RpcServer.LOG.debug(Thread.currentThread().getName() + ": " + call.toShortString(), e);
         errorThrowable = e;
         error = StringUtils.stringifyException(e);
+        if (e instanceof Error) {
+          throw (Error)e;
+        } 
       } finally {
         if (traceScope != null) {
           traceScope.close();
         }
-        // Must always clear the request context to avoid leaking
-        // credentials between requests.
-        RequestContext.clear();
       }
       RpcServer.CurCall.set(null);
       // Set the response for undelayed calls and delayed calls with
@@ -141,9 +137,10 @@ public class CallRunner {
         throw e;
       }
     } catch (ClosedChannelException cce) {
+      InetSocketAddress address = rpcServer.getListenerAddress();
       RpcServer.LOG.warn(Thread.currentThread().getName() + ": caught a ClosedChannelException, " +
-          "this means that the server was processing a " +
-          "request but the client went away. The error message was: " +
+          "this means that the server " + (address != null ? address : "(channel closed)") +
+          " was processing a request but the client went away. The error message was: " +
           cce.getMessage());
     } catch (Exception e) {
       RpcServer.LOG.warn(Thread.currentThread().getName()
@@ -153,17 +150,5 @@ public class CallRunner {
       this.rpcServer.addCallSize(call.getSize() * -1);
       cleanup();
     }
-  }
-
-  MonitoredRPCHandler getStatus() {
-    // It is ugly the way we park status up in RpcServer.  Let it be for now.  TODO.
-    MonitoredRPCHandler status = RpcServer.MONITORED_RPC.get();
-    if (status != null) {
-      return status;
-    }
-    status = TaskMonitor.get().createRPCStatus(Thread.currentThread().getName());
-    status.pause("Waiting for a call");
-    RpcServer.MONITORED_RPC.set(status);
-    return status;
   }
 }

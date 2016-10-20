@@ -34,17 +34,17 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.jetty.SslSelectChannelConnectorSecure;
 import org.apache.hadoop.hbase.rest.filter.AuthFilter;
 import org.apache.hadoop.hbase.security.UserProvider;
+import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.HttpServerUtil;
 import org.apache.hadoop.hbase.util.InfoServer;
 import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.hbase.util.VersionInfo;
-import org.apache.hadoop.net.DNS;
 import org.mortbay.jetty.Connector;
 import org.mortbay.jetty.Server;
 import org.mortbay.jetty.nio.SelectChannelConnector;
-import org.mortbay.jetty.security.SslSelectChannelConnector;
 import org.mortbay.jetty.servlet.Context;
 import org.mortbay.jetty.servlet.FilterHolder;
 import org.mortbay.jetty.servlet.ServletHolder;
@@ -110,7 +110,7 @@ public class RESTServer implements Constants {
     RESTServlet servlet = RESTServlet.getInstance(conf, userProvider);
 
     Options options = new Options();
-    options.addOption("p", "port", true, "Port to bind to [default: 8080]");
+    options.addOption("p", "port", true, "Port to bind to [default: " + DEFAULT_LISTEN_PORT + "]");
     options.addOption("ro", "readonly", false, "Respond only to GET HTTP " +
       "method requests [default: false]");
     options.addOption(null, "infoport", true, "Port for web UI");
@@ -126,23 +126,27 @@ public class RESTServer implements Constants {
     // check for user-defined port setting, if so override the conf
     if (commandLine != null && commandLine.hasOption("port")) {
       String val = commandLine.getOptionValue("port");
-      servlet.getConfiguration()
-          .setInt("hbase.rest.port", Integer.valueOf(val));
-      LOG.debug("port set to " + val);
+      servlet.getConfiguration().setInt("hbase.rest.port", Integer.parseInt(val));
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("port set to " + val);
+      }
     }
 
     // check if server should only process GET requests, if so override the conf
     if (commandLine != null && commandLine.hasOption("readonly")) {
       servlet.getConfiguration().setBoolean("hbase.rest.readonly", true);
-      LOG.debug("readonly set to true");
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("readonly set to true");
+      }
     }
 
     // check for user-defined info server port setting, if so override the conf
     if (commandLine != null && commandLine.hasOption("infoport")) {
       String val = commandLine.getOptionValue("infoport");
-      servlet.getConfiguration()
-          .setInt("hbase.rest.info.port", Integer.valueOf(val));
-      LOG.debug("Web UI port set to " + val);
+      servlet.getConfiguration().setInt("hbase.rest.info.port", Integer.parseInt(val));
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Web UI port set to " + val);
+      }
     }
 
     @SuppressWarnings("unchecked")
@@ -189,7 +193,7 @@ public class RESTServer implements Constants {
 
     Connector connector = new SelectChannelConnector();
     if(conf.getBoolean(REST_SSL_ENABLED, false)) {
-      SslSelectChannelConnector sslConnector = new SslSelectChannelConnector();
+      SslSelectChannelConnectorSecure sslConnector = new SslSelectChannelConnectorSecure();
       String keystore = conf.get(REST_SSL_KEYSTORE_STORE);
       String password = HBaseConfiguration.getPassword(conf,
         REST_SSL_KEYSTORE_PASSWORD, null);
@@ -200,8 +204,9 @@ public class RESTServer implements Constants {
       sslConnector.setKeyPassword(keyPassword);
       connector = sslConnector;
     }
-    connector.setPort(servlet.getConfiguration().getInt("hbase.rest.port", 8080));
+    connector.setPort(servlet.getConfiguration().getInt("hbase.rest.port", DEFAULT_LISTEN_PORT));
     connector.setHost(servlet.getConfiguration().get("hbase.rest.host", "0.0.0.0"));
+    connector.setHeaderBufferSize(65536);
 
     server.addConnector(connector);
 

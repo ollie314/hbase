@@ -30,12 +30,14 @@ import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -43,20 +45,16 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.commons.lang.mutable.MutableInt;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
-import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
-import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
@@ -64,6 +62,8 @@ import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotFoundException;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HConnection;
 import org.apache.hadoop.hbase.client.HTable;
@@ -75,15 +75,17 @@ import org.apache.hadoop.hbase.io.HFileLink;
 import org.apache.hadoop.hbase.io.HalfStoreFileReader;
 import org.apache.hadoop.hbase.io.Reference;
 import org.apache.hadoop.hbase.io.compress.Compression.Algorithm;
-import org.apache.hadoop.hbase.io.hfile.CacheConfig;
-import org.apache.hadoop.hbase.io.hfile.HFile;
-import org.apache.hadoop.hbase.io.hfile.HFileContext;
-import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;
+import org.apache.hadoop.hbase.io.hfile.CacheConfig;    
+import org.apache.hadoop.hbase.io.hfile.HFile;    
+import org.apache.hadoop.hbase.io.hfile.HFileContext;   
+import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;    
 import org.apache.hadoop.hbase.io.hfile.HFileScanner;
+import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoder;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.regionserver.BloomType;
 import org.apache.hadoop.hbase.regionserver.HStore;
 import org.apache.hadoop.hbase.regionserver.StoreFile;
+import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.security.token.FsDelegationToken;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -96,8 +98,6 @@ import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Multimaps;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
-
-import java.util.UUID;
 
 /**
  * Tool to load the output of HFileOutputFormat into an existing table.
@@ -114,6 +114,10 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     = "hbase.mapreduce.bulkload.max.hfiles.perRegion.perFamily";
   private static final String ASSIGN_SEQ_IDS = "hbase.mapreduce.bulkload.assign.sequenceNumbers";
   public final static String CREATE_TABLE_CONF_KEY = "create.table";
+
+  // We use a '.' prefix which is ignored when walking directory trees
+  // above. It is invalid family name.
+  final static String TMP_DIR = ".tmp";
 
   private int maxFilesPerRegionPerFamily;
   private boolean assignSeqIds;
@@ -154,6 +158,96 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
         + "\n");
   }
 
+  private static interface BulkHFileVisitor<TFamily> {
+    TFamily bulkFamily(final byte[] familyName)
+      throws IOException;
+    void bulkHFile(final TFamily family, final FileStatus hfileStatus)
+      throws IOException;
+  }
+
+  /**
+   * Iterate over the bulkDir hfiles.
+   * Skip reference, HFileLink, files starting with "_" and non-valid hfiles.
+   */
+  private static <TFamily> void visitBulkHFiles(final FileSystem fs, final Path bulkDir,
+    final BulkHFileVisitor<TFamily> visitor) throws IOException {
+    visitBulkHFiles(fs, bulkDir, visitor, true);
+  }
+
+  /**
+   * Iterate over the bulkDir hfiles.
+   * Skip reference, HFileLink, files starting with "_".
+   * Check and skip non-valid hfiles by default, or skip this validation by setting
+   * 'hbase.loadincremental.validate.hfile' to false.
+   */
+  private static <TFamily> void visitBulkHFiles(final FileSystem fs, final Path bulkDir,
+    final BulkHFileVisitor<TFamily> visitor, final boolean validateHFile) throws IOException {
+    if (!fs.exists(bulkDir)) {
+      throw new FileNotFoundException("Bulkload dir " + bulkDir + " not found");
+    }
+
+    FileStatus[] familyDirStatuses = fs.listStatus(bulkDir);
+    if (familyDirStatuses == null) {
+      throw new FileNotFoundException("No families found in " + bulkDir);
+    }
+
+    for (FileStatus familyStat : familyDirStatuses) {
+      if (!familyStat.isDir()) {
+        LOG.warn("Skipping non-directory " + familyStat.getPath());
+        continue;
+      }
+      Path familyDir = familyStat.getPath();
+      byte[] familyName = familyDir.getName().getBytes();
+      // Skip invalid family
+      try {
+        HColumnDescriptor.isLegalFamilyName(familyName);
+      }
+      catch (IllegalArgumentException e) {
+        LOG.warn("Skipping invalid " + familyStat.getPath());
+        continue;
+      }
+      TFamily family = visitor.bulkFamily(familyName);
+
+      FileStatus[] hfileStatuses = fs.listStatus(familyDir);
+      for (FileStatus hfileStatus : hfileStatuses) {
+        if (!fs.isFile(hfileStatus.getPath())) {
+          LOG.warn("Skipping non-file " + hfileStatus);
+          continue;
+        }
+
+        Path hfile = hfileStatus.getPath();
+        // Skip "_", reference, HFileLink
+        String fileName = hfile.getName();
+        if (fileName.startsWith("_")) {
+          continue;
+        }
+        if (StoreFileInfo.isReference(fileName)) {
+          LOG.warn("Skipping reference " + fileName);
+          continue;
+        }
+        if (HFileLink.isHFileLink(fileName)) {
+          LOG.warn("Skipping HFileLink " + fileName);
+          continue;
+        }
+
+        // Validate HFile Format if needed
+        if (validateHFile) {
+          try {
+            if (!HFile.isHFileFormat(fs, hfile)) {
+              LOG.warn("the file " + hfile + " doesn't seems to be an hfile. skipping");
+              continue;
+            }
+          } catch (FileNotFoundException e) {
+            LOG.warn("the file " + hfile + " was removed");
+            continue;
+          }
+	}
+
+        visitor.bulkHFile(family, hfileStatus);
+      }
+    }
+  }
+
   /**
    * Represents an HFile waiting to be loaded. An queue is used
    * in this class in order to support the case where a region has
@@ -180,39 +274,25 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
    * Walk the given directory for all HFiles, and return a Queue
    * containing all such files.
    */
-  private void discoverLoadQueue(Deque<LoadQueueItem> ret, Path hfofDir)
-  throws IOException {
+  private void discoverLoadQueue(final Deque<LoadQueueItem> ret, final Path hfofDir,
+    final boolean validateHFile) throws IOException {
     fs = hfofDir.getFileSystem(getConf());
-
-    if (!fs.exists(hfofDir)) {
-      throw new FileNotFoundException("HFileOutputFormat dir " +
-          hfofDir + " not found");
-    }
-
-    FileStatus[] familyDirStatuses = fs.listStatus(hfofDir);
-    if (familyDirStatuses == null) {
-      throw new FileNotFoundException("No families found in " + hfofDir);
-    }
-
-    for (FileStatus stat : familyDirStatuses) {
-      if (!stat.isDir()) {
-        LOG.warn("Skipping non-directory " + stat.getPath());
-        continue;
+    visitBulkHFiles(fs, hfofDir, new BulkHFileVisitor<byte[]>() {
+      @Override
+      public byte[] bulkFamily(final byte[] familyName) {
+        return familyName;
       }
-      Path familyDir = stat.getPath();
-      if (familyDir.getName().equals("_logs")) {
-        // Family name of "_logs" is not supported.
-        // This is due to the presence of history directory under _logs directory
-        // when hadoop-1 is used
-        continue;
+      @Override
+      public void bulkHFile(final byte[] family, final FileStatus hfile) throws IOException {
+        long length = hfile.getLen();
+        if (length > getConf().getLong(HConstants.HREGION_MAX_FILESIZE,
+            HConstants.DEFAULT_MAX_FILE_SIZE)) {
+          LOG.warn("Trying to bulk load hfile " + hfile.getPath() + " with size: " +
+              length + " bytes can be problematic as it may lead to oversplitting.");
+        }
+        ret.add(new LoadQueueItem(family, hfile.getPath()));
       }
-      byte[] family = familyDir.getName().getBytes();
-      Path[] hfiles = FileUtil.stat2Paths(fs.listStatus(familyDir));
-      for (Path hfile : hfiles) {
-        if (hfile.getName().startsWith("_")) continue;
-        ret.add(new LoadQueueItem(family, hfile));
-      }
-    }
+    }, validateHFile);
   }
 
   /**
@@ -251,15 +331,28 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     // happen in this thread
     Deque<LoadQueueItem> queue = new LinkedList<LoadQueueItem>();
     try {
-      discoverLoadQueue(queue, hfofDir);
+      /*
+       * Checking hfile format is a time-consuming operation, we should have an option to skip
+       * this step when bulkloading millions of HFiles. See HBASE-13985.
+       */
+      boolean validateHFile = getConf().getBoolean("hbase.loadincremental.validate.hfile", true);
+      if(!validateHFile) {
+	LOG.warn("You are skipping HFiles validation, it might cause some data loss if files " +
+	    "are not correct. If you fail to read data from your table after using this " +
+	    "option, consider removing the files and bulkload again without this option. " +
+	    "See HBASE-13985");
+      }
+      discoverLoadQueue(queue, hfofDir, validateHFile);
       // check whether there is invalid family name in HFiles to be bulkloaded
       Collection<HColumnDescriptor> families = table.getTableDescriptor().getFamilies();
-      ArrayList<String> familyNames = new ArrayList<String>();
+      ArrayList<String> familyNames = new ArrayList<String>(families.size());
       for (HColumnDescriptor family : families) {
         familyNames.add(family.getNameAsString());
       }
       ArrayList<String> unmatchedFamilies = new ArrayList<String>();
-      for (LoadQueueItem lqi : queue) {
+      Iterator<LoadQueueItem> queueIter = queue.iterator();
+      while (queueIter.hasNext()) {
+        LoadQueueItem lqi = queueIter.next();
         String familyNameInHFile = Bytes.toString(lqi.family);
         if (!familyNames.contains(familyNameInHFile)) {
           unmatchedFamilies.add(familyNameInHFile);
@@ -301,8 +394,8 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
 
         int maxRetries = getConf().getInt("hbase.bulkload.retries.number", 0);
         if (maxRetries != 0 && count >= maxRetries) {
-          LOG.error("Retry attempted " + count +  " times without completing, bailing out");
-          return;
+          throw new IOException("Retry attempted " + count +
+            " times without completing, bailing out");
         }
         count++;
 
@@ -479,9 +572,10 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       byte[] splitKey) throws IOException {
     final Path hfilePath = item.hfilePath;
 
-    // We use a '_' prefix which is ignored when walking directory trees
-    // above.
-    final Path tmpDir = new Path(item.hfilePath.getParent(), "_tmp");
+    Path tmpDir = item.hfilePath.getParent();
+    if (!tmpDir.getName().equals(TMP_DIR)) {
+      tmpDir = new Path(tmpDir, TMP_DIR);
+    }
 
     LOG.info("HFile at " + hfilePath + " no longer fits inside a single " +
     "region. Splitting...");
@@ -496,6 +590,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     FileSystem fs = tmpDir.getFileSystem(getConf());
     fs.setPermission(tmpDir, FsPermission.valueOf("-rwxrwxrwx"));
     fs.setPermission(botOut, FsPermission.valueOf("-rwxrwxrwx"));
+    fs.setPermission(topOut, FsPermission.valueOf("-rwxrwxrwx"));
 
     // Add these back at the *front* of the queue, so there's a lower
     // chance that the region will just split again before we get there.
@@ -503,6 +598,17 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     lqis.add(new LoadQueueItem(item.family, botOut));
     lqis.add(new LoadQueueItem(item.family, topOut));
 
+    // If the current item is already the result of previous splits,
+    // we don't need it anymore. Clean up to save space.
+    // It is not part of the original input files.
+    try {
+      tmpDir = item.hfilePath.getParent();
+      if (tmpDir.getName().equals(TMP_DIR)) {
+        fs.delete(item.hfilePath, false);
+      }
+    } catch (IOException e) {
+      LOG.warn("Unable to delete temporary split file " + item.hfilePath);
+    }
     LOG.info("Successfully split into new HFiles " + botOut + " and " + topOut);
     return lqis;
   }
@@ -682,7 +788,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     try {
       List<LoadQueueItem> toRetry = new ArrayList<LoadQueueItem>();
       Configuration conf = getConf();
-      boolean success = RpcRetryingCallerFactory.instantiate(conf).<Boolean> newCaller()
+      boolean success = RpcRetryingCallerFactory.instantiate(conf, null).<Boolean> newCaller()
           .callWithRetries(svrCallable);
       if (!success) {
         LOG.warn("Attempt to bulk load region containing "
@@ -699,7 +805,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       throw e;
     }
   }
-  
+
   private boolean isSecureBulkLoadEndpointAvailable() {
     String classes = getConf().get(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, "");
     return classes.contains("org.apache.hadoop.hbase.security.access.SecureBulkLoadEndpoint");
@@ -746,6 +852,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
                                   .withBytesPerCheckSum(HStore.getBytesPerChecksum(conf))
                                   .withBlockSize(blocksize)
                                   .withDataBlockEncoding(familyDescriptor.getDataBlockEncoding())
+                                  .withIncludesTags(true)
                                   .build();
       halfWriter = new StoreFile.WriterBuilder(conf, cacheConf,
           fs)
@@ -772,6 +879,11 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
   }
 
   private static boolean shouldCopyHFileMetaKey(byte[] key) {
+    // skip encoding to keep hfile meta consistent with data block info, see HBASE-15085
+    if (Bytes.equals(key, HFileDataBlockEncoder.DATA_BLOCK_ENCODING)) {
+      return false;
+    }
+
     return !HFile.isReservedFileInfoKey(key);
   }
 
@@ -814,50 +926,26 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
    * More modifications necessary if we want to avoid doing it.
    */
   private void createTable(TableName tableName, String dirPath) throws Exception {
-    Path hfofDir = new Path(dirPath);
-    FileSystem fs = hfofDir.getFileSystem(getConf());
-
-    if (!fs.exists(hfofDir)) {
-      throw new FileNotFoundException("HFileOutputFormat dir " +
-          hfofDir + " not found");
-    }
-
-    FileStatus[] familyDirStatuses = fs.listStatus(hfofDir);
-    if (familyDirStatuses == null) {
-      throw new FileNotFoundException("No families found in " + hfofDir);
-    }
-
-    HTableDescriptor htd = new HTableDescriptor(tableName);
-    HColumnDescriptor hcd;
+    final Path hfofDir = new Path(dirPath);
+    final FileSystem fs = hfofDir.getFileSystem(getConf());
 
     // Add column families
     // Build a set of keys
-    byte[][] keys;
-    TreeMap<byte[], Integer> map = new TreeMap<byte[], Integer>(Bytes.BYTES_COMPARATOR);
-
-    for (FileStatus stat : familyDirStatuses) {
-      if (!stat.isDir()) {
-        LOG.warn("Skipping non-directory " + stat.getPath());
-        continue;
+    final HTableDescriptor htd = new HTableDescriptor(tableName);
+    final TreeMap<byte[], Integer> map = new TreeMap<byte[], Integer>(Bytes.BYTES_COMPARATOR);
+    visitBulkHFiles(fs, hfofDir, new BulkHFileVisitor<HColumnDescriptor>() {
+      @Override
+      public HColumnDescriptor bulkFamily(final byte[] familyName) {
+        HColumnDescriptor hcd = new HColumnDescriptor(familyName);
+        htd.addFamily(hcd);
+        return hcd;
       }
-      Path familyDir = stat.getPath();
-      if (familyDir.getName().equals("_logs")) {
-        // Family name of "_logs" is not supported.
-        // This is due to the presence of history directory under _logs directory
-        // when hadoop-1 is used
-        continue;
-      }
-      byte[] family = familyDir.getName().getBytes();
-
-      hcd = new HColumnDescriptor(family);
-      htd.addFamily(hcd);
-
-      Path[] hfiles = FileUtil.stat2Paths(fs.listStatus(familyDir));
-      for (Path hfile : hfiles) {
-        if (hfile.getName().startsWith("_")) continue;
+      @Override
+      public void bulkHFile(final HColumnDescriptor hcd, final FileStatus hfileStatus)
+          throws IOException {
+        Path hfile = hfileStatus.getPath();
         HFile.Reader reader = HFile.createReader(fs, hfile,
             new CacheConfig(getConf()), getConf());
-        final byte[] first, last;
         try {
           if (hcd.getCompressionType() != reader.getFileContext().getCompression()) {
             hcd.setCompressionType(reader.getFileContext().getCompression());
@@ -865,8 +953,8 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
                      " for family " + hcd.toString());
           }
           reader.loadFileInfo();
-          first = reader.getFirstRowKey();
-          last =  reader.getLastRowKey();
+          byte[] first = reader.getFirstRowKey();
+          byte[] last  = reader.getLastRowKey();
 
           LOG.info("Trying to figure out region boundaries hfile=" + hfile +
             " first=" + Bytes.toStringBinary(first) +
@@ -878,13 +966,13 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
 
           value = map.containsKey(last)? map.get(last):0;
           map.put(last, value-1);
-        }  finally {
+        } finally {
           reader.close();
         }
       }
-    }
+    });
 
-    keys = LoadIncrementalHFiles.inferBoundaries(map);
+    byte[][] keys = LoadIncrementalHFiles.inferBoundaries(map);
     this.hbAdmin.createTable(htd,keys);
 
     LOG.info("Table "+ tableName +" is available!!");

@@ -20,11 +20,15 @@
 package org.apache.hadoop.hbase.ipc;
 
 import org.apache.hadoop.hbase.CompatibilityFactory;
-import org.apache.hadoop.hbase.SmallTests;
+import org.apache.hadoop.hbase.NotServingRegionException;
+import org.apache.hadoop.hbase.RegionTooBusyException;
+import org.apache.hadoop.hbase.ServerName;
+import org.apache.hadoop.hbase.exceptions.OutOfOrderScannerNextException;
+import org.apache.hadoop.hbase.exceptions.RegionMovedException;
 import org.apache.hadoop.hbase.test.MetricsAssertHelper;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
-
 
 import static org.junit.Assert.*;
 
@@ -98,8 +102,10 @@ public class TestRpcMetrics {
 
     mrpc.dequeuedCall(100);
     mrpc.processedCall(101);
+    mrpc.totalCall(102);
     HELPER.assertCounter("queueCallTime_NumOps", 1, serverSource);
     HELPER.assertCounter("processCallTime_NumOps", 1, serverSource);
+    HELPER.assertCounter("totalCallTime_NumOps", 1, serverSource);
 
     mrpc.sentBytes(103);
     mrpc.sentBytes(103);
@@ -110,7 +116,51 @@ public class TestRpcMetrics {
 
     HELPER.assertCounter("sentBytes", 309, serverSource);
     HELPER.assertCounter("receivedBytes", 208, serverSource);
+
+    mrpc.receivedRequest(105);
+    mrpc.sentResponse(106);
+    HELPER.assertCounter("requestSize_NumOps", 1, serverSource);
+    HELPER.assertCounter("responseSize_NumOps", 1, serverSource);
+
+    mrpc.exception(null);
+    HELPER.assertCounter("exceptions", 1, serverSource);
+
+    mrpc.exception(new RegionMovedException(ServerName.parseServerName("localhost:60020"), 100));
+    mrpc.exception(new RegionTooBusyException());
+    mrpc.exception(new OutOfOrderScannerNextException());
+    mrpc.exception(new NotServingRegionException());
+    HELPER.assertCounter("exceptions.RegionMovedException", 1, serverSource);
+    HELPER.assertCounter("exceptions.RegionTooBusyException", 1, serverSource);
+    HELPER.assertCounter("exceptions.OutOfOrderScannerNextException", 1, serverSource);
+    HELPER.assertCounter("exceptions.NotServingRegionException", 1, serverSource);
+    HELPER.assertCounter("exceptions", 5, serverSource);
   }
 
+  @Test
+  public void testServerContextNameWithHostName() {
+    String[] masterServerNames =
+        { "HMaster/node-xyz/10.19.250.253:16020", "HMaster/node-HRegion-xyz/10.19.250.253:16020" };
+
+    String[] regionServerNames = { "HRegionserver/node-xyz/10.19.250.253:16020",
+        "HRegionserver/node-HMaster1-xyz/10.19.250.253:16020" };
+
+    MetricsHBaseServerSource masterSource = null;
+    for (String serverName : masterServerNames) {
+      masterSource = new MetricsHBaseServer(serverName, new MetricsHBaseServerWrapperStub())
+          .getMetricsSource();
+      assertEquals("master", masterSource.getMetricsContext());
+      assertEquals("Master,sub=IPC", masterSource.getMetricsJmxContext());
+      assertEquals("IPC", masterSource.getMetricsName());
+    }
+
+    MetricsHBaseServerSource rsSource = null;
+    for (String serverName : regionServerNames) {
+      rsSource = new MetricsHBaseServer(serverName, new MetricsHBaseServerWrapperStub())
+          .getMetricsSource();
+      assertEquals("regionserver", rsSource.getMetricsContext());
+      assertEquals("RegionServer,sub=IPC", rsSource.getMetricsJmxContext());
+      assertEquals("IPC", rsSource.getMetricsName());
+    }
+  }
 }
 

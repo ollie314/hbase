@@ -23,7 +23,7 @@ import java.io.IOException;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
-import org.apache.hadoop.hbase.SmallTests;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
@@ -42,8 +42,8 @@ public class TestReference {
   @Test
   public void testParsingWritableReference() throws IOException {
     // Read a Reference written w/ 0.94 out of the test data dir.
-    final String datafile = System.getProperty("project.build.testSourceDirectory", "src/test") +
-      File.separator + "data" + File.separator +
+    final String datafile = System.getProperty("test.build.classes",
+        "target/test-classes") + File.separator +
       "a6a6562b777440fd9c34885428f5cb61.21e75333ada3d5bafb34bb918f29576c";
     FileSystem fs = FileSystem.get(HTU.getConfiguration());
     Reference.read(fs, new Path(datafile));

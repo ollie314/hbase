@@ -34,9 +34,9 @@ import org.apache.hadoop.hbase.io.crypto.Cipher;
 import org.apache.hadoop.hbase.io.crypto.Decryptor;
 import org.apache.hadoop.hbase.io.crypto.Encryption;
 import org.apache.hadoop.hbase.protobuf.generated.WALProtos.WALHeader;
-import org.apache.hadoop.hbase.regionserver.wal.ProtobufLogReader.WALHdrResult;
 import org.apache.hadoop.hbase.security.EncryptionUtil;
 import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.util.EncryptionTest;
 
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
 public class SecureProtobufLogReader extends ProtobufLogReader {
@@ -67,6 +67,9 @@ public class SecureProtobufLogReader extends ProtobufLogReader {
       // Serialized header data has been merged into the builder from the
       // stream.
 
+      EncryptionTest.testKeyProvider(conf);
+      EncryptionTest.testCipherProvider(conf);
+
       // Retrieve a usable key
 
       byte[] keyBytes = builder.getEncryptionKey().toByteArray();
@@ -75,7 +78,7 @@ public class SecureProtobufLogReader extends ProtobufLogReader {
       // First try the WAL key, if one is configured
       if (walKeyName != null) {
         try {
-          key = EncryptionUtil.unwrapKey(conf, walKeyName, keyBytes);
+          key = EncryptionUtil.unwrapWALKey(conf, walKeyName, keyBytes);
         } catch (KeyException e) {
           if (LOG.isDebugEnabled()) {
             LOG.debug("Unable to unwrap key with WAL key '" + walKeyName + "'");
@@ -88,7 +91,7 @@ public class SecureProtobufLogReader extends ProtobufLogReader {
           User.getCurrent().getShortName());
         try {
           // Then, try the cluster master key
-          key = EncryptionUtil.unwrapKey(conf, masterKeyName, keyBytes);
+          key = EncryptionUtil.unwrapWALKey(conf, masterKeyName, keyBytes);
         } catch (KeyException e) {
           // If the current master key fails to unwrap, try the alternate, if
           // one is configured
@@ -99,7 +102,7 @@ public class SecureProtobufLogReader extends ProtobufLogReader {
             conf.get(HConstants.CRYPTO_MASTERKEY_ALTERNATE_NAME_CONF_KEY);
           if (alternateKeyName != null) {
             try {
-              key = EncryptionUtil.unwrapKey(conf, alternateKeyName, keyBytes);
+              key = EncryptionUtil.unwrapWALKey(conf, alternateKeyName, keyBytes);
             } catch (KeyException ex) {
               throw new IOException(ex);
             }

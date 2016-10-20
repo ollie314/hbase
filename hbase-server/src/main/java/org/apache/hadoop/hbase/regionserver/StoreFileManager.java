@@ -18,16 +18,16 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import com.google.common.collect.ImmutableCollection;
+
 import java.io.IOException;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.KeyValue.KVComparator;
-
-import com.google.common.collect.ImmutableCollection;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 
 /**
  * Manages the store files and basic metadata about that that determines the logical structure
@@ -134,4 +134,16 @@ public interface StoreFileManager {
    * @return The files which don't have any necessary data according to TTL and other criteria.
    */
   Collection<StoreFile> getUnneededFiles(long maxTs, List<StoreFile> filesCompacting);
+
+  /**
+   * @return the compaction pressure used for compaction throughput tuning.
+   * @see Store#getCompactionPressure()
+   */
+  double getCompactionPressure();
+
+  /**
+   * @return the comparator used to sort storefiles. Usually, the
+   *         {@link StoreFile#getMaxSequenceId()} is the first priority.
+   */
+  Comparator<StoreFile> getStoreFileComparator();
 }

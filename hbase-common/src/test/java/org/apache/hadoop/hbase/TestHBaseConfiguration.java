@@ -19,16 +19,21 @@
 package org.apache.hadoop.hbase;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 
+import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.List;
 
+import com.google.common.collect.ImmutableMap;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.junit.AfterClass;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
@@ -36,6 +41,13 @@ import org.junit.experimental.categories.Category;
 public class TestHBaseConfiguration {
 
   private static final Log LOG = LogFactory.getLog(TestHBaseConfiguration.class);
+
+  private static HBaseCommonTestingUtility UTIL = new HBaseCommonTestingUtility();
+
+  @AfterClass
+  public static void tearDown() throws IOException {
+    UTIL.cleanupTestDir();
+  }
 
   @Test
   public void testGetIntDeprecated() {
@@ -63,24 +75,49 @@ public class TestHBaseConfiguration {
   }
 
   @Test
+  public void testSubset() throws Exception {
+    Configuration conf = HBaseConfiguration.create();
+    // subset is used in TableMapReduceUtil#initCredentials to support different security
+    // configurations between source and destination clusters, so we'll use that as an example
+    String prefix = "hbase.mapred.output.";
+    conf.set("hbase.security.authentication", "kerberos");
+    conf.set("hbase.regionserver.kerberos.principal", "hbasesource");
+    HBaseConfiguration.setWithPrefix(conf, prefix,
+        ImmutableMap.of(
+            "hbase.regionserver.kerberos.principal", "hbasedest",
+            "", "shouldbemissing")
+            .entrySet());
+
+    Configuration subsetConf = HBaseConfiguration.subset(conf, prefix);
+    assertNull(subsetConf.get(prefix + "hbase.regionserver.kerberos.principal"));
+    assertEquals("hbasedest", subsetConf.get("hbase.regionserver.kerberos.principal"));
+    assertNull(subsetConf.get("hbase.security.authentication"));
+    assertNull(subsetConf.get(""));
+
+    Configuration mergedConf = HBaseConfiguration.create(conf);
+    HBaseConfiguration.merge(mergedConf, subsetConf);
+
+    assertEquals("hbasedest", mergedConf.get("hbase.regionserver.kerberos.principal"));
+    assertEquals("kerberos", mergedConf.get("hbase.security.authentication"));
+    assertEquals("shouldbemissing", mergedConf.get(prefix));
+  }
+
+  @Test
   public void testGetPassword() throws Exception {
     Configuration conf = HBaseConfiguration.create();
-    conf.set(ReflectiveCredentialProviderClient.CREDENTIAL_PROVIDER_PATH,
-        "jceks://file/tmp/foo.jks");
-    ReflectiveCredentialProviderClient client =
-        new ReflectiveCredentialProviderClient();
+    conf.set(ReflectiveCredentialProviderClient.CREDENTIAL_PROVIDER_PATH, "jceks://file"
+        + new File(UTIL.getDataTestDir().toUri().getPath(), "foo.jks").getCanonicalPath());
+    ReflectiveCredentialProviderClient client = new ReflectiveCredentialProviderClient();
     if (client.isHadoopCredentialProviderAvailable()) {
-      char[] keyPass = {'k', 'e', 'y', 'p', 'a', 's', 's'};
-      char[] storePass = {'s', 't', 'o', 'r', 'e', 'p', 'a', 's', 's'};
+      char[] keyPass = { 'k', 'e', 'y', 'p', 'a', 's', 's' };
+      char[] storePass = { 's', 't', 'o', 'r', 'e', 'p', 'a', 's', 's' };
       client.createEntry(conf, "ssl.keypass.alias", keyPass);
       client.createEntry(conf, "ssl.storepass.alias", storePass);
 
-      String keypass = HBaseConfiguration.getPassword(
-          conf, "ssl.keypass.alias", null);
+      String keypass = HBaseConfiguration.getPassword(conf, "ssl.keypass.alias", null);
       assertEquals(keypass, new String(keyPass));
 
-      String storepass = HBaseConfiguration.getPassword(
-          conf, "ssl.storepass.alias", null);
+      String storepass = HBaseConfiguration.getPassword(conf, "ssl.storepass.alias", null);
       assertEquals(storepass, new String(storePass));
     }
   }
@@ -164,7 +201,6 @@ public class TestHBaseConfiguration {
         getProvidersMethod = loadMethod(hadoopCredProviderFactoryClz,
             HADOOP_CRED_PROVIDER_FACTORY_GET_PROVIDERS_METHOD_NAME,
             Configuration.class);
-
         // Load Hadoop CredentialProvider
         Class<?> hadoopCredProviderClz = null;
         hadoopCredProviderClz = Class.forName(HADOOP_CRED_PROVIDER_CLASS_NAME);

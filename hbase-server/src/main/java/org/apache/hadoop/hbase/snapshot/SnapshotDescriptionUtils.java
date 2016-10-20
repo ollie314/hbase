@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hbase.snapshot;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.Collections;
 
@@ -29,7 +30,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 import org.apache.hadoop.hbase.snapshot.SnapshotManifestV1;
 import org.apache.hadoop.hbase.snapshot.SnapshotManifestV2;
@@ -72,7 +73,8 @@ import org.apache.hadoop.hbase.util.FSUtils;
  * {@link #completeSnapshot}, and writing the
  * {@link SnapshotDescription} to the working snapshot directory.
  */
-public class SnapshotDescriptionUtils {
+@InterfaceAudience.Private
+public final class SnapshotDescriptionUtils {
 
   /**
    * Filter that only accepts completed snapshot directories
@@ -104,14 +106,34 @@ public class SnapshotDescriptionUtils {
 
   /** Temporary directory under the snapshot directory to store in-progress snapshots */
   public static final String SNAPSHOT_TMP_DIR_NAME = ".tmp";
+
+  /** This tag will be created in in-progess snapshots */
+  public static final String SNAPSHOT_IN_PROGRESS = ".inprogress";
   // snapshot operation values
   /** Default value if no start time is specified */
   public static final long NO_SNAPSHOT_START_TIME_SPECIFIED = 0;
 
+
   public static final String MASTER_SNAPSHOT_TIMEOUT_MILLIS = "hbase.snapshot.master.timeout.millis";
 
-  /** By default, wait 60 seconds for a snapshot to complete */
-  public static final long DEFAULT_MAX_WAIT_TIME = 60000;
+  /** By default, wait 300 seconds for a snapshot to complete */
+  public static final long DEFAULT_MAX_WAIT_TIME = 60000 * 5 ;
+
+
+  /**
+   * By default, check to see if the snapshot is complete (ms)
+   * @deprecated Use {@link #DEFAULT_MAX_WAIT_TIME} instead.
+   * */
+  @Deprecated
+  public static final int SNAPSHOT_TIMEOUT_MILLIS_DEFAULT = 60000 * 5;
+
+  /**
+   * Conf key for # of ms elapsed before injecting a snapshot timeout error when waiting for
+   * completion.
+   * @deprecated Use {@link #MASTER_SNAPSHOT_TIMEOUT_MILLIS} instead.
+   */
+  @Deprecated
+  public static final String SNAPSHOT_TIMEOUT_MILLIS_KEY = "hbase.snapshot.master.timeoutMillis";
 
   private SnapshotDescriptionUtils() {
     // private constructor for utility class
@@ -140,7 +162,8 @@ public class SnapshotDescriptionUtils {
     default:
       confKey = MASTER_SNAPSHOT_TIMEOUT_MILLIS;
     }
-    return conf.getLong(confKey, defaultMaxWaitTime);
+    return Math.max(conf.getLong(confKey, defaultMaxWaitTime),
+        conf.getLong(SNAPSHOT_TIMEOUT_MILLIS_KEY, defaultMaxWaitTime));
   }
 
   /**
@@ -281,6 +304,16 @@ public class SnapshotDescriptionUtils {
         throw new IOException(msg);
       }
     }
+  }
+
+  /**
+   * Create in-progress tag under .tmp of in-progress snapshot
+   * */
+  public static void createInProgressTag(Path workingDir, FileSystem fs) throws IOException {
+    FsPermission perms = FSUtils.getFilePermissions(fs, fs.getConf(),
+      HConstants.DATA_FILE_UMASK_KEY);
+    Path snapshot_in_progress = new Path(workingDir, SnapshotDescriptionUtils.SNAPSHOT_IN_PROGRESS);
+    FSUtils.create(fs, snapshot_in_progress, perms, true);
   }
 
   /**

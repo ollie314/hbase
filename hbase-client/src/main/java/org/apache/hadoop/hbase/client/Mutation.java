@@ -78,6 +78,11 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
    */
   private static final String CONSUMED_CLUSTER_IDS = "_cs.id";
 
+  /**
+   * The attribute for storing TTL for the result of the mutation.
+   */
+  private static final String OP_ATTRIBUTE_TTL = "_ttl";
+
   protected byte [] row = null;
   protected long ts = HConstants.LATEST_TIMESTAMP;
   protected Durability durability = Durability.USE_DEFAULT;
@@ -206,6 +211,12 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
     if (getId() != null) {
       map.put("id", getId());
     }
+    // Add the TTL if set
+    // Long.MAX_VALUE is the default, and is interpreted to mean this attribute
+    // has not been set.
+    if (getTTL() != Long.MAX_VALUE) {
+      map.put("ttl", getTTL());
+    }
     return map;
   }
 
@@ -215,7 +226,7 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
    */
   @Deprecated
   public boolean getWriteToWAL() {
-    return this.durability == Durability.SKIP_WAL;
+    return this.durability != Durability.SKIP_WAL;
   }
 
   /**
@@ -357,6 +368,7 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
    * It is illegal to set <code>CellVisibility</code> on <code>Delete</code> mutation.
    * @param expression
    */
+  @InterfaceStability.Unstable
   public void setCellVisibility(CellVisibility expression) {
     this.setAttribute(VisibilityConstants.VISIBILITY_LABELS_ATTR_KEY, ProtobufUtil
         .toCellVisibility(expression).toByteArray());
@@ -366,6 +378,7 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
    * @return CellVisibility associated with cells in this Mutation.
    * @throws DeserializationException
    */
+  @InterfaceStability.Unstable
   public CellVisibility getCellVisibility() throws DeserializationException {
     byte[] cellVisibilityBytes = this.getAttribute(VisibilityConstants.VISIBILITY_LABELS_ATTR_KEY);
     if (cellVisibilityBytes == null) return null;
@@ -429,6 +442,7 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
   /**
    * @return The serialized ACL for this operation, or null if none
    */
+  @InterfaceStability.Unstable
   public byte[] getACL() {
     return getAttribute(AccessControlConstants.OP_ATTRIBUTE_ACL);
   }
@@ -437,6 +451,7 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
    * @param user User short name
    * @param perms Permissions for the user
    */
+  @InterfaceStability.Unstable
   public void setACL(String user, Permission perms) {
     setAttribute(AccessControlConstants.OP_ATTRIBUTE_ACL,
       ProtobufUtil.toUsersAndPermissions(user, perms).toByteArray());
@@ -445,6 +460,7 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
   /**
    * @param perms A map of permissions for a user or users
    */
+  @InterfaceStability.Unstable
   public void setACL(Map<String, Permission> perms) {
     ListMultimap<String, Permission> permMap = ArrayListMultimap.create();
     for (Map.Entry<String, Permission> entry : perms.entrySet()) {
@@ -467,6 +483,31 @@ public abstract class Mutation extends OperationWithAttributes implements Row, C
    */
   @Deprecated
   public void setACLStrategy(boolean cellFirstStrategy) {
+  }
+
+  /**
+   * Return the TTL requested for the result of the mutation, in milliseconds.
+   * @return the TTL requested for the result of the mutation, in milliseconds,
+   * or Long.MAX_VALUE if unset
+   */
+  @InterfaceStability.Unstable
+  public long getTTL() {
+    byte[] ttlBytes = getAttribute(OP_ATTRIBUTE_TTL);
+    if (ttlBytes != null) {
+      return Bytes.toLong(ttlBytes);
+    }
+    return Long.MAX_VALUE;
+  }
+
+  /**
+   * Set the TTL desired for the result of the mutation, in milliseconds.
+   * @param ttl the TTL desired for the result of the mutation, in milliseconds
+   * @return this
+   */
+  @InterfaceStability.Unstable
+  public Mutation setTTL(long ttl) {
+    setAttribute(OP_ATTRIBUTE_TTL, Bytes.toBytes(ttl));
+    return this;
   }
 
   /**

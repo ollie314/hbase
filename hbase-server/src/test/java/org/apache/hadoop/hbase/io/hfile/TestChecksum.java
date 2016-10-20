@@ -37,10 +37,10 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.fs.HFileSystem;
 import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.compress.Compression;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.ChecksumType;
 import org.junit.Before;
 import org.junit.Test;
@@ -291,7 +291,7 @@ public class TestChecksum {
     }
 
     @Override
-    protected boolean validateBlockChecksum(HFileBlock block, 
+    protected boolean validateBlockChecksum(HFileBlock block, long offset,
       byte[] data, int hdrSize) throws IOException {
       return false;  // checksum validation failure
     }

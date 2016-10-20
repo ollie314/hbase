@@ -51,15 +51,17 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.filter.ParseFilter;
+import org.apache.hadoop.hbase.security.SaslUtil;
 import org.apache.hadoop.hbase.security.SecurityUtil;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.thrift.CallQueue;
 import org.apache.hadoop.hbase.thrift.CallQueue.Call;
 import org.apache.hadoop.hbase.thrift.ThriftMetrics;
 import org.apache.hadoop.hbase.thrift2.generated.THBaseService;
+import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.InfoServer;
+import org.apache.hadoop.hbase.util.JvmPauseMonitor;
 import org.apache.hadoop.hbase.util.Strings;
-import org.apache.hadoop.net.DNS;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.SaslRpcServer.SaslGssCallbackHandler;
 import org.apache.hadoop.util.GenericOptionsParser;
@@ -95,9 +97,9 @@ public class ThriftServer {
 
   /**
    * Thrift quality of protection configuration key. Valid values can be:
-   * auth-conf: authentication, integrity and confidentiality checking
-   * auth-int: authentication and integrity checking
-   * auth: authentication only
+   * privacy: authentication, integrity and confidentiality checking
+   * integrity: authentication and integrity checking
+   * authentication: authentication only
    *
    * This is used to authenticate the callers and support impersonation.
    * The thrift server and the HBase cluster must run in secure mode.
@@ -106,7 +108,19 @@ public class ThriftServer {
 
   public static final int DEFAULT_LISTEN_PORT = 9090;
 
-  
+  private static final String READ_TIMEOUT_OPTION = "readTimeout";
+
+  static final String BACKLOG_CONF_KEY = "hbase.regionserver.thrift.backlog";
+
+  /**
+   * Amount of time in milliseconds before a server thread will timeout
+   * waiting for client to send data on a connected socket. Currently,
+   * applies only to TBoundedThreadPoolServer
+   */
+  public static final String THRIFT_SERVER_SOCKET_READ_TIMEOUT_KEY =
+    "hbase.thrift.server.socket.read.timeout";
+  public static final int THRIFT_SERVER_SOCKET_READ_TIMEOUT_DEFAULT = 60000;
+
   public ThriftServer() {
   }
 
@@ -126,9 +140,15 @@ public class ThriftServer {
     options.addOption("p", "port", true, "Port to bind to [default: " + DEFAULT_LISTEN_PORT + "]");
     options.addOption("f", "framed", false, "Use framed transport");
     options.addOption("c", "compact", false, "Use the compact protocol");
+    options.addOption("w", "workers", true, "How many worker threads to use.");
+    options.addOption("q", "callQueueSize", true,
+      "Max size of request queue (unbounded by default)");
     options.addOption("h", "help", false, "Print help information");
     options.addOption(null, "infoport", true, "Port for web UI");
-
+    options.addOption("t", READ_TIMEOUT_OPTION, true,
+      "Amount of time in milliseconds before a server thread will timeout " +
+      "waiting for client to send data on a connected socket. Currently, " +
+      "only applies to TBoundedThreadPoolServer");
     OptionGroup servers = new OptionGroup();
     servers.addOption(
         new Option("nonblocking", false, "Use the TNonblockingServer. This implies the framed transport."));
@@ -157,7 +177,8 @@ public class ThriftServer {
   }
 
   private static TTransportFactory getTTransportFactory(
-      String qop, String name, String host, boolean framed, int frameSize) {
+      SaslUtil.QualityOfProtection qop, String name, String host,
+      boolean framed, int frameSize) {
     if (framed) {
       if (qop != null) {
         throw new RuntimeException("Thrift server authentication"
@@ -169,7 +190,7 @@ public class ThriftServer {
       return new TTransportFactory();
     } else {
       Map<String, String> saslProperties = new HashMap<String, String>();
-      saslProperties.put(Sasl.QOP, qop);
+      saslProperties.put(Sasl.QOP, qop.getSaslQop());
       TSaslServerTransport.Factory saslFactory = new TSaslServerTransport.Factory();
       saslFactory.addServerDefinition("GSSAPI", name, host, saslProperties,
         new SaslGssCallbackHandler() {
@@ -232,13 +253,17 @@ public class ThriftServer {
 
   private static TServer getTHsHaServer(TProtocolFactory protocolFactory,
       TProcessor processor, TTransportFactory transportFactory,
+      int workerThreads, int maxCallQueueSize,
       InetSocketAddress inetSocketAddress, ThriftMetrics metrics)
       throws TTransportException {
     TNonblockingServerTransport serverTransport = new TNonblockingServerSocket(inetSocketAddress);
     log.info("starting HBase HsHA Thrift server on " + inetSocketAddress.toString());
     THsHaServer.Args serverArgs = new THsHaServer.Args(serverTransport);
+    if (workerThreads > 0) {
+      serverArgs.workerThreads(workerThreads);
+    }
     ExecutorService executorService = createExecutor(
-        serverArgs.getWorkerThreads(), metrics);
+        workerThreads, maxCallQueueSize, metrics);
     serverArgs.executorService(executorService);
     serverArgs.processor(processor);
     serverArgs.transportFactory(transportFactory);
@@ -247,24 +272,39 @@ public class ThriftServer {
   }
 
   private static ExecutorService createExecutor(
-      int workerThreads, ThriftMetrics metrics) {
-    CallQueue callQueue = new CallQueue(
-        new LinkedBlockingQueue<Call>(), metrics);
+      int workerThreads, int maxCallQueueSize, ThriftMetrics metrics) {
+    CallQueue callQueue;
+    if (maxCallQueueSize > 0) {
+      callQueue = new CallQueue(new LinkedBlockingQueue<Call>(maxCallQueueSize), metrics);
+    } else {
+      callQueue = new CallQueue(new LinkedBlockingQueue<Call>(), metrics);
+    }
+
     ThreadFactoryBuilder tfb = new ThreadFactoryBuilder();
     tfb.setDaemon(true);
     tfb.setNameFormat("thrift2-worker-%d");
-    return new ThreadPoolExecutor(workerThreads, workerThreads,
+    ThreadPoolExecutor pool = new ThreadPoolExecutor(workerThreads, workerThreads,
             Long.MAX_VALUE, TimeUnit.SECONDS, callQueue, tfb.build());
+    pool.prestartAllCoreThreads();
+    return pool;
   }
 
-  private static TServer getTThreadPoolServer(TProtocolFactory protocolFactory, TProcessor processor,
-      TTransportFactory transportFactory, InetSocketAddress inetSocketAddress) throws TTransportException {
-    TServerTransport serverTransport = new TServerSocket(inetSocketAddress);
+  private static TServer getTThreadPoolServer(TProtocolFactory protocolFactory,
+                                              TProcessor processor,
+                                              TTransportFactory transportFactory,
+                                              int workerThreads,
+                                              InetSocketAddress inetSocketAddress,
+                                              int clientTimeout)
+      throws TTransportException {
+    TServerTransport serverTransport = new TServerSocket(inetSocketAddress, clientTimeout);
     log.info("starting HBase ThreadPool Thrift server on " + inetSocketAddress.toString());
     TThreadPoolServer.Args serverArgs = new TThreadPoolServer.Args(serverTransport);
     serverArgs.processor(processor);
     serverArgs.transportFactory(transportFactory);
     serverArgs.protocolFactory(protocolFactory);
+    if (workerThreads > 0) {
+      serverArgs.maxWorkerThreads(workerThreads);
+    }
     return new TThreadPoolServer(serverArgs);
   }
 
@@ -297,6 +337,8 @@ public class ThriftServer {
     Options options = getOptions();
     Configuration conf = HBaseConfiguration.create();
     CommandLine cmd = parseArguments(conf, options, args);
+    int workerThreads = 0;
+    int maxCallQueueSize = -1; // use unbounded queue by default
 
     /**
      * This is to please both bin/hbase and bin/hbase-daemon. hbase-daemon provides "start" and "stop" arguments hbase
@@ -306,6 +348,28 @@ public class ThriftServer {
     if (cmd.hasOption("help") || !argList.contains("start") || argList.contains("stop")) {
       printUsage();
       System.exit(1);
+    }
+
+    // Get address to bind
+    String bindAddress;
+    if (cmd.hasOption("bind")) {
+      bindAddress = cmd.getOptionValue("bind");
+      conf.set("hbase.thrift.info.bindAddress", bindAddress);
+    } else {
+      bindAddress = conf.get("hbase.thrift.info.bindAddress");
+    }
+
+    // Get read timeout
+    int readTimeout = THRIFT_SERVER_SOCKET_READ_TIMEOUT_DEFAULT;
+    if (cmd.hasOption(READ_TIMEOUT_OPTION)) {
+      try {
+        readTimeout = Integer.parseInt(cmd.getOptionValue(READ_TIMEOUT_OPTION));
+      } catch (NumberFormatException e) {
+        throw new RuntimeException("Could not parse the value provided for the timeout option", e);
+      }
+    } else {
+      readTimeout = conf.getInt(THRIFT_SERVER_SOCKET_READ_TIMEOUT_KEY,
+        THRIFT_SERVER_SOCKET_READ_TIMEOUT_DEFAULT);
     }
 
     // Get port to bind to
@@ -319,6 +383,9 @@ public class ThriftServer {
     } catch (NumberFormatException e) {
       throw new RuntimeException("Could not parse the value provided for the port option", e);
     }
+
+    // Thrift's implementation uses '0' as a placeholder for 'use the default.'
+    int backlog = conf.getInt(BACKLOG_CONF_KEY, 0);
 
     // Local hostname and user name,
     // used only if QOP is configured.
@@ -338,13 +405,10 @@ public class ThriftServer {
     }
 
     UserGroupInformation realUser = userProvider.getCurrent().getUGI();
-    String qop = conf.get(THRIFT_QOP_KEY);
-    if (qop != null) {
-      if (!qop.equals("auth") && !qop.equals("auth-int")
-          && !qop.equals("auth-conf")) {
-        throw new IOException("Invalid " + THRIFT_QOP_KEY + ": " + qop
-          + ", it must be 'auth', 'auth-int', or 'auth-conf'");
-      }
+    String stringQop = conf.get(THRIFT_QOP_KEY);
+    SaslUtil.QualityOfProtection qop = null;
+    if (stringQop != null) {
+      qop = SaslUtil.getQop(stringQop);
       if (!securityEnabled) {
         throw new IOException("Thrift server must"
           + " run in secure mode to support authentication");
@@ -358,6 +422,7 @@ public class ThriftServer {
     boolean hsha = cmd.hasOption("hsha");
 
     ThriftMetrics metrics = new ThriftMetrics(conf, ThriftMetrics.ThriftServerType.TWO);
+    final JvmPauseMonitor pauseMonitor = new JvmPauseMonitor(conf, metrics.getSource());
 
     String implType = "threadpool";
     if (nonblocking) {
@@ -386,7 +451,7 @@ public class ThriftServer {
         conf.getBoolean("hbase.regionserver.thrift.framed", false) || nonblocking || hsha;
     TTransportFactory transportFactory = getTTransportFactory(qop, name, host, framed,
         conf.getInt("hbase.regionserver.thrift.framed.max_frame_size_in_mb", 2) * 1024 * 1024);
-    InetSocketAddress inetSocketAddress = bindToPort(cmd.getOptionValue("bind"), listenPort);
+    InetSocketAddress inetSocketAddress = bindToPort(bindAddress, listenPort);
     conf.setBoolean("hbase.regionserver.thrift.framed", framed);
     if (qop != null) {
       // Create a processor wrapper, to get the caller
@@ -402,6 +467,14 @@ public class ThriftServer {
           return p.process(inProt, outProt);
         }
       };
+    }
+
+    if (cmd.hasOption("w")) {
+      workerThreads = Integer.parseInt(cmd.getOptionValue("w"));
+    }
+
+    if (cmd.hasOption("q")) {
+      maxCallQueueSize = Integer.parseInt(cmd.getOptionValue("q"));
     }
 
     // check for user-defined info server port setting, if so override the conf
@@ -428,11 +501,25 @@ public class ThriftServer {
     }
 
     if (nonblocking) {
-      server = getTNonBlockingServer(protocolFactory, processor, transportFactory, inetSocketAddress);
+      server = getTNonBlockingServer(protocolFactory,
+          processor,
+          transportFactory,
+          inetSocketAddress);
     } else if (hsha) {
-      server = getTHsHaServer(protocolFactory, processor, transportFactory, inetSocketAddress, metrics);
+      server = getTHsHaServer(protocolFactory,
+          processor,
+          transportFactory,
+          workerThreads,
+          maxCallQueueSize,
+          inetSocketAddress,
+          metrics);
     } else {
-      server = getTThreadPoolServer(protocolFactory, processor, transportFactory, inetSocketAddress);
+      server = getTThreadPoolServer(protocolFactory,
+          processor,
+          transportFactory,
+          workerThreads,
+          inetSocketAddress,
+          readTimeout);
     }
 
     final TServer tserver = server;
@@ -440,8 +527,13 @@ public class ThriftServer {
       new PrivilegedAction<Object>() {
         @Override
         public Object run() {
-          tserver.serve();
-          return null;
+          pauseMonitor.start();
+          try {
+            tserver.serve();
+            return null;
+          } finally {
+            pauseMonitor.stop();
+          }
         }
       });
   }

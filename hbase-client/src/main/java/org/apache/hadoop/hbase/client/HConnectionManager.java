@@ -18,6 +18,8 @@
  */
 package org.apache.hadoop.hbase.client;
 
+import static org.apache.hadoop.hbase.client.MetricsConnection.CLIENT_SIDE_METRICS_ENABLED_KEY;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
@@ -66,6 +68,8 @@ import org.apache.hadoop.hbase.TableNotFoundException;
 import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
+import org.apache.hadoop.hbase.client.backoff.ClientBackoffPolicy;
+import org.apache.hadoop.hbase.client.backoff.ClientBackoffPolicyFactory;
 import org.apache.hadoop.hbase.client.coprocessor.Batch;
 import org.apache.hadoop.hbase.exceptions.RegionMovedException;
 import org.apache.hadoop.hbase.exceptions.RegionOpeningException;
@@ -77,45 +81,93 @@ import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.AdminService;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ClientService;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceRequest;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.CoprocessorServiceResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AddColumnRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AddColumnResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AssignRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AssignRegionResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.BalanceRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.BalanceResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.CreateNamespaceRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.CreateNamespaceResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.CreateTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.CreateTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteColumnRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteColumnResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteNamespaceRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteNamespaceResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteSnapshotRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteSnapshotResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DeleteTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DisableTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DisableTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DispatchMergingRegionsRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.DispatchMergingRegionsResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableCatalogJanitorRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableCatalogJanitorResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ExecProcedureRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ExecProcedureResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetClusterStatusRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetClusterStatusResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetCompletedSnapshotsRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetCompletedSnapshotsResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetNamespaceDescriptorRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetNamespaceDescriptorResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetSchemaAlterStatusRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetSchemaAlterStatusResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescriptorsRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescriptorsResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableNamesRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableNamesResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsBalancerEnabledRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsBalancerEnabledResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsCatalogJanitorEnabledRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsCatalogJanitorEnabledResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsMasterRunningRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsMasterRunningResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsProcedureDoneRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsProcedureDoneResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsRestoreSnapshotDoneRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsRestoreSnapshotDoneResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsSnapshotDoneRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsSnapshotDoneResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListNamespaceDescriptorsRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListNamespaceDescriptorsResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableDescriptorsByNamespaceRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableDescriptorsByNamespaceResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ListTableNamesByNamespaceResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MasterService;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyColumnRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyColumnResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyNamespaceRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyNamespaceResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MoveRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MoveRegionResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.OfflineRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.OfflineRegionResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningResponse;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.StopMasterRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.StopMasterResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.UnassignRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.UnassignRegionResponse;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AddColumnRequest;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.BalanceRequest;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.*;
 import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;
 import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.security.UserProvider;
@@ -545,6 +597,7 @@ public class HConnectionManager {
   }
 
   /** Encapsulates connection to zookeeper and regionservers.*/
+  @InterfaceAudience.Private
   @edu.umd.cs.findbugs.annotations.SuppressWarnings(
       value="AT_OPERATION_SEQUENCE_ON_CONCURRENT_ABSTRACTION",
       justification="Access to the conncurrent hash map is under a lock so should be fine.")
@@ -564,6 +617,7 @@ public class HConnectionManager {
     ClusterStatusListener clusterStatusListener;
 
     private final Object userRegionLock = new Object();
+    private final Object metaRegionLock = new Object();
 
     // We have a single lock for master & zk to prevent deadlocks. Having
     //  one lock for ZK and one lock for master is not possible:
@@ -583,8 +637,14 @@ public class HConnectionManager {
 
     private final Configuration conf;
 
+    // cache the configuration value for tables so that we can avoid calling
+    // the expensive Configuration to fetch the value multiple times.
+    private final TableConfiguration tableConfig;
+
     // Client rpc instance.
     private RpcClient rpcClient;
+
+    private final MetricsConnection metrics;
 
     /**
       * Map of table to table {@link HRegionLocation}s.
@@ -610,7 +670,16 @@ public class HConnectionManager {
     // indicates whether this connection's life cycle is managed (by us)
     private boolean managed;
 
-    private User user;
+    protected User user;
+
+    private RpcRetryingCallerFactory rpcCallerFactory;
+
+    private RpcControllerFactory rpcControllerFactory;
+
+    // single tracker per connection
+    private final ServerStatisticTracker stats;
+
+    private final ClientBackoffPolicy backoffPolicy;
 
     /**
      * Cluster registry of basic info such as clusterid and meta region location.
@@ -641,7 +710,7 @@ public class HConnectionManager {
       this.registry = setupRegistry();
       retrieveClusterId();
 
-      this.rpcClient = new RpcClient(this.conf, this.clusterId);
+      this.rpcClient = new RpcClient(this.conf, this.clusterId, this.metrics);
 
       // Do we publish the status?
       boolean shouldListen = conf.getBoolean(HConstants.STATUS_PUBLISHED,
@@ -667,6 +736,9 @@ public class HConnectionManager {
               }, conf, listenerClass);
         }
       }
+
+      this.rpcCallerFactory = RpcRetryingCallerFactory.instantiate(conf, this.stats);
+      this.rpcControllerFactory = RpcControllerFactory.instantiate(conf);
     }
 
     /** Dummy nonce generator for disabled nonces. */
@@ -686,11 +758,11 @@ public class HConnectionManager {
      */
     protected HConnectionImplementation(Configuration conf) {
       this.conf = conf;
+      this.tableConfig = new TableConfiguration(conf);
       this.closed = false;
       this.pause = conf.getLong(HConstants.HBASE_CLIENT_PAUSE,
           HConstants.DEFAULT_HBASE_CLIENT_PAUSE);
-      this.numTries = conf.getInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,
-          HConstants.DEFAULT_HBASE_CLIENT_RETRIES_NUMBER);
+      this.numTries = tableConfig.getRetriesNumber();
       this.rpcTimeout = conf.getInt(
           HConstants.HBASE_RPC_TIMEOUT_KEY,
           HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
@@ -705,11 +777,20 @@ public class HConnectionManager {
         this.nonceGenerator = new NoNonceGenerator();
       }
 
+      this.stats = ServerStatisticTracker.create(conf);
       this.usePrefetch = conf.getBoolean(HConstants.HBASE_CLIENT_PREFETCH,
           HConstants.DEFAULT_HBASE_CLIENT_PREFETCH);
       this.prefetchRegionLimit = conf.getInt(
           HConstants.HBASE_CLIENT_PREFETCH_LIMIT,
           HConstants.DEFAULT_HBASE_CLIENT_PREFETCH_LIMIT);
+      this.rpcControllerFactory = RpcControllerFactory.instantiate(conf);
+      this.rpcCallerFactory = RpcRetryingCallerFactory.instantiate(conf, this.stats);
+      this.backoffPolicy = ClientBackoffPolicyFactory.create(conf);
+      if (conf.getBoolean(CLIENT_SIDE_METRICS_ENABLED_KEY, false)) {
+        this.metrics = new MetricsConnection(this);
+      } else {
+        this.metrics = null;
+      }
     }
 
     @Override
@@ -742,7 +823,13 @@ public class HConnectionManager {
       if (managed) {
         throw new IOException("The connection has to be unmanaged.");
       }
-      return new HTable(tableName, this, pool);
+      return new HTable(tableName, this, tableConfig, rpcCallerFactory, rpcControllerFactory,
+        pool);
+    }
+
+    @Override
+    public MetricsConnection getConnectionMetrics() {
+      return this.metrics;
     }
 
     private ExecutorService getBatchPool() {
@@ -1086,12 +1173,46 @@ public class HConnectionManager {
       }
 
       if (tableName.equals(TableName.META_TABLE_NAME)) {
-        return this.registry.getMetaRegionLocation();
+        return locateMeta(tableName, useCache);
       } else {
         // Region not in the cache - have to go to the meta RS
         return locateRegionInMeta(TableName.META_TABLE_NAME, tableName, row,
           useCache, userRegionLock, retry);
       }
+    }
+
+    private HRegionLocation locateMeta(final TableName tableName,
+        boolean useCache) throws IOException {
+      // HBASE-10785: We cache the location of the META itself, so that we are not overloading
+      // zookeeper with one request for every region lookup. We cache the META with empty row
+      // key in MetaCache.
+      byte[] metaCacheKey = HConstants.EMPTY_START_ROW; // use byte[0] as the row for meta
+      HRegionLocation location = null;
+      if (useCache) {
+        location = getCachedLocation(tableName, metaCacheKey);
+        if (location != null) {
+          return location;
+        }
+      }
+
+      // only one thread should do the lookup.
+      synchronized (metaRegionLock) {
+        // Check the cache again for a hit in case some other thread made the
+        // same query while we were waiting on the lock.
+        if (useCache) {
+          location = getCachedLocation(tableName, metaCacheKey);
+          if (location != null) {
+            return location;
+          }
+        }
+
+        // Look up from zookeeper
+        location = this.registry.getMetaRegionLocation();
+        if (location != null) {
+          cacheLocation(tableName, null, location);
+        }
+      }
+      return location;
     }
 
     /*
@@ -1178,7 +1299,7 @@ public class HConnectionManager {
         HRegionLocation metaLocation = null;
         try {
           // locate the meta region
-          metaLocation = locateRegion(parentTable, metaKey, true, false);
+          metaLocation = locateRegion(parentTable, metaKey, useCache, retry);
           // If null still, go around again.
           if (metaLocation == null) continue;
           ClientService.BlockingInterface service = getClient(metaLocation.getServerName());
@@ -1318,6 +1439,7 @@ public class HConnectionManager {
 
       Entry<byte[], HRegionLocation> e = tableLocations.floorEntry(row);
       if (e == null) {
+        if (metrics != null) metrics.incrMetaCacheMiss();
         return null;
       }
       HRegionLocation possibleRegion = e.getValue();
@@ -1331,10 +1453,12 @@ public class HConnectionManager {
       if (Bytes.equals(endKey, HConstants.EMPTY_END_ROW) ||
           tableName.getRowComparator().compareRows(
               endKey, 0, endKey.length, row, 0, row.length) > 0) {
+        if (metrics != null) metrics.incrMetaCacheHit();
         return possibleRegion;
       }
 
       // Passed all the way through, so we got nothing - complete cache miss
+      if (metrics != null) metrics.incrMetaCacheMiss();
       return null;
     }
 
@@ -1757,10 +1881,8 @@ public class HConnectionManager {
       if (zkw == null){
         return;
       }
-      synchronized (masterAndZKLock) {
-        if (keepAliveZookeeperUserCount.decrementAndGet() <= 0 ){
-          keepZooKeeperWatcherAliveUntil = System.currentTimeMillis() + keepAlive;
-        }
+      if (keepAliveZookeeperUserCount.decrementAndGet() <= 0) {
+        keepZooKeeperWatcherAliveUntil = System.currentTimeMillis() + keepAlive;
       }
     }
 
@@ -1791,8 +1913,9 @@ public class HConnectionManager {
               @Override public void stop(String why) { isStopped = true;}
               @Override public boolean isStopped() {return isStopped;}
             };
-
-        return new DelayedClosing(hci, stoppable);
+        DelayedClosing delayedClosing = new DelayedClosing(hci, stoppable);
+        Threads.setDaemonThreadRunning(delayedClosing.getThread());
+        return delayedClosing;
       }
 
       protected void closeMasterProtocol(MasterServiceState protocolState) {
@@ -1975,6 +2098,12 @@ public class HConnectionManager {
         }
 
         @Override
+        public IsBalancerEnabledResponse isBalancerEnabled(RpcController controller,
+            IsBalancerEnabledRequest request) throws ServiceException {
+          return stub.isBalancerEnabled(controller, request);
+        }
+
+        @Override
         public RunCatalogScanResponse runCatalogScan(RpcController controller,
             RunCatalogScanRequest request) throws ServiceException {
           return stub.runCatalogScan(controller, request);
@@ -2135,6 +2264,12 @@ public class HConnectionManager {
         public TruncateTableResponse truncateTable(RpcController controller,
             TruncateTableRequest request) throws ServiceException {
           return stub.truncateTable(controller, request);
+        }
+
+        @Override
+        public SecurityCapabilitiesResponse getSecurityCapabilities(RpcController controller,
+            SecurityCapabilitiesRequest request) throws ServiceException {
+          return stub.getSecurityCapabilities(controller, request);
         }
       };
     }
@@ -2360,10 +2495,11 @@ public class HConnectionManager {
     // For tests.
     protected <R> AsyncProcess createAsyncProcess(TableName tableName, ExecutorService pool,
            AsyncProcess.AsyncProcessCallback<R> callback, Configuration conf) {
-      return new AsyncProcess<R>(this, tableName, pool, callback, conf,
-          RpcRetryingCallerFactory.instantiate(conf), RpcControllerFactory.instantiate(conf));
+      RpcControllerFactory controllerFactory = RpcControllerFactory.instantiate(conf);
+      RpcRetryingCallerFactory callerFactory = RpcRetryingCallerFactory.instantiate(conf, this.stats);
+      return new AsyncProcess<R>(this, tableName, pool, callback, conf, callerFactory,
+        controllerFactory);
     }
-
 
     /**
      * Fill the result array for the interfaces using it.
@@ -2403,6 +2539,15 @@ public class HConnectionManager {
       }
     }
 
+    @Override
+    public ServerStatisticTracker getStatisticsTracker() {
+      return this.stats;
+    }
+
+    @Override
+    public ClientBackoffPolicy getBackoffPolicy() {
+      return this.backoffPolicy;
+    }
 
     /*
      * Return the number of cached region for a table. It will only be called
@@ -2527,6 +2672,9 @@ public class HConnectionManager {
       delayedClosing.stop("Closing connection");
       closeMaster();
       shutdownBatchPool();
+      if (this.metrics != null) {
+        this.metrics.shutdown();
+      }
       this.closed = true;
       closeZooKeeperWatcher();
       this.stubs.clear();
@@ -2672,6 +2820,14 @@ public class HConnectionManager {
     public HTableDescriptor getHTableDescriptor(final byte[] tableName)
     throws IOException {
       return getHTableDescriptor(TableName.valueOf(tableName));
+    }
+
+    /**
+     * @return true when this connection uses a {@link org.apache.hadoop.hbase.codec.Codec} and so
+     *         supports cell blocks.
+     */
+    public boolean hasCellBlockSupport() {
+      return this.rpcClient.hasCellBlockSupport();
     }
   }
 

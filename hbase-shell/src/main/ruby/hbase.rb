@@ -62,6 +62,11 @@ module HBaseConstants
   VISIBILITY="VISIBILITY"
   AUTHORIZATIONS = "AUTHORIZATIONS"
   SKIP_FLUSH = 'SKIP_FLUSH'
+  ENDPOINT_CLASSNAME = 'ENDPOINT_CLASSNAME'
+  CLUSTER_KEY = 'CLUSTER_KEY'
+  TABLE_CFS = 'TABLE_CFS'
+  CONFIG = 'CONFIG'
+  DATA = 'DATA'
 
   # Load constants from hbase java API
   def self.promote_constants(constants)
@@ -80,6 +85,7 @@ end
 # Include classes definition
 require 'hbase/hbase'
 require 'hbase/admin'
+require 'hbase/taskmonitor'
 require 'hbase/table'
 require 'hbase/replication_admin'
 require 'hbase/security'

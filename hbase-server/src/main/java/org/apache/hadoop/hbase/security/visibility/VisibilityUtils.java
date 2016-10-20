@@ -44,7 +44,7 @@ import org.apache.hadoop.hbase.TagType;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.io.util.StreamUtils;
-import org.apache.hadoop.hbase.ipc.RequestContext;
+import org.apache.hadoop.hbase.ipc.RpcServer;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.MultiUserAuthorizations;
 import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.UserAuthorizations;
@@ -62,8 +62,6 @@ import org.apache.hadoop.hbase.util.ByteStringer;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.SimpleByteRange;
 import org.apache.hadoop.util.ReflectionUtils;
-
-import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
  * Utility method to support visibility
@@ -131,10 +129,10 @@ public class VisibilityUtils {
     if (ProtobufUtil.isPBMagicPrefix(data)) {
       int pblen = ProtobufUtil.lengthOfPBMagic();
       try {
-        VisibilityLabelsRequest request = VisibilityLabelsRequest.newBuilder()
-            .mergeFrom(data, pblen, data.length - pblen).build();
-        return request.getVisLabelList();
-      } catch (InvalidProtocolBufferException e) {
+        VisibilityLabelsRequest.Builder builder = VisibilityLabelsRequest.newBuilder();
+        ProtobufUtil.mergeFrom(builder, data, pblen, data.length - pblen);
+        return builder.getVisLabelList();
+      } catch (IOException e) {
         throw new DeserializationException(e);
       }
     }
@@ -152,10 +150,10 @@ public class VisibilityUtils {
     if (ProtobufUtil.isPBMagicPrefix(data)) {
       int pblen = ProtobufUtil.lengthOfPBMagic();
       try {
-        MultiUserAuthorizations multiUserAuths = MultiUserAuthorizations.newBuilder()
-            .mergeFrom(data, pblen, data.length - pblen).build();
-        return multiUserAuths;
-      } catch (InvalidProtocolBufferException e) {
+        MultiUserAuthorizations.Builder builder = MultiUserAuthorizations.newBuilder();
+        ProtobufUtil.mergeFrom(builder, data, pblen, data.length - pblen);
+        return builder.build();
+      } catch (IOException e) {
         throw new DeserializationException(e);
       }
     }
@@ -188,10 +186,17 @@ public class VisibilityUtils {
         }
       }
     }
-    // If the conf is not configured by default we need to have one SLG to be used
-    // ie. DefaultScanLabelGenerator
+    // If no SLG is specified in conf, by default we'll add two SLGs
+    // 1. FeedUserAuthScanLabelGenerator
+    // 2. DefinedSetFilterScanLabelGenerator
+    // This stacking will achieve the following default behavior:
+    // 1. If there is no Auths in the scan, we will obtain the global defined set for the user
+    //    from the labels table.
+    // 2. If there is Auths in the scan, we will examine the passed in Auths and filter out the
+    //    labels that the user is not entitled to. Then use the resulting label set.
     if (slgs.isEmpty()) {
-      slgs.add(ReflectionUtils.newInstance(DefaultScanLabelGenerator.class, conf));
+      slgs.add(ReflectionUtils.newInstance(FeedUserAuthScanLabelGenerator.class, conf));
+      slgs.add(ReflectionUtils.newInstance(DefinedSetFilterScanLabelGenerator.class, conf));
     }
     return slgs;
   }
@@ -213,6 +218,39 @@ public class VisibilityUtils {
           serializationFormat = tag.getBuffer()[tag.getTagOffset()];
         } else if (tag.getType() == TagType.VISIBILITY_TAG_TYPE) {
           tags.add(tag);
+        }
+      }
+    }
+    return serializationFormat;
+  }
+
+  /**
+   * Extracts and partitions the visibility tags and nonVisibility Tags
+   *
+   * @param cell - the cell for which we would extract and partition the
+   * visibility and non visibility tags
+   * @param visTags
+   *          - all the visibilty tags of type TagType.VISIBILITY_TAG_TYPE would
+   *          be added to this list
+   * @param nonVisTags - all the non visibility tags would be added to this list
+   * @return - the serailization format of the tag. Can be null if no tags are found or
+   * if there is no visibility tag found
+   */
+  public static Byte extractAndPartitionTags(Cell cell, List<Tag> visTags,
+      List<Tag> nonVisTags) {
+    Byte serializationFormat = null;
+    if (cell.getTagsLength() > 0) {
+      Iterator<Tag> tagsIterator = CellUtil.tagsIterator(cell.getTagsArray(), cell.getTagsOffset(),
+          cell.getTagsLength());
+      while (tagsIterator.hasNext()) {
+        Tag tag = tagsIterator.next();
+        if (tag.getType() == TagType.VISIBILITY_EXP_SERIALIZATION_FORMAT_TAG_TYPE) {
+          serializationFormat = tag.getBuffer()[tag.getTagOffset()];
+        } else if (tag.getType() == VISIBILITY_TAG_TYPE) {
+          visTags.add(tag);
+        } else {
+          // ignore string encoded visibility expressions, will be added in replication handling
+          nonVisTags.add(tag);
         }
       }
     }
@@ -252,8 +290,8 @@ public class VisibilityUtils {
    * @throws IOException When there is IOE in getting the system user (During non-RPC handling).
    */
   public static User getActiveUser() throws IOException {
-    User user = RequestContext.getRequestUser();
-    if (!RequestContext.isInRequestContext()) {
+    User user = RpcServer.getRequestUser();
+    if (user == null) {
       user = User.getCurrent();
     }
     if (LOG.isTraceEnabled()) {

@@ -31,6 +31,7 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -49,6 +50,10 @@ import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.client.HConnection;
 import org.apache.hadoop.hbase.client.HConnectionManager;
 import org.apache.hadoop.hbase.client.RetriesExhaustedException;
+
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.master.balancer.BaseLoadBalancer;
+
 import org.apache.hadoop.hbase.master.handler.MetaServerShutdownHandler;
 import org.apache.hadoop.hbase.master.handler.ServerShutdownHandler;
 import org.apache.hadoop.hbase.monitoring.MonitoredTask;
@@ -63,6 +68,8 @@ import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos.SplitLogTask.R
 import org.apache.hadoop.hbase.regionserver.RegionOpeningState;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Triple;
+import org.apache.hadoop.hbase.util.RetryCounter;
+import org.apache.hadoop.hbase.util.RetryCounterFactory;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.ServiceException;
@@ -112,8 +119,8 @@ public class ServerManager {
     new ConcurrentSkipListMap<byte[], Long>(Bytes.BYTES_COMPARATOR);
 
   /** Map of registered servers to their current load */
-  private final ConcurrentHashMap<ServerName, ServerLoad> onlineServers =
-    new ConcurrentHashMap<ServerName, ServerLoad>();
+  private final ConcurrentNavigableMap<ServerName, ServerLoad> onlineServers =
+    new ConcurrentSkipListMap<ServerName, ServerLoad>();
 
   /**
    * Map of admin interfaces per registered regionserver; these interfaces we use to control
@@ -137,6 +144,8 @@ public class ServerManager {
 
   private final long maxSkew;
   private final long warningSkew;
+
+  private final RetryCounterFactory pingRetryCounterFactory;
 
   /**
    * Set of region servers which are dead but not processed immediately. If one
@@ -197,6 +206,11 @@ public class ServerManager {
     maxSkew = c.getLong("hbase.master.maxclockskew", 30000);
     warningSkew = c.getLong("hbase.master.warningclockskew", 10000);
     this.connection = connect ? HConnectionManager.getConnection(c) : null;
+    int pingMaxAttempts = Math.max(1, master.getConfiguration().getInt(
+      "hbase.master.maximum.ping.server.attempts", 10));
+    int pingSleepInterval = Math.max(1, master.getConfiguration().getInt(
+      "hbase.master.ping.server.retry.sleep.interval", 100));
+    this.pingRetryCounterFactory = new RetryCounterFactory(pingMaxAttempts, pingSleepInterval);
   }
 
   /**
@@ -252,7 +266,8 @@ public class ServerManager {
   private void updateLastFlushedSequenceIds(ServerName sn, ServerLoad hsl) {
     Map<byte[], RegionLoad> regionsLoad = hsl.getRegionsLoad();
     for (Entry<byte[], RegionLoad> entry : regionsLoad.entrySet()) {
-      Long existingValue = flushedSequenceIdByRegion.get(entry.getKey());
+      byte[] encodedRegionName = Bytes.toBytes(HRegionInfo.encodeRegionName(entry.getKey()));
+      Long existingValue = flushedSequenceIdByRegion.get(encodedRegionName);
       long l = entry.getValue().getCompleteSequenceId();
       if (existingValue != null) {
         if (l != -1 && l < existingValue) {
@@ -262,11 +277,10 @@ public class ServerManager {
               existingValue + ") for region " +
               Bytes.toString(entry.getKey()) + " Ignoring.");
 
-          continue; // Don't let smaller sequence ids override greater
-          // sequence ids.
+          continue; // Don't let smaller sequence ids override greater sequence ids.
         }
       }
-      flushedSequenceIdByRegion.put(entry.getKey(), l);
+      flushedSequenceIdByRegion.put(encodedRegionName, l);
     }
   }
 
@@ -386,8 +400,14 @@ public class ServerManager {
    */
   private ServerName findServerWithSameHostnamePortWithLock(
       final ServerName serverName) {
-    for (ServerName sn: this.onlineServers.keySet()) {
-      if (ServerName.isSameHostnameAndPort(serverName, sn)) return sn;
+    ServerName end = ServerName.valueOf(serverName.getHostname(), serverName.getPort(),
+        Long.MAX_VALUE);
+
+    ServerName r = onlineServers.lowerKey(end);
+    if (r != null) {
+      if (ServerName.isSameHostnameAndPort(r, serverName)) {
+        return r;
+      }
     }
     return null;
   }
@@ -405,10 +425,10 @@ public class ServerManager {
     this.rsAdmins.remove(serverName);
   }
 
-  public long getLastFlushedSequenceId(byte[] regionName) {
-    long seqId = -1;
-    if (flushedSequenceIdByRegion.containsKey(regionName)) {
-      seqId = flushedSequenceIdByRegion.get(regionName);
+  public long getLastFlushedSequenceId(byte[] encodedRegionName) {
+    long seqId = -1L;
+    if (flushedSequenceIdByRegion.containsKey(encodedRegionName)) {
+      seqId = flushedSequenceIdByRegion.get(encodedRegionName);
     }
     return seqId;
   }
@@ -664,8 +684,8 @@ public class ServerManager {
         " failed because no RPC connection found to this server");
       return RegionOpeningState.FAILED_OPENING;
     }
-    OpenRegionRequest request = RequestConverter.buildOpenRegionRequest(server, 
-      region, versionOfOfflineNode, favoredNodes, 
+    OpenRegionRequest request = RequestConverter.buildOpenRegionRequest(server,
+      region, versionOfOfflineNode, favoredNodes,
       (RecoveryMode.LOG_REPLAY == this.services.getMasterFileSystem().getLogRecoveryMode()));
     try {
       OpenRegionResponse response = admin.openRegion(null, request);
@@ -772,9 +792,14 @@ public class ServerManager {
    */
   public boolean isServerReachable(ServerName server) {
     if (server == null) throw new NullPointerException("Passed server is null");
-    int maximumAttempts = Math.max(1, master.getConfiguration().getInt(
-      "hbase.master.maximum.ping.server.attempts", 10));
-    for (int i = 0; i < maximumAttempts; i++) {
+
+    RetryCounter retryCounter = pingRetryCounterFactory.create();
+    while (retryCounter.shouldRetry()) {
+      synchronized (this.onlineServers) {
+        if (this.deadservers.isDeadServer(server)) {
+          return false;
+        }
+      }
       try {
         AdminService.BlockingInterface admin = getRsAdmin(server);
         if (admin != null) {
@@ -783,8 +808,16 @@ public class ServerManager {
             && server.getStartcode() == info.getServerName().getStartCode();
         }
       } catch (IOException ioe) {
-        LOG.debug("Couldn't reach " + server + ", try=" + i
-          + " of " + maximumAttempts, ioe);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Couldn't reach " + server + ", try=" + retryCounter.getAttemptTimes() + " of "
+              + retryCounter.getMaxAttempts(), ioe);
+        }
+        try {
+          retryCounter.sleepUntilNextRetry();
+        } catch(InterruptedException ie) {
+          Thread.currentThread().interrupt();
+          break;
+        }
       }
     }
     return false;
@@ -1023,6 +1056,23 @@ public class ServerManager {
   void clearDeadServersWithSameHostNameAndPortOfOnlineServer() {
     for (ServerName serverName : getOnlineServersList()) {
       deadservers.cleanAllPreviousInstances(serverName);
+    }
+  }
+
+  /**
+   * Called by delete table and similar to notify the ServerManager that a region was removed.
+   */
+  public void removeRegion(final HRegionInfo regionInfo) {
+    final byte[] encodedName = regionInfo.getEncodedNameAsBytes();
+    flushedSequenceIdByRegion.remove(encodedName);
+  }
+
+  /**
+   * Called by delete table and similar to notify the ServerManager that a region was removed.
+   */
+  public void removeRegions(final List<HRegionInfo> regions) {
+    for (HRegionInfo hri: regions) {
+      removeRegion(hri);
     }
   }
 }

@@ -23,6 +23,7 @@ import static org.apache.hadoop.hbase.util.Bytes.len;
 
 import java.io.DataInput;
 import java.io.DataOutput;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -381,7 +382,8 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
   }
 
   /**
-   * Constructs KeyValue structure filled with null value.
+   * Constructs KeyValue structure as a put filled with specified values and
+   * LATEST_TIMESTAMP.
    * @param row - row key (arbitrary byte array)
    * @param family family name
    * @param qualifier column qualifier
@@ -864,7 +866,7 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
    * @throws IllegalArgumentException an illegal value was passed or there is insufficient space
    * remaining in the buffer
    */
-  private static int writeByteArray(byte [] buffer, final int boffset,
+  static int writeByteArray(byte [] buffer, final int boffset,
       final byte [] row, final int roffset, final int rlength,
       final byte [] family, final int foffset, int flength,
       final byte [] qualifier, final int qoffset, int qlength,
@@ -1053,15 +1055,12 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
     return CellComparator.equals(this, (Cell)other);
   }
 
+  /**
+   * In line with {@link #equals(Object)}, only uses the key portion, not the value.
+   */
   @Override
   public int hashCode() {
-    byte[] b = getBuffer();
-    int start = getOffset(), end = getOffset() + getLength();
-    int h = b[start++];
-    for (int i = start; i < end; i++) {
-      h = (h * 13) ^ b[i];
-    }
-    return h;
+    return CellComparator.hashCodeIgnoreMvcc(this);
   }
 
   //---------------------------------------------------------------------------
@@ -1993,6 +1992,63 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
       return compareFlatKey(left, 0, left.length, right, 0, right.length);
     }
 
+    // compare a key against a given row/fam/qual/ts/type
+    public int compareKey(byte[] key, int koff, int klen, byte[] row, int roff, int rlen,
+        byte[] fam, int foff, int flen, byte[] col, int coff, int clen, long ts, byte type) {
+
+      short lrowlength = Bytes.toShort(key, koff);
+      int compare = compareRows(key, koff + Bytes.SIZEOF_SHORT, lrowlength, row, roff, rlen);
+      if (compare != 0) {
+        return compare;
+      }
+      // See compareWithoutRows...
+      // -------------------------
+      int commonLength = ROW_LENGTH_SIZE + FAMILY_LENGTH_SIZE + rlen;
+
+      // key's ColumnFamily + Qualifier length.
+      int lcolumnlength = klen - TIMESTAMP_TYPE_SIZE + commonLength;
+
+      byte ltype = key[koff + (klen - 1)];
+
+      // If the column is not specified, the "minimum" key type appears the
+      // latest in the sorted order, regardless of the timestamp. This is used
+      // for specifying the last key/value in a given row, because there is no
+      // "lexicographically last column" (it would be infinitely long). The
+      // "maximum" key type does not need this behavior.
+      if (lcolumnlength == 0 && ltype == Type.Minimum.getCode()) {
+        // left is "bigger", i.e. it appears later in the sorted order
+        return 1;
+      }
+      if (flen + clen == 0 && type == Type.Minimum.getCode()) {
+        return -1;
+      }
+
+      int lfamilyoffset = commonLength + koff;
+      int lfamilylength = key[lfamilyoffset - 1];
+      compare = Bytes.compareTo(key, lfamilyoffset, lfamilylength, fam, foff, flen);
+      if (compare != 0) {
+        return compare;
+      }
+      int lColOffset = lfamilyoffset + lfamilylength;
+      int lColLength = lcolumnlength - lfamilylength;
+      compare = Bytes.compareTo(key, lColOffset, lColLength, col, coff, clen);
+      if (compare != 0) {
+        return compare;
+      }
+      // Next compare timestamps.
+      long ltimestamp = Bytes.toLong(key, koff + (klen - TIMESTAMP_TYPE_SIZE));
+      compare = compareTimestamps(ltimestamp, ts);
+      if (compare != 0) {
+        return compare;
+      }
+
+      // Compare types. Let the delete types sort ahead of puts; i.e. types
+      // of higher numbers sort before those of lesser numbers. Maximum (255)
+      // appears ahead of everything, and minimum (0) appears after
+      // everything.
+      return (0xff & type) - (0xff & ltype);
+    }
+
     /**
      * Compares the Key of a cell -- with fields being more significant in this order:
      * rowkey, colfam/qual, timestamp, type, mvcc
@@ -2799,8 +2855,7 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
    * Create a KeyValue reading from the raw InputStream.
    * Named <code>iscreate</code> so doesn't clash with {@link #create(DataInput)}
    * @param in
-   * @return Created KeyValue OR if we find a length of zero, we will return null which
-   * can be useful marking a stream as done.
+   * @return Created KeyValue or throws an exception
    * @throws IOException
    */
   public static KeyValue iscreate(final InputStream in) throws IOException {
@@ -2809,7 +2864,9 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
     while (bytesRead < intBytes.length) {
       int n = in.read(intBytes, bytesRead, intBytes.length - bytesRead);
       if (n < 0) {
-        if (bytesRead == 0) return null; // EOF at start is ok
+        if (bytesRead == 0) {
+          throw new EOFException();
+        }
         throw new IOException("Failed read of int, read " + bytesRead + " bytes");
       }
       bytesRead += n;
@@ -2951,6 +3008,27 @@ public class KeyValue implements Cell, HeapSize, Cloneable {
     sum += ClassSize.REFERENCE;// pointer to "bytes"
     sum += ClassSize.align(ClassSize.ARRAY);// "bytes"
     sum += ClassSize.align(length);// number of bytes of data in the "bytes" array
+    sum += 2 * Bytes.SIZEOF_INT;// offset, length
+    sum += Bytes.SIZEOF_LONG;// memstoreTS
+    return ClassSize.align(sum);
+  }
+
+  /**
+   * This is a hack that should be removed once we don't care about matching
+   * up client- and server-side estimations of cell size. It needed to be
+   * backwards compatible with estimations done by older clients. We need to
+   * pretend that tags never exist and KeyValues aren't serialized with tag
+   * length included. See HBASE-13262 and HBASE-13303
+   */
+  @Deprecated
+  public long heapSizeWithoutTags() {
+    int sum = 0;
+    sum += ClassSize.OBJECT;// the KeyValue object itself
+    sum += ClassSize.REFERENCE;// pointer to "bytes"
+    sum += ClassSize.align(ClassSize.ARRAY);// "bytes"
+    sum += KeyValue.KEYVALUE_INFRASTRUCTURE_SIZE;
+    sum += getKeyLength();
+    sum += getValueLength();
     sum += 2 * Bytes.SIZEOF_INT;// offset, length
     sum += Bytes.SIZEOF_LONG;// memstoreTS
     return ClassSize.align(sum);

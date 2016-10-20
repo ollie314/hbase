@@ -40,6 +40,7 @@ import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.Regio
 import org.apache.hadoop.hbase.regionserver.CompactionRequestor;
 import org.apache.hadoop.hbase.regionserver.FlushRequester;
 import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.HeapMemoryManager;
 import org.apache.hadoop.hbase.regionserver.Leases;
 import org.apache.hadoop.hbase.regionserver.RegionServerAccounting;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices;
@@ -104,6 +105,11 @@ class MockRegionServerServices implements RegionServerServices {
   @Override
   public boolean isStopping() {
     return this.stopping;
+  }
+
+  @Override
+  public void postOpenDeployTasks(PostOpenDeployContext context, CatalogTracker ct)
+      throws KeeperException, IOException {
   }
 
   @Override
@@ -244,8 +250,23 @@ class MockRegionServerServices implements RegionServerServices {
   }
 
   @Override
+  public boolean reportRegionStateTransition(RegionStateTransitionContext context) {
+    return false;
+  }
+
+  @Override
   public boolean registerService(Service service) {
     // TODO Auto-generated method stub
     return false;
+  }
+
+  @Override
+  public HeapMemoryManager getHeapMemoryManager() {
+    return null;
+  }
+
+  @Override
+  public double getCompactionPressure() {
+    return 0;
   }
 }

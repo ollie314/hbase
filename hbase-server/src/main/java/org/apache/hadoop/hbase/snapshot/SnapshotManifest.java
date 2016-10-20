@@ -18,8 +18,11 @@
 
 package org.apache.hadoop.hbase.snapshot;
 
-import java.io.IOException;
+import com.google.protobuf.CodedInputStream;
+import com.google.protobuf.InvalidProtocolBufferException;
+
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -30,7 +33,6 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -38,6 +40,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.errorhandling.ForeignExceptionSnare;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 import org.apache.hadoop.hbase.protobuf.generated.SnapshotProtos.SnapshotDataManifest;
@@ -64,7 +67,9 @@ import org.apache.hadoop.hbase.util.Threads;
 public class SnapshotManifest {
   private static final Log LOG = LogFactory.getLog(SnapshotManifest.class);
 
-  private static final String DATA_MANIFEST_NAME = "data.manifest";
+  public static final String SNAPSHOT_MANIFEST_SIZE_LIMIT_CONF_KEY = "snapshot.manifest.size.limit";
+
+  public static final String DATA_MANIFEST_NAME = "data.manifest";
 
   private List<SnapshotRegionManifest> regionManifests;
   private SnapshotDescription desc;
@@ -74,6 +79,7 @@ public class SnapshotManifest {
   private final Configuration conf;
   private final Path workingDir;
   private final FileSystem fs;
+  private int manifestSizeLimit;
 
   private SnapshotManifest(final Configuration conf, final FileSystem fs,
       final Path workingDir, final SnapshotDescription desc,
@@ -83,6 +89,8 @@ public class SnapshotManifest {
     this.workingDir = workingDir;
     this.conf = conf;
     this.fs = fs;
+
+    this.manifestSizeLimit = conf.getInt(SNAPSHOT_MANIFEST_SIZE_LIMIT_CONF_KEY, 64 * 1024 * 1024);
   }
 
   /**
@@ -282,6 +290,9 @@ public class SnapshotManifest {
           try {
             v1Regions = SnapshotManifestV1.loadRegionManifests(conf, tpool, fs, workingDir, desc);
             v2Regions = SnapshotManifestV2.loadRegionManifests(conf, tpool, fs, workingDir, desc);
+          } catch (InvalidProtocolBufferException e) {
+            throw new CorruptedSnapshotException("unable to parse region manifest " +
+                e.getMessage(), e);
           } finally {
             tpool.shutdown();
           }
@@ -430,9 +441,13 @@ public class SnapshotManifest {
     FSDataInputStream in = null;
     try {
       in = fs.open(new Path(workingDir, DATA_MANIFEST_NAME));
-      return SnapshotDataManifest.parseFrom(in);
+      CodedInputStream cin = CodedInputStream.newInstance(in);
+      cin.setSizeLimit(manifestSizeLimit);
+      return SnapshotDataManifest.parseFrom(cin);
     } catch (FileNotFoundException e) {
       return null;
+    } catch (InvalidProtocolBufferException e) {
+      throw new CorruptedSnapshotException("unable to parse data manifest " + e.getMessage(), e);
     } finally {
       if (in != null) in.close();
     }

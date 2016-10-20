@@ -43,7 +43,10 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.InvalidFamilyOperationException;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.regionserver.HRegion;
+import org.apache.hadoop.hbase.regionserver.Store;
+import org.apache.hadoop.hbase.regionserver.StoreFile;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotDisabledException;
@@ -52,6 +55,7 @@ import org.apache.hadoop.hbase.ZooKeeperConnectionException;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.executor.EventHandler;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.zookeeper.ZKTableReadOnly;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.zookeeper.KeeperException;
@@ -1142,10 +1146,10 @@ public class TestAdmin1 {
   @Test (timeout=300000)
   public void testEnableDisableAddColumnDeleteColumn() throws Exception {
     ZooKeeperWatcher zkw = HBaseTestingUtility.getZooKeeperWatcher(TEST_UTIL);
-    TableName tableName = TableName.valueOf("testMasterAdmin");
+    TableName tableName = TableName.valueOf("testEnableDisableAddColumnDeleteColumn");
     TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY).close();
     while (!ZKTableReadOnly.isEnabledTable(zkw,
-        TableName.valueOf("testMasterAdmin"))) {
+        TableName.valueOf("testEnableDisableAddColumnDeleteColumn"))) {
       Thread.sleep(10);
     }
     this.admin.disableTable(tableName);
@@ -1164,5 +1168,89 @@ public class TestAdmin1 {
     }
     this.admin.disableTable(tableName);
     this.admin.deleteTable(tableName);
+  }
+
+  @Test (timeout=300000)
+  public void testDeleteLastColumnFamily() throws Exception {
+    TableName tableName = TableName.valueOf("testDeleteLastColumnFamily");
+    TEST_UTIL.createTable(tableName, HConstants.CATALOG_FAMILY).close();
+    while (!this.admin.isTableEnabled(TableName.valueOf("testDeleteLastColumnFamily"))) {
+      Thread.sleep(10);
+    }
+
+    // test for enabled table
+    try {
+      this.admin.deleteColumn(tableName, HConstants.CATALOG_FAMILY);
+      fail("Should have failed to delete the only column family of a table");
+    } catch (InvalidFamilyOperationException ex) {
+      // expected
+    }
+
+    // test for disabled table
+    this.admin.disableTable(tableName);
+
+    try {
+      this.admin.deleteColumn(tableName, HConstants.CATALOG_FAMILY);
+      fail("Should have failed to delete the only column family of a table");
+    } catch (InvalidFamilyOperationException ex) {
+      // expected
+    }
+
+    this.admin.deleteTable(tableName);
+  }
+
+  /*
+   * Test DFS replication for column families, where one CF has default replication(3) and the other
+   * is set to 1.
+   */
+  @Test(timeout = 300000)
+  public void testHFileReplication() throws Exception {
+    TableName name = TableName.valueOf("testHFileReplication");
+    String fn1 = "rep1";
+    HColumnDescriptor hcd1 = new HColumnDescriptor(fn1);
+    hcd1.setDFSReplication((short) 1);
+    String fn = "defaultRep";
+    HColumnDescriptor hcd = new HColumnDescriptor(fn);
+    HTableDescriptor htd = new HTableDescriptor(name);
+    htd.addFamily(hcd);
+    htd.addFamily(hcd1);
+    HTable table = TEST_UTIL.createTable(htd, null);
+    TEST_UTIL.waitTableAvailable(name.getName());
+    Put p = new Put(Bytes.toBytes("defaultRep_rk"));
+    byte[] q1 = Bytes.toBytes("q1");
+    byte[] v1 = Bytes.toBytes("v1");
+    p.add(Bytes.toBytes(fn), q1, v1);
+    List<Put> puts = new ArrayList<Put>(2);
+    puts.add(p);
+    p = new Put(Bytes.toBytes("rep1_rk"));
+    p.add(Bytes.toBytes(fn1), q1, v1);
+    puts.add(p);
+    try {
+      table.put(puts);
+      admin.flush(name.getNameAsString());
+
+      List<HRegion> regions = TEST_UTIL.getMiniHBaseCluster().getRegions(name);
+      for (HRegion r : regions) {
+        Store store = r.getStore(Bytes.toBytes(fn));
+        for (StoreFile sf : store.getStorefiles()) {
+          assertTrue(sf.toString().contains(fn));
+          assertTrue("Column family " + fn + " should have 3 copies",
+            FSUtils.getDefaultReplication(TEST_UTIL.getTestFileSystem(), sf.getPath()) == (sf
+                .getFileInfo().getFileStatus().getReplication()));
+        }
+
+        store = r.getStore(Bytes.toBytes(fn1));
+        for (StoreFile sf : store.getStorefiles()) {
+          assertTrue(sf.toString().contains(fn1));
+          short rep = sf.getFileInfo().getFileStatus().getReplication();
+          assertTrue("Column family " + fn1 + " should have only 1 copy. But: " + rep, 1 == rep);
+        }
+      }
+    } finally {
+      if (admin.isTableEnabled(name)) {
+        this.admin.disableTable(name);
+        this.admin.deleteTable(name);
+      }
+    }
   }
 }

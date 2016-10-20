@@ -15,7 +15,7 @@ import java.io.IOException;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.HConnection;
@@ -63,8 +63,9 @@ public class RegionServerCoprocessorRpcChannel extends CoprocessorRpcChannel {
         ProtobufUtil.execRegionServerService(connection.getClient(serverName), call);
     Message response = null;
     if (result.getValue().hasValue()) {
-      response =
-          responsePrototype.newBuilderForType().mergeFrom(result.getValue().getValue()).build();
+      Message.Builder builder = responsePrototype.newBuilderForType();
+      ProtobufUtil.mergeFrom(builder, result.getValue().getValue());
+      response = builder.build();
     } else {
       response = responsePrototype.getDefaultInstanceForType();
     }

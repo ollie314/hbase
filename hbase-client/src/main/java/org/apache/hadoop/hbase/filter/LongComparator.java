@@ -19,27 +19,32 @@
 package org.apache.hadoop.hbase.filter;
 
 import com.google.protobuf.InvalidProtocolBufferException;
+
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.protobuf.generated.ComparatorProtos;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.LongUtils;
 
 /**
  * A long comparator which numerical compares against the specified byte array
  */
-
+@InterfaceAudience.Public
+@InterfaceStability.Stable
 public class LongComparator extends ByteArrayComparable {
-    private Long longValue;
+  private long longValue;
 
-    public LongComparator(long value) {
-      super(Bytes.toBytes(value));
-      this.longValue = value;
-    }
+  public LongComparator(long value) {
+    super(Bytes.toBytes(value));
+    this.longValue = value;
+  }
 
-    @Override
-    public int compareTo(byte[] value, int offset, int length) {
-      Long that = Bytes.toLong(value, offset, length);
-      return this.longValue.compareTo(that);
-    }
+  @Override
+  public int compareTo(byte[] value, int offset, int length) {
+    long that = Bytes.toLong(value, offset, length);
+    return LongUtils.compare(longValue, that);
+  }
 
     /**
      * @return The comparator serialized using pb
@@ -75,8 +80,6 @@ public class LongComparator extends ByteArrayComparable {
      */
     boolean areSerializedFieldsEqual(LongComparator other) {
         if (other == this) return true;
-        if (!(other instanceof LongComparator)) return false;
-
         return super.areSerializedFieldsEqual(other);
     }
 }

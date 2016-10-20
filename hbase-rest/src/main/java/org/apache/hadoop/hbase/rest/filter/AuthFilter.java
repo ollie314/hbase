@@ -32,8 +32,8 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.Strings;
-import org.apache.hadoop.net.DNS;
 import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.authentication.server.AuthenticationFilter;
 
@@ -72,7 +72,9 @@ public class AuthFilter extends AuthenticationFilter {
             throw new ServletException("Failed to retrieve server principal", ie);
           }
         }
-        LOG.debug("Setting property " + name + "=" + value);
+        if (LOG.isTraceEnabled()) {
+          LOG.trace("Setting property " + name + "=" + value);
+        }
         name = name.substring(REST_PREFIX_LEN);
         props.setProperty(name, value);
       }

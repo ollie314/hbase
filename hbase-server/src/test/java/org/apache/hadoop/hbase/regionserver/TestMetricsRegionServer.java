@@ -17,9 +17,11 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.CompatibilityFactory;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.test.MetricsAssertHelper;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.util.JvmPauseMonitor;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -59,6 +61,10 @@ public class TestMetricsRegionServer {
     HELPER.assertGauge("regionServerStartTime", 100, serverSource);
     HELPER.assertGauge("regionCount", 101, serverSource);
     HELPER.assertGauge("storeCount", 2, serverSource);
+    HELPER.assertGauge("maxStoreFileAge", 2, serverSource);
+    HELPER.assertGauge("minStoreFileAge", 2, serverSource);
+    HELPER.assertGauge("avgStoreFileAge", 2, serverSource);
+    HELPER.assertGauge("numReferenceFiles", 2, serverSource);
     HELPER.assertGauge("hlogFileCount", 10, serverSource);
     HELPER.assertGauge("hlogFileSize", 1024000, serverSource);
     HELPER.assertGauge("storeFileCount", 300, serverSource);
@@ -85,6 +91,7 @@ public class TestMetricsRegionServer {
     HELPER.assertCounter("blockCacheEvictionCount", 418, serverSource);
     HELPER.assertGauge("blockCountHitPercent", 98, serverSource);
     HELPER.assertGauge("blockCacheExpressHitPercent", 97, serverSource);
+    HELPER.assertCounter("blockCacheFailedInsertionCount", 36, serverSource);
     HELPER.assertCounter("updatesBlockedTime", 419, serverSource);
   }
 
@@ -129,6 +136,24 @@ public class TestMetricsRegionServer {
     HELPER.assertCounter("slowGetCount", 14, serverSource);
     HELPER.assertCounter("slowIncrementCount", 15, serverSource);
     HELPER.assertCounter("slowPutCount", 16, serverSource);
+  }
+
+  @Test
+  public void testPauseMonitor() {
+    Configuration conf = new Configuration();
+    conf.setLong(JvmPauseMonitor.INFO_THRESHOLD_KEY, 1000L);
+    conf.setLong(JvmPauseMonitor.WARN_THRESHOLD_KEY, 10000L);
+    JvmPauseMonitor monitor = new JvmPauseMonitor(conf, serverSource);
+    monitor.updateMetrics(1500, false);
+    HELPER.assertCounter("pauseInfoThresholdExceeded", 1, serverSource);
+    HELPER.assertCounter("pauseWarnThresholdExceeded", 0, serverSource);
+    HELPER.assertCounter("pauseTimeWithoutGc_num_ops", 1, serverSource);
+    HELPER.assertCounter("pauseTimeWithGc_num_ops", 0, serverSource);
+    monitor.updateMetrics(15000, true);
+    HELPER.assertCounter("pauseInfoThresholdExceeded", 1, serverSource);
+    HELPER.assertCounter("pauseWarnThresholdExceeded", 1, serverSource);
+    HELPER.assertCounter("pauseTimeWithoutGc_num_ops", 1, serverSource);
+    HELPER.assertCounter("pauseTimeWithGc_num_ops", 1, serverSource);
   }
 }
 

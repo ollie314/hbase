@@ -22,25 +22,32 @@ import java.io.IOException;
 import java.util.Comparator;
 import java.util.List;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
-import org.apache.hadoop.hbase.classification.InterfaceStability;
+import org.apache.commons.lang.ClassUtils;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.Coprocessor;
 import org.apache.hadoop.hbase.CoprocessorEnvironment;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.MetaMutationAnnotation;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
-import org.apache.hadoop.hbase.coprocessor.CoprocessorService;
 import org.apache.hadoop.hbase.coprocessor.ObserverContext;
 import org.apache.hadoop.hbase.coprocessor.RegionServerCoprocessorEnvironment;
 import org.apache.hadoop.hbase.coprocessor.RegionServerObserver;
 import org.apache.hadoop.hbase.coprocessor.SingletonCoprocessorService;
+import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.WALEntry;
+import org.apache.hadoop.hbase.replication.ReplicationEndpoint;
 
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.COPROC)
 @InterfaceStability.Evolving
 public class RegionServerCoprocessorHost extends
     CoprocessorHost<RegionServerCoprocessorHost.RegionServerEnvironment> {
+
+  private static final Log LOG = LogFactory.getLog(RegionServerCoprocessorHost.class);
 
   private RegionServerServices rsServices;
 
@@ -49,7 +56,16 @@ public class RegionServerCoprocessorHost extends
     super(rsServices);
     this.rsServices = rsServices;
     this.conf = conf;
-    // load system default cp's from configuration.
+    // Log the state of coprocessor loading here; should appear only once or
+    // twice in the daemon log, depending on HBase version, because there is
+    // only one RegionServerCoprocessorHost instance in the RS process
+    boolean coprocessorsEnabled = conf.getBoolean(COPROCESSORS_ENABLED_CONF_KEY,
+      DEFAULT_COPROCESSORS_ENABLED);
+    boolean tableCoprocessorsEnabled = conf.getBoolean(USER_COPROCESSORS_ENABLED_CONF_KEY,
+      DEFAULT_USER_COPROCESSORS_ENABLED);
+    LOG.info("System coprocessor loading is " + (coprocessorsEnabled ? "enabled" : "disabled"));
+    LOG.info("Table coprocessor loading is " +
+      ((coprocessorsEnabled && tableCoprocessorsEnabled) ? "enabled" : "disabled"));
     loadSystemCoprocessors(conf, REGIONSERVER_COPROCESSOR_CONF_KEY);
   }
 
@@ -61,7 +77,9 @@ public class RegionServerCoprocessorHost extends
   }
 
   public void preStop(String message) throws IOException {
-    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+    // While stopping the region server all coprocessors method should be executed first then the
+    // coprocessor should be cleaned up.
+    execShutdown(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
       @Override
       public void call(RegionServerObserver oserver,
           ObserverContext<RegionServerCoprocessorEnvironment> ctx) throws IOException {
@@ -158,8 +176,71 @@ public class RegionServerCoprocessorHost extends
     });
   }
 
-  private static abstract class CoprocessorOperation
-      extends ObserverContext<RegionServerCoprocessorEnvironment> {
+  public void preReplicateLogEntries(final List<WALEntry> entries, final CellScanner cells)
+      throws IOException {
+    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+      @Override
+      public void call(RegionServerObserver oserver,
+          ObserverContext<RegionServerCoprocessorEnvironment> ctx) throws IOException {
+        oserver.preReplicateLogEntries(ctx, entries, cells);
+      }
+    });
+  }
+
+  public void postReplicateLogEntries(final List<WALEntry> entries, final CellScanner cells)
+      throws IOException {
+    execOperation(coprocessors.isEmpty() ? null : new CoprocessorOperation() {
+      @Override
+      public void call(RegionServerObserver oserver,
+          ObserverContext<RegionServerCoprocessorEnvironment> ctx) throws IOException {
+        oserver.postReplicateLogEntries(ctx, entries, cells);
+      }
+    });
+  }
+
+  public ReplicationEndpoint postCreateReplicationEndPoint(final ReplicationEndpoint endpoint)
+      throws IOException {
+    return execOperationWithResult(endpoint, coprocessors.isEmpty() ? null
+        : new CoprocessOperationWithResult<ReplicationEndpoint>() {
+          @Override
+          public void call(RegionServerObserver oserver,
+              ObserverContext<RegionServerCoprocessorEnvironment> ctx) throws IOException {
+            try {
+              oserver.getClass().getDeclaredMethod("postCreateReplicationEndPoint",
+                  ObserverContext.class, ReplicationEndpoint.class);
+            } catch (NoSuchMethodException e) {
+              LOG.warn("The RegionServer Observer class "
+                  + oserver.getClass().getName()
+                  + " does not have the"
+                  + "method postCreateReplicationEndPoint(). Consider upgrading inorder to replicate visibility"
+                  + " labels as strings");
+              setResult(endpoint);
+              return;
+            } catch (SecurityException e) {
+              LOG.warn("The RegionServer Observer class "
+                  + oserver.getClass().getName()
+                  + " does not have the"
+                  + "method postCreateReplicationEndPoint(). Consider upgrading inorder to replicate visibility"
+                  + " labels as strings");
+              setResult(endpoint);
+              return;
+            }
+            setResult(oserver.postCreateReplicationEndPoint(ctx, getResult()));
+          }
+        });
+  }
+
+  private <T> T execOperationWithResult(final T defaultValue,
+      final CoprocessOperationWithResult<T> ctx) throws IOException {
+    if (ctx == null)
+      return defaultValue;
+    ctx.setResult(defaultValue);
+    execOperation(ctx);
+    return ctx.getResult();
+  }
+
+  private static abstract class CoprocessorOperation extends
+      ObserverContext<RegionServerCoprocessorEnvironment> {
     public CoprocessorOperation() {
     }
 
@@ -170,11 +251,24 @@ public class RegionServerCoprocessorHost extends
     }
   }
 
+  private static abstract class CoprocessOperationWithResult<T> extends CoprocessorOperation {
+    private T result = null;
+
+    public void setResult(final T result) {
+      this.result = result;
+    }
+
+    public T getResult() {
+      return this.result;
+    }
+  }
+
   private boolean execOperation(final CoprocessorOperation ctx) throws IOException {
     if (ctx == null) return false;
-
     boolean bypass = false;
-    for (RegionServerEnvironment env: coprocessors) {
+    List<RegionServerEnvironment> envs = coprocessors.get();
+    for (int i = 0; i < envs.size(); i++) {
+      RegionServerEnvironment env = envs.get(i);
       if (env.getInstance() instanceof RegionServerObserver) {
         ctx.prepare(env);
         Thread currentThread = Thread.currentThread();
@@ -198,6 +292,53 @@ public class RegionServerCoprocessorHost extends
   }
 
   /**
+   * RegionServer coprocessor classes can be configured in any order, based on that priority is set
+   * and chained in a sorted order. For preStop(), coprocessor methods are invoked in call() and
+   * environment is shutdown in postEnvCall(). <br>
+   * Need to execute all coprocessor methods first then postEnvCall(), otherwise some coprocessors
+   * may remain shutdown if any exception occurs during next coprocessor execution which prevent
+   * RegionServer stop. (Refer:
+   * <a href="https://issues.apache.org/jira/browse/HBASE-16663">HBASE-16663</a>
+   * @param ctx CoprocessorOperation
+   * @return true if bypaas coprocessor execution, false if not.
+   * @throws IOException
+   */
+  private boolean execShutdown(final CoprocessorOperation ctx) throws IOException {
+    if (ctx == null) return false;
+    boolean bypass = false;
+    List<RegionServerEnvironment> envs = coprocessors.get();
+    int envsSize = envs.size();
+    // Iterate the coprocessors and execute CoprocessorOperation's call()
+    for (int i = 0; i < envsSize; i++) {
+      RegionServerEnvironment env = envs.get(i);
+      if (env.getInstance() instanceof RegionServerObserver) {
+        ctx.prepare(env);
+        Thread currentThread = Thread.currentThread();
+        ClassLoader cl = currentThread.getContextClassLoader();
+        try {
+          currentThread.setContextClassLoader(env.getClassLoader());
+          ctx.call((RegionServerObserver) env.getInstance(), ctx);
+        } catch (Throwable e) {
+          handleCoprocessorThrowable(env, e);
+        } finally {
+          currentThread.setContextClassLoader(cl);
+        }
+        bypass |= ctx.shouldBypass();
+        if (ctx.shouldComplete()) {
+          break;
+        }
+      }
+    }
+
+    // Iterate the coprocessors and execute CoprocessorOperation's postEnvCall()
+    for (int i = 0; i < envsSize; i++) {
+      RegionServerEnvironment env = envs.get(i);
+      ctx.postEnvCall(env);
+    }
+    return bypass;
+  }
+
+  /**
    * Coprocessor environment extension providing access to region server
    * related services.
    */
@@ -211,9 +352,11 @@ public class RegionServerCoprocessorHost extends
         final Configuration conf, final RegionServerServices services) {
       super(impl, priority, seq, conf);
       this.regionServerServices = services;
-      for (Class c : implClass.getInterfaces()) {
+      for (Object itf : ClassUtils.getAllInterfaces(implClass)) {
+        Class<?> c = (Class<?>) itf;
         if (SingletonCoprocessorService.class.isAssignableFrom(c)) {
-          this.regionServerServices.registerService(((SingletonCoprocessorService) impl).getService());
+          this.regionServerServices.registerService(
+            ((SingletonCoprocessorService) impl).getService());
           break;
         }
       }

@@ -25,6 +25,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.SequenceInputStream;
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -256,6 +257,7 @@ public class HFile {
     protected KVComparator comparator = KeyValue.COMPARATOR;
     protected InetSocketAddress[] favoredNodes;
     private HFileContext fileContext;
+    protected boolean shouldDropBehind = false;
 
     WriterFactory(Configuration conf, CacheConfig cacheConf) {
       this.conf = conf;
@@ -293,6 +295,12 @@ public class HFile {
       return this;
     }
 
+    public WriterFactory withShouldDropCacheBehind(boolean shouldDropBehind) {
+      this.shouldDropBehind = shouldDropBehind;
+      return this;
+    }
+
+
     public Writer create() throws IOException {
       if ((path != null ? 1 : 0) + (ostream != null ? 1 : 0) != 1) {
         throw new AssertionError("Please specify exactly one of " +
@@ -300,6 +308,23 @@ public class HFile {
       }
       if (path != null) {
         ostream = AbstractHFileWriter.createOutputStream(conf, fs, path, favoredNodes);
+        try {
+          Class<? extends FSDataOutputStream> outStreamClass = ostream.getClass();
+          try {
+            Method m = outStreamClass.getDeclaredMethod("setDropBehind",
+              new Class[]{ boolean.class });
+            m.invoke(ostream, new Object[] {
+              shouldDropBehind && cacheConf.shouldDropBehindCompaction() });
+          } catch (NoSuchMethodException e) {
+            // Not supported, we can just ignore it
+          } catch (Exception e) {
+            if (LOG.isDebugEnabled()) {
+              LOG.debug("Failed to invoke output stream's setDropBehind method, continuing");
+            }
+          }
+        } catch (UnsupportedOperationException uoe) {
+          LOG.debug("Unable to set drop behind on " + path, uoe);
+        }
       }
       return createWriter(fs, path, ostream,
                    comparator, fileContext);
@@ -515,6 +540,47 @@ public class HFile {
       throws IOException {
     FSDataInputStreamWrapper wrapper = new FSDataInputStreamWrapper(fsdis);
     return pickReaderVersion(path, wrapper, size, cacheConf, null, conf);
+  }
+
+  /**
+   * Returns true if the specified file has a valid HFile Trailer.
+   * @param fs filesystem
+   * @param path Path to file to verify
+   * @return true if the file has a valid HFile Trailer, otherwise false
+   * @throws IOException if failed to read from the underlying stream
+   */
+  public static boolean isHFileFormat(final FileSystem fs, final Path path) throws IOException {
+    return isHFileFormat(fs, fs.getFileStatus(path));
+  }
+
+  /**
+   * Returns true if the specified file has a valid HFile Trailer.
+   * @param fs filesystem
+   * @param fileStatus the file to verify
+   * @return true if the file has a valid HFile Trailer, otherwise false
+   * @throws IOException if failed to read from the underlying stream
+   */
+  public static boolean isHFileFormat(final FileSystem fs, final FileStatus fileStatus)
+      throws IOException {
+    final Path path = fileStatus.getPath();
+    final long size = fileStatus.getLen();
+    FSDataInputStreamWrapper fsdis = new FSDataInputStreamWrapper(fs, path);
+    try {
+      boolean isHBaseChecksum = fsdis.shouldUseHBaseChecksum();
+      assert !isHBaseChecksum; // Initially we must read with FS checksum.
+      FixedFileTrailer.readFromStream(fsdis.getStream(isHBaseChecksum), size);
+      return true;
+    } catch (IllegalArgumentException e) {
+      return false;
+    } catch (IOException e) {
+      throw e;
+    } finally {
+      try {
+        fsdis.close();
+      } catch (Throwable t) {
+        LOG.warn("Error closing fsdis FSDataInputStreamWrapper: " + path, t);
+      }
+    }
   }
 
   /**

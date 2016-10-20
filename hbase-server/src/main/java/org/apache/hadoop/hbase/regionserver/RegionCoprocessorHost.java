@@ -26,14 +26,14 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Matcher;
 
 import org.apache.commons.collections.map.AbstractReferenceMap;
 import org.apache.commons.collections.map.ReferenceMap;
+import org.apache.commons.lang.ClassUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.commons.math.stat.descriptive.DescriptiveStatistics;
@@ -49,6 +49,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
+import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.client.Append;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
@@ -58,6 +59,7 @@ import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorService;
 import org.apache.hadoop.hbase.coprocessor.EndpointObserver;
@@ -75,7 +77,9 @@ import org.apache.hadoop.hbase.regionserver.HRegion.Operation;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest;
 import org.apache.hadoop.hbase.regionserver.wal.HLogKey;
 import org.apache.hadoop.hbase.regionserver.wal.WALEdit;
+import org.apache.hadoop.hbase.util.BoundedConcurrentLinkedQueue;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.CoprocessorClassLoader;
 import org.apache.hadoop.hbase.util.Pair;
 
 import com.google.common.collect.ImmutableList;
@@ -97,7 +101,11 @@ public class RegionCoprocessorHost
   private static ReferenceMap sharedDataMap =
       new ReferenceMap(AbstractReferenceMap.HARD, AbstractReferenceMap.WEAK);
 
+  // optimization: no need to call postScannerFilterRow, if no coprocessor implements it
+  private final boolean hasCustomPostScannerFilterRow;
+
   /**
+   * 
    * Encapsulation of the environment of each coprocessor
    */
   static class RegionEnvironment extends CoprocessorHost.Environment
@@ -107,8 +115,8 @@ public class RegionCoprocessorHost
     private RegionServerServices rsServices;
     ConcurrentMap<String, Object> sharedData;
     private static final int LATENCY_BUFFER_SIZE = 100;
-    private final BlockingQueue<Long> coprocessorTimeNanos = new ArrayBlockingQueue<Long>(
-        LATENCY_BUFFER_SIZE);
+    private final BoundedConcurrentLinkedQueue<Long> coprocessorTimeNanos =
+        new BoundedConcurrentLinkedQueue<Long>(LATENCY_BUFFER_SIZE);
 
     /**
      * Constructor
@@ -155,6 +163,42 @@ public class RegionCoprocessorHost
       return latencies;
     }
 
+    @Override
+    public HRegionInfo getRegionInfo() {
+      return region.getRegionInfo();
+    }
+
+  }
+
+  static class TableCoprocessorAttribute {
+    private Path path;
+    private String className;
+    private int priority;
+    private Configuration conf;
+
+    public TableCoprocessorAttribute(Path path, String className, int priority,
+        Configuration conf) {
+      this.path = path;
+      this.className = className;
+      this.priority = priority;
+      this.conf = conf;
+    }
+
+    public Path getPath() {
+      return path;
+    }
+
+    public String getClassName() {
+      return className;
+    }
+
+    public int getPriority() {
+      return priority;
+    }
+
+    public Configuration getConf() {
+      return conf;
+    }
   }
 
   /** The region server services */
@@ -186,17 +230,44 @@ public class RegionCoprocessorHost
 
     // load Coprocessor From HDFS
     loadTableCoprocessors(conf);
+
+    // now check whether any coprocessor implements postScannerFilterRow
+    boolean hasCustomPostScannerFilterRow = false;
+    out: for (RegionEnvironment env: coprocessors) {
+      if (env.getInstance() instanceof RegionObserver) {
+        Class<?> clazz = env.getInstance().getClass();
+        for(;;) {
+          if (clazz == null) {
+            // we must have directly implemented RegionObserver
+            hasCustomPostScannerFilterRow = true;
+            break out;
+          }
+          if (clazz == BaseRegionObserver.class) {
+            // we reached BaseRegionObserver, try next coprocessor
+            break;
+          }
+          try {
+            clazz.getDeclaredMethod("postScannerFilterRow", ObserverContext.class,
+              InternalScanner.class, byte[].class, int.class, short.class, boolean.class);
+            // this coprocessor has a custom version of postScannerFilterRow
+            hasCustomPostScannerFilterRow = true;
+            break out;
+          } catch (NoSuchMethodException ignore) {
+          }
+          clazz = clazz.getSuperclass();
+        }
+      }
+    }
+    this.hasCustomPostScannerFilterRow = hasCustomPostScannerFilterRow;
   }
 
-  void loadTableCoprocessors(final Configuration conf) {
-    // scan the table attributes for coprocessor load specifications
-    // initialize the coprocessors
-    List<RegionEnvironment> configured = new ArrayList<RegionEnvironment>();
-    for (Map.Entry<ImmutableBytesWritable,ImmutableBytesWritable> e:
-        region.getTableDesc().getValues().entrySet()) {
+  static List<TableCoprocessorAttribute> getTableCoprocessorAttrsFromSchema(Configuration conf,
+      HTableDescriptor htd) {
+    List<TableCoprocessorAttribute> result = Lists.newArrayList();
+    for (Map.Entry<ImmutableBytesWritable, ImmutableBytesWritable> e: htd.getValues().entrySet()) {
       String key = Bytes.toString(e.getKey().get()).trim();
-      String spec = Bytes.toString(e.getValue().get()).trim();
       if (HConstants.CP_HTD_ATTR_KEY_PATTERN.matcher(key).matches()) {
+        String spec = Bytes.toString(e.getValue().get()).trim();
         // found one
         try {
           Matcher matcher = HConstants.CP_HTD_ATTR_VALUE_PATTERN.matcher(spec);
@@ -206,6 +277,11 @@ public class RegionCoprocessorHost
             Path path = matcher.group(1).trim().isEmpty() ?
                 null : new Path(matcher.group(1).trim());
             String className = matcher.group(2).trim();
+            if (className.isEmpty()) {
+              LOG.error("Malformed table coprocessor specification: key=" +
+                key + ", spec: " + spec);
+              continue;
+            }
             int priority = matcher.group(3).trim().isEmpty() ?
                 Coprocessor.PRIORITY_USER : Integer.valueOf(matcher.group(3));
             String cfgSpec = null;
@@ -215,7 +291,7 @@ public class RegionCoprocessorHost
               // ignore
             }
             Configuration ourConf;
-            if (cfgSpec != null) {
+            if (cfgSpec != null && !cfgSpec.trim().equals("|")) {
               cfgSpec = cfgSpec.substring(cfgSpec.indexOf('|') + 1);
               // do an explicit deep copy of the passed configuration
               ourConf = new Configuration(false);
@@ -227,20 +303,7 @@ public class RegionCoprocessorHost
             } else {
               ourConf = conf;
             }
-            // Load encompasses classloading and coprocessor initialization
-            try {
-              RegionEnvironment env = load(path, className, priority, ourConf);
-              configured.add(env);
-              LOG.info("Loaded coprocessor " + className + " from HTD of " +
-                region.getTableDesc().getTableName().getNameAsString() + " successfully.");
-            } catch (Throwable t) {
-              // Coprocessor failed to load, do we abort on error?
-              if (conf.getBoolean(ABORT_ON_ERROR_KEY, DEFAULT_ABORT_ON_ERROR)) {
-                abortServer(className, t);
-              } else {
-                LOG.error("Failed to load coprocessor " + className, t);
-              }
-            }
+            result.add(new TableCoprocessorAttribute(path, className, priority, ourConf));
           } else {
             LOG.error("Malformed table coprocessor specification: key=" + key +
               ", spec: " + spec);
@@ -248,6 +311,73 @@ public class RegionCoprocessorHost
         } catch (Exception ioe) {
           LOG.error("Malformed table coprocessor specification: key=" + key +
             ", spec: " + spec);
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Sanity check the table coprocessor attributes of the supplied schema. Will
+   * throw an exception if there is a problem.
+   * @param conf
+   * @param htd
+   * @throws IOException
+   */
+  public static void testTableCoprocessorAttrs(final Configuration conf,
+      final HTableDescriptor htd) throws IOException {
+    String pathPrefix = UUID.randomUUID().toString();
+    for (TableCoprocessorAttribute attr: getTableCoprocessorAttrsFromSchema(conf, htd)) {
+      if (attr.getPriority() < 0) {
+        throw new IOException("Priority for coprocessor " + attr.getClassName() +
+          " cannot be less than 0");
+      }
+      ClassLoader old = Thread.currentThread().getContextClassLoader();
+      try {
+        ClassLoader cl;
+        if (attr.getPath() != null) {
+          cl = CoprocessorClassLoader.getClassLoader(attr.getPath(),
+            CoprocessorHost.class.getClassLoader(), pathPrefix, conf);
+        } else {
+          cl = CoprocessorHost.class.getClassLoader();
+        }
+        Thread.currentThread().setContextClassLoader(cl);
+        cl.loadClass(attr.getClassName());
+      } catch (ClassNotFoundException e) {
+        throw new IOException("Class " + attr.getClassName() + " cannot be loaded", e);
+      } finally {
+        Thread.currentThread().setContextClassLoader(old);
+      }
+    }
+  }
+
+  void loadTableCoprocessors(final Configuration conf) {
+    boolean coprocessorsEnabled = conf.getBoolean(COPROCESSORS_ENABLED_CONF_KEY,
+      DEFAULT_COPROCESSORS_ENABLED);
+    boolean tableCoprocessorsEnabled = conf.getBoolean(USER_COPROCESSORS_ENABLED_CONF_KEY,
+      DEFAULT_USER_COPROCESSORS_ENABLED);
+    if (!(coprocessorsEnabled && tableCoprocessorsEnabled)) {
+      return;
+    }
+
+    // scan the table attributes for coprocessor load specifications
+    // initialize the coprocessors
+    List<RegionEnvironment> configured = new ArrayList<RegionEnvironment>();
+    for (TableCoprocessorAttribute attr: getTableCoprocessorAttrsFromSchema(conf, 
+        region.getTableDesc())) {
+      // Load encompasses classloading and coprocessor initialization
+      try {
+        RegionEnvironment env = load(attr.getPath(), attr.getClassName(), attr.getPriority(),
+          attr.getConf());
+        configured.add(env);
+        LOG.info("Loaded coprocessor " + attr.getClassName() + " from HTD of " +
+            region.getTableDesc().getTableName().getNameAsString() + " successfully.");
+      } catch (Throwable t) {
+        // Coprocessor failed to load, do we abort on error?
+        if (conf.getBoolean(ABORT_ON_ERROR_KEY, DEFAULT_ABORT_ON_ERROR)) {
+          abortServer(attr.getClassName(), t);
+        } else {
+          LOG.error("Failed to load coprocessor " + attr.getClassName(), t);
         }
       }
     }
@@ -263,7 +393,8 @@ public class RegionCoprocessorHost
     // uses a different way to be registered and executed.
     // It uses a visitor pattern to invoke registered Endpoint
     // method.
-    for (Class<?> c : implClass.getInterfaces()) {
+    for (Object itf : ClassUtils.getAllInterfaces(implClass)) {
+      Class<?> c = (Class<?>) itf;
       if (CoprocessorService.class.isAssignableFrom(c)) {
         region.registerService( ((CoprocessorService)instance).getService() );
       }
@@ -1264,6 +1395,8 @@ public class RegionCoprocessorHost
    */
   public boolean postScannerFilterRow(final InternalScanner s, final byte[] currentRow,
       final int offset, final short length) throws IOException {
+    // short circuit for performance
+    if (!hasCustomPostScannerFilterRow) return true;
     return execOperationWithResult(true,
         coprocessors.isEmpty() ? null : new RegionOperationWithResult<Boolean>() {
       @Override
@@ -1586,7 +1719,9 @@ public class RegionCoprocessorHost
   private boolean execOperation(final boolean earlyExit, final CoprocessorOperation ctx)
       throws IOException {
     boolean bypass = false;
-    for (RegionEnvironment env: coprocessors) {
+    List<RegionEnvironment> envs = coprocessors.get();
+    for (int i = 0; i < envs.size(); i++) {
+      RegionEnvironment env = envs.get(i);
       Coprocessor observer = env.getInstance();
       if (ctx.hasCall(observer)) {
         long startTime = System.nanoTime();

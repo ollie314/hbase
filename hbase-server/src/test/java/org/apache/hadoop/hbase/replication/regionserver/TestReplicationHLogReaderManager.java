@@ -26,7 +26,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
 import org.apache.hadoop.hbase.regionserver.wal.HLogFactory;
@@ -47,7 +47,6 @@ import org.junit.runners.Parameterized.Parameters;
 
 import static org.junit.Assert.*;
 
-import java.io.EOFException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -226,7 +225,7 @@ public class TestReplicationHLogReaderManager {
     public void postLogArchive(Path oldPath, Path newPath) throws IOException {}
 
     @Override
-    public void logRollRequested() {}
+    public void logRollRequested(boolean tooFewReplicas) {}
 
     @Override
     public void logCloseRequested() {}

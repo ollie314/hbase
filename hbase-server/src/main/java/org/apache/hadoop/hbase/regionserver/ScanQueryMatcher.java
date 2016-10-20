@@ -22,6 +22,7 @@ package org.apache.hadoop.hbase.regionserver;
 import java.io.IOException;
 import java.util.NavigableSet;
 
+import org.apache.hadoop.hbase.KeyValue.Type;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HConstants;
@@ -100,6 +101,10 @@ public class ScanQueryMatcher {
   private final long earliestPutTs;
   private final long ttl;
 
+  /** The oldest timestamp we are interested in, based on TTL */
+  private final long oldestUnexpiredTS;
+  private final long now;
+
   /** readPoint over which the KVs are unconditionally included */
   protected long maxReadPointToTrackVersions;
 
@@ -152,7 +157,7 @@ public class ScanQueryMatcher {
    */
   public ScanQueryMatcher(Scan scan, ScanInfo scanInfo, NavigableSet<byte[]> columns,
       ScanType scanType, long readPointToUse, long earliestPutTs, long oldestUnexpiredTS,
-      RegionCoprocessorHost regionCoprocessorHost) throws IOException {
+      long now, RegionCoprocessorHost regionCoprocessorHost) throws IOException {
     this.tr = scan.getTimeRange();
     this.rowComparator = scanInfo.getComparator();
     this.regionCoprocessorHost = regionCoprocessorHost;
@@ -162,6 +167,9 @@ public class ScanQueryMatcher {
         scanInfo.getFamily());
     this.filter = scan.getFilter();
     this.earliestPutTs = earliestPutTs;
+    this.oldestUnexpiredTS = oldestUnexpiredTS;
+    this.now = now;
+
     this.maxReadPointToTrackVersions = readPointToUse;
     this.timeToPurgeDeletes = scanInfo.getTimeToPurgeDeletes();
     this.ttl = oldestUnexpiredTS;
@@ -195,9 +203,8 @@ public class ScanQueryMatcher {
 
       // We can share the ExplicitColumnTracker, diff is we reset
       // between rows, not between storefiles.
-      byte[] attr = scan.getAttribute(Scan.HINT_LOOKAHEAD);
       this.columns = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(), maxVersions,
-          oldestUnexpiredTS, attr == null ? 0 : Bytes.toInt(attr));
+          oldestUnexpiredTS);
     }
     this.isReversed = scan.isReversed();
   }
@@ -216,18 +223,18 @@ public class ScanQueryMatcher {
    * @param scanInfo The store's immutable scan info
    * @param columns
    * @param earliestPutTs Earliest put seen in any of the store files.
-   * @param oldestUnexpiredTS the oldest timestamp we are interested in,
-   *  based on TTL
+   * @param oldestUnexpiredTS the oldest timestamp we are interested in, based on TTL
+   * @param now the current server time
    * @param dropDeletesFromRow The inclusive left bound of the range; can be EMPTY_START_ROW.
    * @param dropDeletesToRow The exclusive right bound of the range; can be EMPTY_END_ROW.
    * @param regionCoprocessorHost 
    * @throws IOException 
    */
   public ScanQueryMatcher(Scan scan, ScanInfo scanInfo, NavigableSet<byte[]> columns,
-      long readPointToUse, long earliestPutTs, long oldestUnexpiredTS, byte[] dropDeletesFromRow,
+      long readPointToUse, long earliestPutTs, long oldestUnexpiredTS, long now, byte[] dropDeletesFromRow,
       byte[] dropDeletesToRow, RegionCoprocessorHost regionCoprocessorHost) throws IOException {
     this(scan, scanInfo, columns, ScanType.COMPACT_RETAIN_DELETES, readPointToUse, earliestPutTs,
-        oldestUnexpiredTS, regionCoprocessorHost);
+        oldestUnexpiredTS, now, regionCoprocessorHost);
     Preconditions.checkArgument((dropDeletesFromRow != null) && (dropDeletesToRow != null));
     this.dropDeletesFromRow = dropDeletesFromRow;
     this.dropDeletesToRow = dropDeletesToRow;
@@ -237,10 +244,10 @@ public class ScanQueryMatcher {
    * Constructor for tests
    */
   ScanQueryMatcher(Scan scan, ScanInfo scanInfo,
-      NavigableSet<byte[]> columns, long oldestUnexpiredTS) throws IOException {
+      NavigableSet<byte[]> columns, long oldestUnexpiredTS, long now) throws IOException {
     this(scan, scanInfo, columns, ScanType.USER_SCAN,
           Long.MAX_VALUE, /* max Readpoint to track versions */
-        HConstants.LATEST_TIMESTAMP, oldestUnexpiredTS, null);
+        HConstants.LATEST_TIMESTAMP, oldestUnexpiredTS, now, null);
   }
 
   /**
@@ -299,7 +306,6 @@ public class ScanQueryMatcher {
       }
     }
 
-
     // optimize case.
     if (this.stickyNextRow)
         return MatchCode.SEEK_NEXT_ROW;
@@ -322,8 +328,13 @@ public class ScanQueryMatcher {
     long timestamp = Bytes.toLong(bytes, initialOffset + keyLength - KeyValue.TIMESTAMP_TYPE_SIZE);
     // check for early out based on timestamp alone
     if (columns.isDone(timestamp)) {
-        return columns.getNextRowOrNextColumn(bytes, offset, qualLength);
+      return columns.getNextRowOrNextColumn(kv.getQualifierArray(), kv.getQualifierOffset(),
+        kv.getQualifierLength());
     }
+    // check if the cell is expired by cell TTL
+    if (HStore.isCellTTLExpired(kv, this.oldestUnexpiredTS, this.now)) {
+      return MatchCode.SKIP;
+    }    
 
     /*
      * The delete logic is pretty complicated now.
@@ -400,7 +411,16 @@ public class ScanQueryMatcher {
         }
     }
 
-    int timestampComparison = tr.compare(timestamp);
+    // NOTE: Cryptic stuff!
+    // if the timestamp is HConstants.OLDEST_TIMESTAMP, then this is a fake cell made to prime a
+    // Scanner; See KeyValueUTil#createLastOnRow. This Cell should never end up returning out of
+    // here a matchcode of INCLUDE else we will return to the client a fake Cell. If we call
+    // TimeRange, it will return 0 because it doesn't deal in OLDEST_TIMESTAMP and we will fall
+    // into the later code where we could return a matchcode of INCLUDE. See HBASE-16074 "ITBLL
+    // fails, reports lost big or tiny families" for a horror story. Check here for
+    // OLDEST_TIMESTAMP. TimeRange#compare is about more generic timestamps, between 0L and
+    // Long.MAX_LONG. It doesn't do OLDEST_TIMESTAMP weird handling.
+    int timestampComparison = timestamp == HConstants.OLDEST_TIMESTAMP? -1: tr.compare(timestamp);
     if (timestampComparison >= 1) {
       return MatchCode.SKIP;
     } else if (timestampComparison <= -1) {
@@ -492,7 +512,7 @@ public class ScanQueryMatcher {
 
   public boolean moreRowsMayExistAfter(KeyValue kv) {
     if (this.isReversed) {
-      if (rowComparator.compareRows(kv.getBuffer(), kv.getRowOffset(),
+      if (rowComparator.compareRows(kv.getRowArray(), kv.getRowOffset(),
           kv.getRowLength(), stopRow, 0, stopRow.length) <= 0) {
         return false;
       } else {
@@ -500,7 +520,7 @@ public class ScanQueryMatcher {
       }
     }
     if (!Bytes.equals(stopRow , HConstants.EMPTY_END_ROW) &&
-        rowComparator.compareRows(kv.getBuffer(),kv.getRowOffset(),
+        rowComparator.compareRows(kv.getRowArray(),kv.getRowOffset(),
             kv.getRowLength(), stopRow, 0, stopRow.length) >= 0) {
       // KV >= STOPROW
       // then NO there is nothing left.
@@ -557,22 +577,56 @@ public class ScanQueryMatcher {
     ColumnCount nextColumn = columns.getColumnHint();
     if (nextColumn == null) {
       return KeyValue.createLastOnRow(
-          kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
-          kv.getBuffer(), kv.getFamilyOffset(), kv.getFamilyLength(),
-          kv.getBuffer(), kv.getQualifierOffset(), kv.getQualifierLength());
+          kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+          kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
+          kv.getQualifierArray(), kv.getQualifierOffset(), kv.getQualifierLength());
     } else {
       return KeyValue.createFirstOnRow(
-          kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
-          kv.getBuffer(), kv.getFamilyOffset(), kv.getFamilyLength(),
+          kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+          kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
           nextColumn.getBuffer(), nextColumn.getOffset(), nextColumn.getLength());
     }
   }
 
   public KeyValue getKeyForNextRow(KeyValue kv) {
     return KeyValue.createLastOnRow(
-        kv.getBuffer(), kv.getRowOffset(), kv.getRowLength(),
-        null, 0, 0,
-        null, 0, 0);
+      kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+      null, 0, 0,
+      null, 0, 0);
+  }
+
+  /**
+   * @param nextIndexed the key of the next entry in the block index (if any)
+   * @param kv The Cell we're using to calculate the seek key
+   * @return result of the compare between the indexed key and the key portion of the passed cell
+   */
+  public int compareKeyForNextRow(byte[] nextIndexed, Cell kv) {
+    return rowComparator.compareKey(nextIndexed, 0, nextIndexed.length,
+      kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+      null, 0, 0, null, 0, 0,
+      HConstants.OLDEST_TIMESTAMP, Type.Minimum.getCode());
+  }
+
+  /**
+   * @param nextIndexed the key of the next entry in the block index (if any)
+   * @param kv The Cell we're using to calculate the seek key
+   * @return result of the compare between the indexed key and the key portion of the passed cell
+   */
+  public int compareKeyForNextColumn(byte[] nextIndexed, Cell kv) {
+    ColumnCount nextColumn = columns.getColumnHint();
+    if (nextColumn == null) {
+      return rowComparator.compareKey(nextIndexed, 0, nextIndexed.length,
+        kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+        kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
+        kv.getQualifierArray(), kv.getQualifierOffset(), kv.getQualifierLength(),
+        HConstants.OLDEST_TIMESTAMP, Type.Minimum.getCode());
+    } else {
+      return rowComparator.compareKey(nextIndexed, 0, nextIndexed.length,
+        kv.getRowArray(), kv.getRowOffset(), kv.getRowLength(),
+        kv.getFamilyArray(), kv.getFamilyOffset(), kv.getFamilyLength(),
+        nextColumn.getBuffer(), nextColumn.getOffset(), nextColumn.getLength(),
+        HConstants.LATEST_TIMESTAMP, Type.Maximum.getCode());
+    }
   }
 
   //Used only for testing purposes

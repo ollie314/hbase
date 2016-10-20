@@ -42,7 +42,7 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HTable;
@@ -142,7 +142,7 @@ public class TestFSErrorsExposed {
       cacheConf, BloomType.NONE);
 
     List<StoreFileScanner> scanners = StoreFileScanner.getScannersForStoreFiles(
-        Collections.singletonList(sf), false, true, false,
+        Collections.singletonList(sf), false, true, false, false,
         // 0 is passed as readpoint because this test operates on StoreFile directly
         0);
     KeyValueScanner scanner = scanners.get(0);

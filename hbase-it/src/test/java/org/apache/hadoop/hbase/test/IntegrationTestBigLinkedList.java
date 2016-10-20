@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase.test;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -48,7 +49,7 @@ import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.IntegrationTestBase;
 import org.apache.hadoop.hbase.IntegrationTestingUtility;
-import org.apache.hadoop.hbase.IntegrationTests;
+import org.apache.hadoop.hbase.testclassification.IntegrationTests;
 import org.apache.hadoop.hbase.fs.HFileSystem;
 import org.apache.hadoop.hbase.MasterNotRunningException;
 import org.apache.hadoop.hbase.TableName;
@@ -152,7 +153,7 @@ import com.google.common.collect.Sets;
  * UNREFERENCED are· ok, any UNDEFINED counts are bad. Do not run at the· same
  * time as the Generator.
  *
- * Walker - A standalong program that start following a linked list· and emits timing info.··
+ * Walker - A standalone program that start following a linked list· and emits timing info.··
  *
  * Print - A standalone program that prints nodes in the linked list
  *
@@ -194,7 +195,7 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
 
   protected int NUM_SLAVES_BASE = 3; // number of slaves for the cluster
 
-  private static final int MISSING_ROWS_TO_LOG = 50;
+  private static final int MISSING_ROWS_TO_LOG = 10; // YARN complains when too many counters
 
   private static final int WIDTH_DEFAULT = 1000000;
   private static final int WRAP_DEFAULT = 25;
@@ -216,6 +217,11 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
   static class Generator extends Configured implements Tool {
 
     private static final Log LOG = LogFactory.getLog(Generator.class);
+
+    public static final String USAGE =  "Usage : " + Generator.class.getSimpleName() +
+            " <num mappers> <num nodes per map> <tmp output dir> [<width> <wrap multiplier> \n" +
+            "where <num nodes per map> should be a multiple of width*wrap multiplier, " +
+            "25M by default \n";
 
     static class GeneratorInputFormat extends InputFormat<BytesWritable,NullWritable> {
       static class GeneratorInputSplit extends InputSplit implements Writable {
@@ -265,7 +271,8 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
         public void initialize(InputSplit arg0, TaskAttemptContext context)
             throws IOException, InterruptedException {
           numNodes = context.getConfiguration().getLong(GENERATOR_NUM_ROWS_PER_MAP_KEY, 25000000);
-          rand = new Random();
+          // Use SecureRandom to avoid issue described in HBASE-13382.
+          rand = new SecureRandom();
         }
 
         @Override
@@ -312,8 +319,8 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
      *                _________________________
      *               |                  ______ |
      *               |                 |      ||
-     *             __+_________________+_____ ||
-     *             v v                 v     |||
+     *             .-+-----------------+-----.||
+     *             | |                 |     |||
      * first   = [ . . . . . . . . . . . ]   |||
      *             ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^     |||
      *             | | | | | | | | | | |     |||
@@ -325,8 +332,8 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
      * ...                                   |||
      *                                       |||
      * last    = [ . . . . . . . . . . . ]   |||
-     *             | | | | | | | | | | |-----|||
-     *             |                 |--------||
+     *             ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^_____|||
+     *             |                 |________||
      *             |___________________________|
      */
     static class GeneratorMapper
@@ -432,20 +439,19 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
     @Override
     public int run(String[] args) throws Exception {
       if (args.length < 3) {
-        System.out.println("Usage : " + Generator.class.getSimpleName() +
-            " <num mappers> <num nodes per map> <tmp output dir> [<width> <wrap multiplier>]");
-        System.out.println("   where <num nodes per map> should be a multiple of " +
-            " width*wrap multiplier, 25M by default");
-        return 0;
+        System.err.println(USAGE);
+        return 1;
       }
 
       int numMappers = Integer.parseInt(args[0]);
       long numNodes = Long.parseLong(args[1]);
       Path tmpOutput = new Path(args[2]);
       Integer width = (args.length < 4) ? null : Integer.parseInt(args[3]);
-      Integer wrapMuplitplier = (args.length < 5) ? null : Integer.parseInt(args[4]);
-      return run(numMappers, numNodes, tmpOutput, width, wrapMuplitplier);
+      Integer wrapMultiplier = (args.length < 5) ? null : Integer.parseInt(args[4]);
+      return run(numMappers, numNodes, tmpOutput, width, wrapMultiplier);
     }
+
+
 
     protected void createSchema() throws IOException {
       Configuration conf = getConf();
@@ -547,12 +553,22 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
     }
 
     public int run(int numMappers, long numNodes, Path tmpOutput,
-        Integer width, Integer wrapMuplitplier) throws Exception {
-      int ret = runRandomInputGenerator(numMappers, numNodes, tmpOutput, width, wrapMuplitplier);
+        Integer width, Integer wrapMultiplier) throws Exception {
+      long wrap = (long)width*wrapMultiplier;
+      if (wrap < numNodes && numNodes % wrap != 0) {
+        /**
+         *  numNodes should be a multiple of width*wrapMultiplier.
+         *  If numNodes less than wrap, wrap will be set to be equal with numNodes,
+         *  See {@link GeneratorMapper#setup(Mapper.Context)}
+         * */
+        System.err.println(USAGE);
+        return 1;
+      }
+      int ret = runRandomInputGenerator(numMappers, numNodes, tmpOutput, width, wrapMultiplier);
       if (ret > 0) {
         return ret;
       }
-      return runGenerator(numMappers, numNodes, tmpOutput, width, wrapMuplitplier);
+      return runGenerator(numMappers, numNodes, tmpOutput, width, wrapMultiplier);
     }
   }
 
@@ -705,7 +721,23 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
 
       boolean success = job.waitForCompletion(true);
 
-      return success ? 0 : 1;
+      if (success) {
+        Counters counters = job.getCounters();
+        if (null == counters) {
+          LOG.warn("Counters were null, cannot verify Job completion");
+          // We don't have access to the counters to know if we have "bad" counts
+          return 0;
+        }
+
+        // If we find no unexpected values, the job didn't outright fail
+        if (verifyUnexpectedValues(counters)) {
+          // We didn't check referenced+unreferenced counts, leave that to visual inspection
+          return 0;
+        }
+      }
+
+      // We failed
+      return 1;
     }
 
     @SuppressWarnings("deprecation")
@@ -716,13 +748,34 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
 
       Counters counters = job.getCounters();
 
-      Counter referenced = counters.findCounter(Counts.REFERENCED);
-      Counter unreferenced = counters.findCounter(Counts.UNREFERENCED);
-      Counter undefined = counters.findCounter(Counts.UNDEFINED);
-      Counter multiref = counters.findCounter(Counts.EXTRAREFERENCES);
+      // Run through each check, even if we fail one early
+      boolean success = verifyExpectedValues(expectedReferenced, counters);
 
+      if (!verifyUnexpectedValues(counters)) {
+        // We found counter objects which imply failure
+        success = false;
+      }
+
+      if (!success) {
+        handleFailure(counters);
+      }
+      return success;
+    }
+
+    /**
+     * Verify the values in the Counters against the expected number of entries written.
+     *
+     * @param expectedReferenced
+     *          Expected number of referenced entrires
+     * @param counters
+     *          The Job's Counters object
+     * @return True if the values match what's expected, false otherwise
+     */
+    protected boolean verifyExpectedValues(long expectedReferenced, Counters counters) {
+      final Counter referenced = counters.findCounter(Counts.REFERENCED);
+      final Counter unreferenced = counters.findCounter(Counts.UNREFERENCED);
       boolean success = true;
-      //assert
+
       if (expectedReferenced != referenced.getValue()) {
         LOG.error("Expected referenced count does not match with actual referenced count. " +
             "expected referenced=" + expectedReferenced + " ,actual=" + referenced.getValue());
@@ -730,20 +783,32 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
       }
 
       if (unreferenced.getValue() > 0) {
+        final Counter multiref = counters.findCounter(Counts.EXTRAREFERENCES);
         boolean couldBeMultiRef = (multiref.getValue() == unreferenced.getValue());
         LOG.error("Unreferenced nodes were not expected. Unreferenced count=" + unreferenced.getValue()
             + (couldBeMultiRef ? "; could be due to duplicate random numbers" : ""));
         success = false;
       }
 
+      return success;
+    }
+
+    /**
+     * Verify that the Counters don't contain values which indicate an outright failure from the Reducers.
+     *
+     * @param counters
+     *          The Job's counters
+     * @return True if the "bad" counter objects are 0, false otherwise
+     */
+    protected boolean verifyUnexpectedValues(Counters counters) {
+      final Counter undefined = counters.findCounter(Counts.UNDEFINED);
+      boolean success = true;
+
       if (undefined.getValue() > 0) {
         LOG.error("Found an undefined node. Undefined count=" + undefined.getValue());
         success = false;
       }
 
-      if (!success) {
-        handleFailure(counters);
-      }
       return success;
     }
 
@@ -965,7 +1030,7 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
       if (cmd.hasOption('n')) {
         maxQueries = Long.parseLong(cmd.getOptionValue("n"));
       }
-      Random rand = new Random();
+      Random rand = new SecureRandom();
       boolean isSpecificStart = cmd.hasOption('s');
       byte[] startKey = isSpecificStart ? Bytes.toBytesBinary(cmd.getOptionValue('s')) : null;
       int logEvery = cmd.hasOption('l') ? Integer.parseInt(cmd.getOptionValue('l')) : 1;
@@ -1124,25 +1189,22 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
 
   private void usage() {
     System.err.println("Usage: " + this.getClass().getSimpleName() + " COMMAND [COMMAND options]");
-    System.err.println("  where COMMAND is one of:");
-    System.err.println("");
-    System.err.println("  Generator                  A map only job that generates data.");
-    System.err.println("  Verify                     A map reduce job that looks for holes");
-    System.err.println("                             Look at the counts after running");
-    System.err.println("                             REFERENCED and UNREFERENCED are ok");
-    System.err.println("                             any UNDEFINED counts are bad. Do not");
-    System.err.println("                             run at the same time as the Generator.");
-    System.err.println("  Walker                     A standalong program that starts ");
-    System.err.println("                             following a linked list and emits");
-    System.err.println("                             timing info.");
-    System.err.println("  Print                      A standalone program that prints nodes");
-    System.err.println("                             in the linked list.");
-    System.err.println("  Delete                     A standalone program that deletes a·");
-    System.err.println("                             single node.");
-    System.err.println("  Loop                       A program to Loop through Generator and");
-    System.err.println("                             Verify steps");
-    System.err.println("  Clean                      A program to clean all left over detritus.");
-    System.err.println("\t  ");
+    printCommands();
+  }
+
+  private void printCommands() {
+    System.err.println("Commands:");
+    System.err.println(" Generator  Map only job that generates data.");
+    System.err.println(" Verify     A map reduce job that looks for holes. Check return code and");
+    System.err.println("            look at the counts after running. See REFERENCED and");
+    System.err.println("            UNREFERENCED are ok. Any UNDEFINED counts are bad. Do not run");
+    System.err.println("            with the Generator.");
+    System.err.println(" Walker     " +
+      "Standalong program that starts following a linked list & emits timing info.");
+    System.err.println(" Print      Standalone program that prints nodes in the linked list.");
+    System.err.println(" Delete     Standalone program that deletes a·single node.");
+    System.err.println(" Loop       Program to Loop through Generator and Verify steps");
+    System.err.println(" Clean      Program to clean all left over detritus.");
     System.err.flush();
   }
 
@@ -1152,7 +1214,9 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
     String[] args = cmd.getArgs();
     //get the class, run with the conf
     if (args.length < 1) {
-      printUsage();
+      printUsage(this.getClass().getSimpleName() +
+        " <general options> COMMAND [<COMMAND options>]", "General options:", "");
+      printCommands();
       throw new RuntimeException("Incorrect Number of args.");
     }
     toRun = args[0];
@@ -1165,19 +1229,19 @@ public class IntegrationTestBigLinkedList extends IntegrationTestBase {
     Tool tool = null;
     if (toRun.equals("Generator")) {
       tool = new Generator();
-    } else if (toRun.equals("Verify")) {
+    } else if (toRun.equalsIgnoreCase("Verify")) {
       tool = new Verify();
-    } else if (toRun.equals("Loop")) {
+    } else if (toRun.equalsIgnoreCase("Loop")) {
       Loop loop = new Loop();
       loop.it = this;
       tool = loop;
-    } else if (toRun.equals("Walker")) {
+    } else if (toRun.equalsIgnoreCase("Walker")) {
       tool = new Walker();
-    } else if (toRun.equals("Print")) {
+    } else if (toRun.equalsIgnoreCase("Print")) {
       tool = new Print();
-    } else if (toRun.equals("Delete")) {
+    } else if (toRun.equalsIgnoreCase("Delete")) {
       tool = new Delete();
-    } else if (toRun.equals("Clean")) {
+    } else if (toRun.equalsIgnoreCase("Clean")) {
       tool = new Clean();
     } else {
       usage();

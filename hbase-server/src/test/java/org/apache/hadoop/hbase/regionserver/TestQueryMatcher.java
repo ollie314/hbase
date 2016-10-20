@@ -21,29 +21,37 @@ package org.apache.hadoop.hbase.regionserver;
 
 import static org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode.INCLUDE;
 import static org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode.SKIP;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NavigableSet;
 
-import org.apache.hadoop.hbase.HBaseTestCase;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeepDeletedCells;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.KVComparator;
 import org.apache.hadoop.hbase.KeyValue.Type;
-import org.apache.hadoop.hbase.SmallTests;
+import org.apache.hadoop.hbase.KeyValueUtil;
 import org.apache.hadoop.hbase.client.Get;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.regionserver.ScanQueryMatcher.MatchCode;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+import org.junit.Before;
+import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
 @Category(SmallTests.class)
-public class TestQueryMatcher extends HBaseTestCase {
+public class TestQueryMatcher {
   private static final boolean PRINT = false;
+  private Configuration conf;
 
   private byte[] row1;
   private byte[] row2;
@@ -64,8 +72,9 @@ public class TestQueryMatcher extends HBaseTestCase {
   KVComparator rowComparator;
   private Scan scan;
 
+  @Before
   public void setUp() throws Exception {
-    super.setUp();
+    this.conf = HBaseConfiguration.create();
     row1 = Bytes.toBytes("row1");
     row2 = Bytes.toBytes("row2");
     row3 = Bytes.toBytes("row3");
@@ -88,14 +97,33 @@ public class TestQueryMatcher extends HBaseTestCase {
     this.scan = new Scan(get);
 
     rowComparator = KeyValue.COMPARATOR;
-
   }
 
-    private void _testMatch_ExplicitColumns(Scan scan, List<MatchCode> expected) throws IOException {
-    // 2,4,5    
+  /**
+   * This is a cryptic test. It is checking that we don't include a fake cell, one that has a
+   * timestamp of {@link HConstants#OLDEST_TIMESTAMP}. See HBASE-16074 for background.
+   * @throws IOException
+   */
+  @Test
+  public void testNeverIncludeFakeCell() throws IOException {
+    long now = EnvironmentEdgeManager.currentTimeMillis();
+    // Do with fam2 which has a col2 qualifier.
+    ScanQueryMatcher qm = new ScanQueryMatcher(scan,
+        new ScanInfo(fam2, 10, 1, ttl, KeepDeletedCells.FALSE, 0, rowComparator),
+        get.getFamilyMap().get(fam2), now - ttl, now);
+    Cell kv = new KeyValue(row1, fam2, col2, 1, data);
+    Cell cell = KeyValueUtil.createLastOnRowCol(kv);
+    qm.setRow(kv.getRowArray(), kv.getRowOffset(), kv.getRowLength());
+    MatchCode code = qm.match(KeyValueUtil.ensureKeyValue(cell));
+    assertFalse(code.compareTo(MatchCode.SEEK_NEXT_COL) != 0);
+  }
+
+  private void _testMatch_ExplicitColumns(Scan scan, List<MatchCode> expected) throws IOException {
+    long now = EnvironmentEdgeManager.currentTimeMillis();
+    // 2,4,5
     ScanQueryMatcher qm = new ScanQueryMatcher(scan, new ScanInfo(fam2,
         0, 1, ttl, KeepDeletedCells.FALSE, 0, rowComparator), get.getFamilyMap().get(fam2),
-        EnvironmentEdgeManager.currentTimeMillis() - ttl);
+        now - ttl, now);
 
     List<KeyValue> memstore = new ArrayList<KeyValue>();
     memstore.add(new KeyValue(row1, fam2, col1, 1, data));
@@ -124,6 +152,7 @@ public class TestQueryMatcher extends HBaseTestCase {
     }
   }
 
+  @Test
   public void testMatch_ExplicitColumns()
   throws IOException {
     //Moving up from the Tracker by using Gets and List<KeyValue> instead
@@ -141,26 +170,7 @@ public class TestQueryMatcher extends HBaseTestCase {
     _testMatch_ExplicitColumns(scan, expected);
   }
 
-  public void testMatch_ExplicitColumnsWithLookAhead()
-  throws IOException {
-    //Moving up from the Tracker by using Gets and List<KeyValue> instead
-    //of just byte []
-
-    //Expected result
-    List<MatchCode> expected = new ArrayList<ScanQueryMatcher.MatchCode>();
-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL);
-    expected.add(ScanQueryMatcher.MatchCode.SKIP);
-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_COL);
-    expected.add(ScanQueryMatcher.MatchCode.INCLUDE_AND_SEEK_NEXT_ROW);
-    expected.add(ScanQueryMatcher.MatchCode.DONE);
-
-    Scan s = new Scan(scan);
-    s.setAttribute(Scan.HINT_LOOKAHEAD, Bytes.toBytes(2));
-    _testMatch_ExplicitColumns(s, expected);
-  }
-
-
+  @Test
   public void testMatch_Wildcard()
   throws IOException {
     //Moving up from the Tracker by using Gets and List<KeyValue> instead
@@ -175,9 +185,10 @@ public class TestQueryMatcher extends HBaseTestCase {
     expected.add(ScanQueryMatcher.MatchCode.INCLUDE);
     expected.add(ScanQueryMatcher.MatchCode.DONE);
 
+    long now = EnvironmentEdgeManager.currentTimeMillis();
     ScanQueryMatcher qm = new ScanQueryMatcher(scan, new ScanInfo(fam2,
         0, 1, ttl, KeepDeletedCells.FALSE, 0, rowComparator), null,
-        EnvironmentEdgeManager.currentTimeMillis() - ttl);
+        now - ttl, now);
 
     List<KeyValue> memstore = new ArrayList<KeyValue>();
     memstore.add(new KeyValue(row1, fam2, col1, 1, data));
@@ -215,6 +226,7 @@ public class TestQueryMatcher extends HBaseTestCase {
    *
    * @throws IOException
    */
+  @Test
   public void testMatch_ExpiredExplicit()
   throws IOException {
 
@@ -231,7 +243,7 @@ public class TestQueryMatcher extends HBaseTestCase {
     long now = EnvironmentEdgeManager.currentTimeMillis();
     ScanQueryMatcher qm = new ScanQueryMatcher(scan, new ScanInfo(fam2,
         0, 1, testTTL, KeepDeletedCells.FALSE, 0, rowComparator), get.getFamilyMap().get(fam2),
-        now - testTTL);
+        now - testTTL, now);
 
     KeyValue [] kvs = new KeyValue[] {
         new KeyValue(row1, fam2, col1, now-100, data),
@@ -260,7 +272,6 @@ public class TestQueryMatcher extends HBaseTestCase {
     }
   }
 
-
   /**
    * Verify that {@link ScanQueryMatcher} only skips expired KeyValue
    * instances and does not exit early from the row (skipping
@@ -269,6 +280,7 @@ public class TestQueryMatcher extends HBaseTestCase {
    *
    * @throws IOException
    */
+  @Test
   public void testMatch_ExpiredWildcard()
   throws IOException {
 
@@ -285,7 +297,7 @@ public class TestQueryMatcher extends HBaseTestCase {
     long now = EnvironmentEdgeManager.currentTimeMillis();
     ScanQueryMatcher qm = new ScanQueryMatcher(scan, new ScanInfo(fam2,
         0, 1, testTTL, KeepDeletedCells.FALSE, 0, rowComparator), null,
-        now - testTTL);
+        now - testTTL, now);
 
     KeyValue [] kvs = new KeyValue[] {
         new KeyValue(row1, fam2, col1, now-100, data),
@@ -314,6 +326,7 @@ public class TestQueryMatcher extends HBaseTestCase {
     }
   }
 
+  @Test
   public void testMatch_PartialRangeDropDeletes() throws Exception {
     // Some ranges.
     testDropDeletes(
@@ -343,7 +356,7 @@ public class TestQueryMatcher extends HBaseTestCase {
     NavigableSet<byte[]> cols = get.getFamilyMap().get(fam2);
 
     ScanQueryMatcher qm = new ScanQueryMatcher(scan, scanInfo, cols, Long.MAX_VALUE,
-        HConstants.OLDEST_TIMESTAMP, HConstants.OLDEST_TIMESTAMP, from, to, null);
+        HConstants.OLDEST_TIMESTAMP, HConstants.OLDEST_TIMESTAMP, now, from, to, null);
     List<ScanQueryMatcher.MatchCode> actual =
         new ArrayList<ScanQueryMatcher.MatchCode>(rows.length);
     byte[] prevRow = null;
@@ -362,4 +375,3 @@ public class TestQueryMatcher extends HBaseTestCase {
     }
   }
 }
-

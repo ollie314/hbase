@@ -1,4 +1,3 @@
-/.arc_jira_lib
 /.externalToolBuilders
 .project
 *.settings/
@@ -14,3 +13,4 @@ hbase-*/test
 *.iws
 *.iml
 *.ipr
+patchprocess/

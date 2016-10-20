@@ -30,13 +30,14 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil;
-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.hbase.zookeeper.ZKUtil.ZKUtilOp;
+import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.zookeeper.KeeperException;
 
 /**
@@ -60,6 +61,7 @@ import org.apache.zookeeper.KeeperException;
  *
  * /hbase/replication/rs/hostname.example.org,6020,1234/1/23522342.23422 [VALUE: 254]
  */
+@InterfaceAudience.Private
 public class ReplicationQueuesZKImpl extends ReplicationStateZKBase implements ReplicationQueues {
 
   /** Znode containing all replication queues for this region server. */
@@ -297,9 +299,11 @@ public class ReplicationQueuesZKImpl extends ReplicationStateZKBase implements R
       for (String peerId : peerIdsToProcess) {
         ReplicationQueueInfo replicationQueueInfo = new ReplicationQueueInfo(peerId);
         if (!peerExists(replicationQueueInfo.getPeerId())) {
-          LOG.warn("Peer " + peerId + " didn't exist, skipping the replay");
-          // Protection against moving orphaned queues
-          continue;
+          // the orphaned queues must be moved, otherwise the delete op of dead rs will fail,
+          // this will cause the whole multi op fail.
+          // NodeFailoverWorker will skip the orphaned queues.
+          LOG.warn("Peer " + peerId
+              + " didn't exist, will move its queue to avoid the failure of multi op");
         }
         String newPeerId = peerId + "-" + znode;
         String newPeerZnode = ZKUtil.joinZNode(this.myQueuesZnode, newPeerId);
@@ -329,7 +333,9 @@ public class ReplicationQueuesZKImpl extends ReplicationStateZKBase implements R
         // add delete op for peer
         listOfOps.add(ZKUtilOp.deleteNodeFailSilent(oldClusterZnode));
       }
-      // add delete op for dead rs
+      // add delete op for dead rs, this will update the cversion of the parent.
+      // The reader will make optimistic locking with this to get a consistent
+      // snapshot
       listOfOps.add(ZKUtilOp.deleteNodeFailSilent(deadRSZnodePath));
       LOG.debug(" The multi list size is: " + listOfOps.size());
       ZKUtil.multiOrSequential(this.zookeeper, listOfOps, false);

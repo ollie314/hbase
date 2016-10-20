@@ -35,7 +35,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Coprocessor;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
+import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.Waiter.Predicate;
 import org.apache.hadoop.hbase.client.HTable;
@@ -43,11 +45,13 @@ import org.apache.hadoop.hbase.client.RetriesExhaustedWithDetailsException;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
 import org.apache.hadoop.hbase.io.hfile.HFile;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos;
 import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos.AccessControlService;
 import org.apache.hadoop.hbase.protobuf.generated.AccessControlProtos.CheckPermissionsRequest;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.security.AccessDeniedException;
 import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.security.access.Permission.Action;
 import org.apache.hadoop.hbase.util.JVMClusterUtil.RegionServerThread;
 
 import com.google.common.collect.Lists;
@@ -63,13 +67,7 @@ public class SecureTestUtil {
   private static final Log LOG = LogFactory.getLog(SecureTestUtil.class);
   private static final int WAIT_TIME = 10000;
 
-  public static void enableSecurity(Configuration conf) throws IOException {
-    conf.set("hadoop.security.authorization", "false");
-    conf.set("hadoop.security.authentication", "simple");
-    conf.set(CoprocessorHost.MASTER_COPROCESSOR_CONF_KEY, AccessController.class.getName());
-    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, AccessController.class.getName() +
-      "," + SecureBulkLoadEndpoint.class.getName());
-    conf.set(CoprocessorHost.REGIONSERVER_COPROCESSOR_CONF_KEY, AccessController.class.getName());
+  public static void configureSuperuser(Configuration conf) throws IOException {
     // The secure minicluster creates separate service principals based on the
     // current user's name, one for each slave. We need to add all of these to
     // the superuser list or security won't function properly. We expect the
@@ -84,15 +82,33 @@ public class SecureTestUtil {
       sb.append(currentUser); sb.append(".hfs."); sb.append(i);
     }
     conf.set("hbase.superuser", sb.toString());
+  }
+
+  public static void enableSecurity(Configuration conf) throws IOException {
+    conf.set("hadoop.security.authorization", "false");
+    conf.set("hadoop.security.authentication", "simple");
+    conf.set(CoprocessorHost.MASTER_COPROCESSOR_CONF_KEY, AccessController.class.getName());
+    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY, AccessController.class.getName() +
+      "," + SecureBulkLoadEndpoint.class.getName());
+    conf.set(CoprocessorHost.REGIONSERVER_COPROCESSOR_CONF_KEY, AccessController.class.getName());
     // Need HFile V3 for tags for security features
     conf.setInt(HFile.FORMAT_VERSION_KEY, 3);
+    configureSuperuser(conf);
   }
 
   public static void verifyConfiguration(Configuration conf) {
+    String coprocs = conf.get(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY);
+    boolean accessControllerLoaded = false;
+    for (String coproc : coprocs.split(",")) {
+      try {
+        accessControllerLoaded = AccessController.class.isAssignableFrom(Class.forName(coproc));
+        if (accessControllerLoaded) break;
+      } catch (ClassNotFoundException cnfe) {
+      }
+    }
     if (!(conf.get(CoprocessorHost.MASTER_COPROCESSOR_CONF_KEY).contains(
         AccessController.class.getName())
-        && conf.get(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY).contains(
-            AccessController.class.getName()) && conf.get(
+        && accessControllerLoaded && conf.get(
         CoprocessorHost.REGIONSERVER_COPROCESSOR_CONF_KEY).contains(
         AccessController.class.getName()))) {
       throw new RuntimeException("AccessController is missing from a system coprocessor list");
@@ -143,6 +159,7 @@ public class SecureTestUtil {
    */
   static interface AccessTestAction extends PrivilegedExceptionAction<Object> { }
 
+  /** This fails only in case of ADE or empty list for any of the actions */
   public static void verifyAllowed(User user, AccessTestAction... actions) throws Exception {
     for (AccessTestAction action : actions) {
       try {
@@ -159,6 +176,7 @@ public class SecureTestUtil {
     }
   }
 
+  /** This fails in case of ADE or empty list for any of the users. */
   public static void verifyAllowed(AccessTestAction action, User... users) throws Exception {
     for (User user : users) {
       verifyAllowed(user, action);
@@ -180,36 +198,53 @@ public class SecureTestUtil {
     }
   }
 
-  public static void verifyDeniedWithException(User user, AccessTestAction... actions)
-      throws Exception {
-    verifyDenied(user, true, actions);
-  }
-
-  public static void verifyDeniedWithException(AccessTestAction action, User... users)
-      throws Exception {
+  /** This passes only in case of ADE for all users. */
+  public static void verifyDenied(AccessTestAction action, User... users) throws Exception {
     for (User user : users) {
-      verifyDenied(user, true, action);
+      verifyDenied(user, action);
     }
   }
 
-  public static void verifyDenied(User user, AccessTestAction... actions) throws Exception {
-    verifyDenied(user, false, actions);
-  }
-
-  public static void verifyDenied(User user, boolean requireException,
-      AccessTestAction... actions) throws Exception {
-    for (AccessTestAction action : actions) {
+  /** This passes only in case of empty list for all users. */
+  public static void verifyIfEmptyList(AccessTestAction action, User... users) throws Exception {
+    for (User user : users) {
       try {
         Object obj = user.runAs(action);
-        if (requireException) {
-          fail("Expected exception was not thrown for user '" + user.getShortName() + "'");
-        }
         if (obj != null && obj instanceof List<?>) {
           List<?> results = (List<?>) obj;
           if (results != null && !results.isEmpty()) {
-            fail("Unexpected results for user '" + user.getShortName() + "'");
+            fail("Unexpected action results: " +  results + " for user '"
+                + user.getShortName() + "'");
           }
+        } else {
+          fail("Unexpected results for user '" + user.getShortName() + "'");
         }
+      } catch (AccessDeniedException ade) {
+        fail("Expected action to pass for user '" + user.getShortName() + "' but was denied");
+      }
+    }
+  }
+
+  /** This passes only in case of null for all users. */
+  public static void verifyIfNull(AccessTestAction  action, User... users) throws Exception {
+    for (User user : users) {
+      try {
+        Object obj = user.runAs(action);
+        if (obj != null) {
+          fail("Non null results from action for user '" + user.getShortName() + "'");
+        }
+      } catch (AccessDeniedException ade) {
+        fail("Expected action to pass for user '" + user.getShortName() + "' but was denied");
+      }
+    }
+  }
+
+  /** This passes only in case of ADE for all actions */
+  public static void verifyDenied(User user, AccessTestAction... actions) throws Exception {
+    for (AccessTestAction action : actions) {
+      try {
+        user.runAs(action);
+        fail("Expected exception was not thrown for user '" + user.getShortName() + "'");
       } catch (IOException e) {
         boolean isAccessDeniedException = false;
         if(e instanceof RetriesExhaustedWithDetailsException) {
@@ -252,12 +287,6 @@ public class SecureTestUtil {
         }
         fail("Expected exception was not thrown for user '" + user.getShortName() + "'");
       }
-    }
-  }
-
-  public static void verifyDenied(AccessTestAction action, User... users) throws Exception {
-    for (User user : users) {
-      verifyDenied(user, action);
     }
   }
 
@@ -502,6 +531,27 @@ public class SecureTestUtil {
   }
 
   /**
+   * Grant global permissions to the given user using AccessControlClient. Will wait until all
+   * active AccessController instances have updated their permissions caches or will
+   * throw an exception upon timeout (10 seconds).
+   */
+  public static void grantGlobalUsingAccessControlClient(final HBaseTestingUtility util,
+      final Configuration conf, final String user, final Permission.Action... actions)
+      throws Exception {
+    SecureTestUtil.updateACLs(util, new Callable<Void>() {
+      @Override
+      public Void call() throws Exception {
+        try {
+          AccessControlClient.grant(conf, user, actions);
+        } catch (Throwable t) {
+          t.printStackTrace();
+        }
+        return null;
+      }
+    });
+  }
+
+  /**
    * Revoke permissions on a table from the given user. Will wait until all active
    * AccessController instances have updated their permissions caches or will
    * throw an exception upon timeout (10 seconds).
@@ -546,4 +596,98 @@ public class SecureTestUtil {
       }
     });
   }
+
+  /**
+   * Revoke global permissions from the given user using AccessControlClient. Will wait until
+   * all active AccessController instances have updated their permissions caches or will
+   * throw an exception upon timeout (10 seconds).
+   */
+  public static void revokeGlobalUsingAccessControlClient(final HBaseTestingUtility util,
+      final Configuration conf, final String user,final Permission.Action... actions)
+      throws Exception {
+    SecureTestUtil.updateACLs(util, new Callable<Void>() {
+      @Override
+      public Void call() throws Exception {
+        try {
+          AccessControlClient.revoke(conf, user, actions);
+        } catch (Throwable t) {
+          t.printStackTrace();
+        }
+        return null;
+      }
+    });
+  }
+
+  public static void createNamespace(HBaseTestingUtility testUtil, NamespaceDescriptor nsDesc)
+      throws Exception {
+    testUtil.getHBaseAdmin().createNamespace(nsDesc);
+  }
+
+  public static void deleteNamespace(HBaseTestingUtility testUtil, String namespace)
+      throws Exception {
+    testUtil.getHBaseAdmin().deleteNamespace(namespace);
+  }
+
+  public static String convertToNamespace(String namespace) {
+    return AccessControlLists.NAMESPACE_PREFIX + namespace;
+  }
+
+  public static void checkGlobalPerms(HBaseTestingUtility testUtil, Permission.Action... actions)
+      throws IOException {
+    Permission[] perms = new Permission[actions.length];
+    for (int i = 0; i < actions.length; i++) {
+      perms[i] = new Permission(actions[i]);
+    }
+    CheckPermissionsRequest.Builder request = CheckPermissionsRequest.newBuilder();
+    for (Action a : actions) {
+      request.addPermission(AccessControlProtos.Permission.newBuilder()
+          .setType(AccessControlProtos.Permission.Type.Global)
+          .setGlobalPermission(
+              AccessControlProtos.GlobalPermission.newBuilder()
+                  .addAction(ProtobufUtil.toPermissionAction(a)).build()));
+    }
+    HTable acl = new HTable(testUtil.getConfiguration(), AccessControlLists.ACL_TABLE_NAME);
+    try {
+      BlockingRpcChannel channel = acl.coprocessorService(new byte[0]);
+      AccessControlService.BlockingInterface protocol =
+        AccessControlService.newBlockingStub(channel);
+      try {
+        protocol.checkPermissions(null, request.build());
+      } catch (ServiceException se) {
+        ProtobufUtil.toIOException(se);
+      }
+    } finally {
+      acl.close();
+    }
+  }
+
+  public void checkTablePerms(HBaseTestingUtility testUtil, TableName table, byte[] family,
+      byte[] column, Permission.Action... actions) throws IOException {
+    Permission[] perms = new Permission[actions.length];
+    for (int i = 0; i < actions.length; i++) {
+      perms[i] = new TablePermission(table, family, column, actions[i]);
+    }
+    checkTablePerms(testUtil, table, perms);
+  }
+
+  public void checkTablePerms(HBaseTestingUtility testUtil, TableName table, Permission... perms)
+      throws IOException {
+    CheckPermissionsRequest.Builder request = CheckPermissionsRequest.newBuilder();
+    for (Permission p : perms) {
+      request.addPermission(ProtobufUtil.toPermission(p));
+    }
+    HTable acl = new HTable(testUtil.getConfiguration(), table);
+    try {
+      AccessControlService.BlockingInterface protocol =
+        AccessControlService.newBlockingStub(acl.coprocessorService(new byte[0]));
+      try {
+        protocol.checkPermissions(null, request.build());
+      } catch (ServiceException se) {
+        ProtobufUtil.toIOException(se);
+      }
+    } finally {
+      acl.close();
+    }
+  }
+
 }

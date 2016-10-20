@@ -18,6 +18,11 @@
  */
 package org.apache.hadoop.hbase.regionserver;
 
+import com.google.common.base.Function;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Ordering;
+
 import java.io.DataInput;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -33,7 +38,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
@@ -41,9 +45,10 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HDFSBlocksDistribution;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValue.KVComparator;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
-import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
+import org.apache.hadoop.hbase.io.TimeRange;
 import org.apache.hadoop.hbase.io.hfile.BlockType;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.HFile;
@@ -56,13 +61,7 @@ import org.apache.hadoop.hbase.util.BloomFilterFactory;
 import org.apache.hadoop.hbase.util.BloomFilterWriter;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.ChecksumType;
-import org.apache.hadoop.hbase.util.Writables;
 import org.apache.hadoop.io.WritableUtils;
-
-import com.google.common.base.Function;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Ordering;
 
 /**
  * A Store data file.  Stores usually have one or more of these files.  They
@@ -184,7 +183,6 @@ public class StoreFile {
     this(fs, new StoreFileInfo(conf, fs, p), conf, cacheConf, cfBloomType);
   }
 
-
   /**
    * Constructor, loads a reader and it's indices, etc. May allocate a
    * substantial amount of ram depending on the underlying files (10-20MB?).
@@ -231,6 +229,13 @@ public class StoreFile {
   }
 
   /**
+   * Clone a StoreFile for opening private reader.
+   */
+  public StoreFile cloneForReader() {
+    return new StoreFile(this);
+  }
+
+  /**
    * @return the StoreFile object associated to this StoreFile.
    *         null if the StoreFile is not a reference.
    */
@@ -253,11 +258,18 @@ public class StoreFile {
   }
 
   /**
-   * @return True if this is a StoreFile Reference; call after {@link #open()}
-   * else may get wrong answer.
+   * @return True if this is a StoreFile Reference; call
+   * after {@link #open(boolean canUseDropBehind)} else may get wrong answer.
    */
   public boolean isReference() {
     return this.fileInfo.isReference();
+  }
+
+  /**
+   * @return True if this is HFile.
+   */
+  public boolean isHFile() {
+    return this.fileInfo.isHFile(this.fileInfo.getPath());
   }
 
   /**
@@ -325,6 +337,10 @@ public class StoreFile {
     return max;
   }
 
+  public CacheConfig getCacheConf() {
+    return this.cacheConf;
+  }
+
   /**
    * Check if this storefile was created by bulk load.
    * When a hfile is bulk loaded into HBase, we append
@@ -335,7 +351,7 @@ public class StoreFile {
    * is turned off, fall back to BULKLOAD_TIME_KEY.
    * @return true if this storefile was created by bulk load.
    */
-  boolean isBulkLoadResult() {
+  public boolean isBulkLoadResult() {
     boolean bulkLoadedHFile = false;
     String fileName = this.getPath().getName();
     int startPos = fileName.indexOf("SeqId_");
@@ -367,13 +383,13 @@ public class StoreFile {
    * @throws IOException
    * @see #closeReader(boolean)
    */
-  private Reader open() throws IOException {
+  private Reader open(boolean canUseDropBehind) throws IOException {
     if (this.reader != null) {
       throw new IllegalAccessError("Already open");
     }
 
     // Open the StoreFile.Reader
-    this.reader = fileInfo.open(this.fs, this.cacheConf);
+    this.reader = fileInfo.open(this.fs, this.cacheConf, canUseDropBehind);
 
     // Load up indices and fileinfo. This also loads Bloom filter type.
     metadataMap = Collections.unmodifiableMap(this.reader.loadFileInfo());
@@ -450,30 +466,32 @@ public class StoreFile {
     reader.loadBloomfilter(BlockType.DELETE_FAMILY_BLOOM_META);
 
     try {
-      byte [] timerangeBytes = metadataMap.get(TIMERANGE_KEY);
-      if (timerangeBytes != null) {
-        this.reader.timeRangeTracker = new TimeRangeTracker();
-        Writables.copyWritable(timerangeBytes, this.reader.timeRangeTracker);
-      }
+      this.reader.timeRange = TimeRangeTracker.getTimeRange(metadataMap.get(TIMERANGE_KEY));
     } catch (IllegalArgumentException e) {
       LOG.error("Error reading timestamp range data from meta -- " +
           "proceeding without", e);
-      this.reader.timeRangeTracker = null;
+      this.reader.timeRange = null;
     }
     return this.reader;
+  }
+
+  public Reader createReader() throws IOException {
+    return createReader(false);
   }
 
   /**
    * @return Reader for StoreFile. creates if necessary
    * @throws IOException
    */
-  public Reader createReader() throws IOException {
+  public Reader createReader(boolean canUseDropBehind) throws IOException {
     if (this.reader == null) {
       try {
-        this.reader = open();
+        this.reader = open(canUseDropBehind);
       } catch (IOException e) {
         try {
-          this.closeReader(true);
+          boolean evictOnClose =
+              cacheConf != null? cacheConf.shouldEvictOnClose(): true;
+          this.closeReader(evictOnClose);
         } catch (IOException ee) {
         }
         throw e;
@@ -508,7 +526,9 @@ public class StoreFile {
    * @throws IOException
    */
   public void deleteReader() throws IOException {
-    closeReader(true);
+    boolean evictOnClose =
+        cacheConf != null? cacheConf.shouldEvictOnClose(): true;
+    closeReader(evictOnClose);
     this.fs.delete(getPath(), true);
   }
 
@@ -547,11 +567,25 @@ public class StoreFile {
     private Path filePath;
     private InetSocketAddress[] favoredNodes;
     private HFileContext fileContext;
+    private boolean shouldDropCacheBehind = false;
+    private TimeRangeTracker trt;
+
     public WriterBuilder(Configuration conf, CacheConfig cacheConf,
         FileSystem fs) {
       this.conf = conf;
       this.cacheConf = cacheConf;
       this.fs = fs;
+    }
+
+    /**
+     * @param trt A premade TimeRangeTracker to use rather than build one per append (building one
+     * of these is expensive so good to pass one in if you have one).
+     * @return this (for chained invocation)
+     */
+    public WriterBuilder withTimeRangeTracker(final TimeRangeTracker trt) {
+      Preconditions.checkNotNull(trt);
+      this.trt = trt;
+      return this;
     }
 
     /**
@@ -612,6 +646,11 @@ public class StoreFile {
       this.fileContext = fileContext;
       return this;
     }
+
+    public WriterBuilder withShouldDropCacheBehind(boolean shouldDropCacheBehind) {
+      this.shouldDropCacheBehind = shouldDropCacheBehind;
+      return this;
+    }
     /**
      * Create a store file writer. Client is responsible for closing file when
      * done. If metadata, add BEFORE closing using
@@ -642,7 +681,7 @@ public class StoreFile {
         comparator = KeyValue.COMPARATOR;
       }
       return new Writer(fs, filePath,
-          conf, cacheConf, comparator, bloomType, maxKeyCount, favoredNodes, fileContext);
+          conf, cacheConf, comparator, bloomType, maxKeyCount, favoredNodes, fileContext, trt);
     }
   }
 
@@ -661,10 +700,13 @@ public class StoreFile {
   }
 
   public Long getMinimumTimestamp() {
-    return (getReader().timeRangeTracker == null) ?
-        null :
-        getReader().timeRangeTracker.getMinimumTimestamp();
+    return getReader().timeRange == null? null: getReader().timeRange.getMin();
   }
+
+  public Long getMaximumTimestamp() {
+    return getReader().timeRange == null? null: getReader().timeRange.getMax();
+  }
+
 
   /**
    * Gets the approximate mid-point of this file that is optimal for use in splitting it.
@@ -715,21 +757,21 @@ public class StoreFile {
     private KeyValue lastDeleteFamilyKV = null;
     private long deleteFamilyCnt = 0;
 
-
     /** Checksum type */
     protected ChecksumType checksumType;
 
     /** Bytes per Checksum */
     protected int bytesPerChecksum;
 
-    TimeRangeTracker timeRangeTracker = new TimeRangeTracker();
-    /* isTimeRangeTrackerSet keeps track if the timeRange has already been set
-     * When flushing a memstore, we set TimeRange and use this variable to
-     * indicate that it doesn't need to be calculated again while
-     * appending KeyValues.
-     * It is not set in cases of compactions when it is recalculated using only
-     * the appended KeyValues*/
-    boolean isTimeRangeTrackerSet = false;
+    /**
+     * timeRangeTrackerSet is used to figure if we were passed a filled-out TimeRangeTracker or not.
+     * When flushing a memstore, we set the TimeRangeTracker that it accumulated during updates to
+     * memstore in here into this Writer and use this variable to indicate that we do not need to
+     * recalculate the timeRangeTracker bounds; it was done already as part of add-to-memstore.
+     * A completed TimeRangeTracker is not set in cases of compactions when it is recalculated.
+     */
+    private final boolean timeRangeTrackerSet;
+    final TimeRangeTracker timeRangeTracker;
 
     protected HFile.Writer writer;
 
@@ -752,6 +794,36 @@ public class StoreFile {
         final KVComparator comparator, BloomType bloomType, long maxKeys,
         InetSocketAddress[] favoredNodes, HFileContext fileContext)
             throws IOException {
+      this(fs, path, conf, cacheConf, comparator, bloomType, maxKeys, favoredNodes, fileContext,
+          null);
+    }
+
+    /**
+     * Creates an HFile.Writer that also write helpful meta data.
+     * @param fs file system to write to
+     * @param path file name to create
+     * @param conf user configuration
+     * @param comparator key comparator
+     * @param bloomType bloom filter setting
+     * @param maxKeys the expected maximum number of keys to be added. Was used
+     *        for Bloom filter size in {@link HFile} format version 1.
+     * @param favoredNodes
+     * @param fileContext - The HFile context
+   * @param trt Ready-made timetracker to use.
+     * @throws IOException problem writing to FS
+     */
+    private Writer(FileSystem fs, Path path,
+        final Configuration conf,
+        CacheConfig cacheConf,
+        final KVComparator comparator, BloomType bloomType, long maxKeys,
+        InetSocketAddress[] favoredNodes, HFileContext fileContext,
+        final TimeRangeTracker trt)
+            throws IOException {
+      // If passed a TimeRangeTracker, use it. Set timeRangeTrackerSet so we don't destroy it.
+      // TODO: put the state of the TRT on the TRT; i.e. make a read-only version (TimeRange) when
+      // it no longer writable.
+      this.timeRangeTrackerSet = trt != null;
+      this.timeRangeTracker = this.timeRangeTrackerSet? trt: new TimeRangeTracker();
       writer = HFile.getWriterFactory(conf, cacheConf)
           .withPath(fs, path)
           .withComparator(comparator)
@@ -813,15 +885,6 @@ public class StoreFile {
     }
 
     /**
-     * Set TimeRangeTracker
-     * @param trt
-     */
-    public void setTimeRangeTracker(final TimeRangeTracker trt) {
-      this.timeRangeTracker = trt;
-      isTimeRangeTrackerSet = true;
-    }
-
-    /**
      * Record the earlest Put timestamp.
      *
      * If the timeRangeTracker is not set,
@@ -832,7 +895,7 @@ public class StoreFile {
       if (KeyValue.Type.Put.getCode() == kv.getTypeByte()) {
         earliestPutTs = Math.min(earliestPutTs, kv.getTimestamp());
       }
-      if (!isTimeRangeTrackerSet) {
+      if (!timeRangeTrackerSet) {
         timeRangeTracker.includeTimestamp(kv);
       }
     }
@@ -1031,7 +1094,7 @@ public class StoreFile {
     protected BloomFilter deleteFamilyBloomFilter = null;
     protected BloomType bloomFilterType;
     private final HFile.Reader reader;
-    protected TimeRangeTracker timeRangeTracker = null;
+    protected TimeRange timeRange;
     protected long sequenceID = -1;
     private byte[] lastBloomKey;
     private long deleteFamilyCnt = -1;
@@ -1141,13 +1204,9 @@ public class StoreFile {
      *          determined by the column family's TTL
      * @return false if queried keys definitely don't exist in this StoreFile
      */
-    boolean passesTimerangeFilter(Scan scan, long oldestUnexpiredTS) {
-      if (timeRangeTracker == null) {
-        return true;
-      } else {
-        return timeRangeTracker.includesTimeRange(scan.getTimeRange()) &&
-            timeRangeTracker.getMaximumTimestamp() >= oldestUnexpiredTS;
-      }
+    boolean passesTimerangeFilter(TimeRange tr, long oldestUnexpiredTS) {
+      return this.timeRange == null? true:
+        this.timeRange.includesTimeRange(tr) && this.timeRange.getMax() >= oldestUnexpiredTS;
     }
 
     /**
@@ -1262,6 +1321,7 @@ public class StoreFile {
         case ROWCOL:
           key = bloomFilter.createBloomKey(row, rowOffset, rowLen, col,
               colOffset, colLen);
+
           break;
 
         default:
@@ -1298,7 +1358,7 @@ public class StoreFile {
             // columns, a file might be skipped if using row+col Bloom filter.
             // In order to ensure this file is included an additional check is
             // required looking only for a row bloom.
-            byte[] rowBloomKey = bloomFilter.createBloomKey(row, 0, row.length,
+            byte[] rowBloomKey = bloomFilter.createBloomKey(row, rowOffset, rowLen,
                 null, 0, 0);
 
             if (keyIsAfterLast
@@ -1538,7 +1598,7 @@ public class StoreFile {
     }
 
     public long getMaxTimestamp() {
-      return timeRangeTracker == null ? Long.MAX_VALUE : timeRangeTracker.getMaximumTimestamp();
+      return timeRange == null ? TimeRange.INITIAL_MAX_TIMESTAMP: timeRange.getMax();
     }
 
     public void setBulkLoaded(boolean bulkLoadResult) {
@@ -1570,6 +1630,19 @@ public class StoreFile {
           Ordering.natural().onResultOf(new GetPathName())
       ));
 
+    /**
+     * Comparator for time-aware compaction. SeqId is still the first
+     *   ordering criterion to maintain MVCC.
+     */
+    public static final Comparator<StoreFile> SEQ_ID_MAX_TIMESTAMP =
+      Ordering.compound(ImmutableList.of(
+        Ordering.natural().onResultOf(new GetSeqId()),
+        Ordering.natural().onResultOf(new GetMaxTimestamp()),
+        Ordering.natural().onResultOf(new GetFileSize()).reverse(),
+        Ordering.natural().onResultOf(new GetBulkTime()),
+        Ordering.natural().onResultOf(new GetPathName())
+      ));
+
     private static class GetSeqId implements Function<StoreFile, Long> {
       @Override
       public Long apply(StoreFile sf) {
@@ -1596,6 +1669,13 @@ public class StoreFile {
       @Override
       public String apply(StoreFile sf) {
         return sf.getPath().getName();
+      }
+    }
+
+    private static class GetMaxTimestamp implements Function<StoreFile, Long> {
+      @Override
+      public Long apply(StoreFile sf) {
+        return sf.getMaximumTimestamp() == null? (Long)Long.MAX_VALUE : sf.getMaximumTimestamp();
       }
     }
   }

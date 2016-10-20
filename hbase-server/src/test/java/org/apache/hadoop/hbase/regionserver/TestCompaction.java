@@ -36,6 +36,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -50,15 +51,19 @@ import org.apache.hadoop.hbase.HBaseTestCase.HRegionIncommon;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MediumTests;
 import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.io.hfile.HFileScanner;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionContext;
 import org.apache.hadoop.hbase.regionserver.compactions.CompactionRequest;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputController;
+import org.apache.hadoop.hbase.regionserver.compactions.CompactionThroughputControllerFactory;
 import org.apache.hadoop.hbase.regionserver.compactions.DefaultCompactor;
+import org.apache.hadoop.hbase.regionserver.compactions.NoLimitCompactionThroughputController;
 import org.apache.hadoop.hbase.regionserver.wal.HLog;
+import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Threads;
@@ -98,8 +103,10 @@ public class TestCompaction {
     super();
 
     // Set cache flush size to 1MB
-    conf.setInt(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, 1024*1024);
-    conf.setInt("hbase.hregion.memstore.block.multiplier", 100);
+    conf.setInt(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, 1024 * 1024);
+    conf.setInt(HConstants.HREGION_MEMSTORE_BLOCK_MULTIPLIER, 100);
+    conf.set(CompactionThroughputControllerFactory.HBASE_THROUGHPUT_CONTROLLER_KEY,
+      NoLimitCompactionThroughputController.class.getName());
     compactionThreshold = conf.getInt("hbase.hstore.compactionThreshold", 3);
 
     secondRowBytes = START_KEY_BYTES.clone();
@@ -284,11 +291,53 @@ public class TestCompaction {
 
     CountDownLatch latch = new CountDownLatch(1);
     TrackableCompactionRequest request = new TrackableCompactionRequest(latch);
-    thread.requestCompaction(r, store, "test custom comapction", Store.PRIORITY_USER, request);
+    thread.requestCompaction(r, store, "test custom comapction", Store.PRIORITY_USER, request,null);
     // wait for the latch to complete.
     latch.await();
 
     thread.interruptIfNecessary();
+  }
+
+  @Test
+  public void testCompactionFailure() throws Exception {
+    // setup a compact/split thread on a mock server
+    HRegionServer mockServer = Mockito.mock(HRegionServer.class);
+    Mockito.when(mockServer.getConfiguration()).thenReturn(r.getBaseConf());
+    CompactSplitThread thread = new CompactSplitThread(mockServer);
+    Mockito.when(mockServer.getCompactSplitThread()).thenReturn(thread);
+
+    // setup a region/store with some files
+    Store store = r.getStore(COLUMN_FAMILY);
+    createStoreFile(r);
+    for (int i = 0; i < HStore.DEFAULT_BLOCKING_STOREFILE_COUNT - 1; i++) {
+      createStoreFile(r);
+    }
+
+    HRegion mockRegion = Mockito.spy(r);
+    Mockito.when(mockRegion.checkSplit()).thenThrow(new IndexOutOfBoundsException());
+
+    MetricsRegionWrapper metricsWrapper = new MetricsRegionWrapperImpl(r);
+
+    long preCompletedCount = metricsWrapper.getNumCompactionsCompleted();
+    long preFailedCount = metricsWrapper.getNumCompactionsFailed();
+
+    CountDownLatch latch = new CountDownLatch(1);
+    TrackableCompactionRequest request = new TrackableCompactionRequest(latch);
+    thread.requestCompaction(mockRegion, store, "test custom comapction", Store.PRIORITY_USER,
+        request, null);
+    // wait for the latch to complete.
+    latch.await(120, TimeUnit.SECONDS);
+
+    // compaction should have completed and been marked as failed due to error in split request
+    long postCompletedCount = metricsWrapper.getNumCompactionsCompleted();
+    long postFailedCount = metricsWrapper.getNumCompactionsFailed();
+
+    assertTrue("Completed count should have increased (pre=" + preCompletedCount +
+        ", post="+postCompletedCount+")",
+        postCompletedCount > preCompletedCount);
+    assertTrue("Failed count should have increased (pre=" + preFailedCount +
+        ", post=" + postFailedCount + ")",
+        postFailedCount > preFailedCount);
   }
 
   /**
@@ -320,7 +369,7 @@ public class TestCompaction {
     }
 
     thread.requestCompaction(r, "test mulitple custom comapctions", Store.PRIORITY_USER,
-      Collections.unmodifiableList(requests));
+      Collections.unmodifiableList(requests), null);
 
     // wait for the latch to complete.
     latch.await();
@@ -358,7 +407,15 @@ public class TestCompaction {
       }
 
       @Override
-      public List<Path> compact() throws IOException {
+      public List<Path> compact(CompactionThroughputController throughputController)
+          throws IOException {
+        finishCompaction(this.selectedFiles);
+        return new ArrayList<Path>();
+      }
+
+      @Override
+      public List<Path> compact(CompactionThroughputController throughputController,
+        User user) throws IOException {
         finishCompaction(this.selectedFiles);
         return new ArrayList<Path>();
       }
@@ -409,12 +466,21 @@ public class TestCompaction {
       }
 
       @Override
-      public List<Path> compact() throws IOException {
+      public List<Path> compact(CompactionThroughputController throughputController)
+          throws IOException {
+        return compact(throughputController, null);
+      }
+
+      @Override
+      public List<Path> compact(CompactionThroughputController throughputController, User user)
+          throws IOException {
         try {
           isInCompact = true;
-          synchronized (this) { this.wait(); }
+          synchronized (this) {
+            this.wait();
+          }
         } catch (InterruptedException e) {
-           Assume.assumeNoException(e);
+          Assume.assumeNoException(e);
         }
         return new ArrayList<Path>();
       }
@@ -485,9 +551,12 @@ public class TestCompaction {
 
     // Set up the region mock that redirects compactions.
     HRegion r = mock(HRegion.class);
-    when(r.compact(any(CompactionContext.class), any(Store.class))).then(new Answer<Boolean>() {
+    when(
+      r.compact(any(CompactionContext.class), any(Store.class),
+        any(CompactionThroughputController.class), any(User.class))).then(new Answer<Boolean>() {
       public Boolean answer(InvocationOnMock invocation) throws Throwable {
-        ((CompactionContext)invocation.getArguments()[0]).compact();
+        ((CompactionContext)invocation.getArguments()[0]).compact(
+          (CompactionThroughputController)invocation.getArguments()[2]);
         return true;
       }
     });

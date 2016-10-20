@@ -24,10 +24,10 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.commons.math.stat.descriptive.DescriptiveStatistics;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.metrics.Interns;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
 import org.apache.hadoop.metrics2.impl.JmxCacheBuster;
 import org.apache.hadoop.metrics2.lib.DynamicMetricsRegistry;
-import org.apache.hadoop.metrics2.lib.Interns;
 import org.apache.hadoop.metrics2.lib.MutableCounterLong;
 import org.apache.hadoop.metrics2.lib.MutableHistogram;
 
@@ -89,10 +89,10 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
     regionAppend = registry.getLongCounter(regionAppendKey, 0l);
 
     regionGetKey = regionNamePrefix + MetricsRegionServerSource.GET_KEY;
-    regionGet = registry.newHistogram(regionGetKey);
+    regionGet = registry.newTimeHistogram(regionGetKey);
 
     regionScanNextKey = regionNamePrefix + MetricsRegionServerSource.SCAN_NEXT_KEY;
-    regionScanNext = registry.newHistogram(regionScanNextKey);
+    regionScanNext = registry.newTimeHistogram(regionScanNextKey);
   }
 
   @Override
@@ -183,12 +183,27 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
     mrb.addGauge(Interns.info(regionNamePrefix + MetricsRegionServerSource.STOREFILE_SIZE,
         MetricsRegionServerSource.STOREFILE_SIZE_DESC),
         this.regionWrapper.getStoreFileSize());
+    mrb.addGauge(Interns.info(regionNamePrefix + MetricsRegionServerSource.MAX_STORE_FILE_AGE,
+        MetricsRegionServerSource.MAX_STORE_FILE_AGE_DESC),
+        this.regionWrapper.getMaxStoreFileAge());
+    mrb.addGauge(Interns.info(regionNamePrefix + MetricsRegionServerSource.MIN_STORE_FILE_AGE,
+        MetricsRegionServerSource.MIN_STORE_FILE_AGE_DESC),
+        this.regionWrapper.getMinStoreFileAge());
+    mrb.addGauge(Interns.info(regionNamePrefix + MetricsRegionServerSource.AVG_STORE_FILE_AGE,
+        MetricsRegionServerSource.AVG_STORE_FILE_AGE_DESC),
+        this.regionWrapper.getAvgStoreFileAge());
+    mrb.addGauge(Interns.info(regionNamePrefix + MetricsRegionServerSource.NUM_REFERENCE_FILES,
+        MetricsRegionServerSource.NUM_REFERENCE_FILES_DESC),
+        this.regionWrapper.getNumReferenceFiles());
     mrb.addCounter(Interns.info(regionNamePrefix + MetricsRegionSource.COMPACTIONS_COMPLETED_COUNT,
         MetricsRegionSource.COMPACTIONS_COMPLETED_DESC),
         this.regionWrapper.getNumCompactionsCompleted());
     mrb.addCounter(Interns.info(regionNamePrefix + MetricsRegionSource.NUM_BYTES_COMPACTED_COUNT,
         MetricsRegionSource.NUM_BYTES_COMPACTED_DESC),
         this.regionWrapper.getNumBytesCompacted());
+    mrb.addCounter(Interns.info(regionNamePrefix + MetricsRegionSource.COMPACTIONS_FAILED_COUNT,
+        MetricsRegionSource.COMPACTIONS_FAILED_DESC),
+        this.regionWrapper.getNumCompactionsFailed());
     mrb.addCounter(Interns.info(regionNamePrefix + MetricsRegionSource.NUM_FILES_COMPACTED_COUNT,
         MetricsRegionSource.NUM_FILES_COMPACTED_DESC),
         this.regionWrapper.getNumFilesCompacted());
@@ -218,6 +233,5 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
         MetricsRegionSource.COPROCESSOR_EXECUTION_STATISTICS_DESC + "99th percentile: "), ds
           .getPercentile(99d) / 1000);
     }
-
   }
 }

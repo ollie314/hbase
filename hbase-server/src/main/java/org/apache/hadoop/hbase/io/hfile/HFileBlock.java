@@ -47,6 +47,7 @@ import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.CompoundBloomFilter;
 import org.apache.hadoop.io.IOUtils;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
 /**
@@ -216,11 +217,11 @@ public class HFileBlock implements Cacheable {
     this.uncompressedSizeWithoutHeader = uncompressedSizeWithoutHeader;
     this.prevBlockOffset = prevBlockOffset;
     this.buf = buf;
-    if (fillHeader)
-      overwriteHeader();
     this.offset = offset;
     this.onDiskDataSizeWithHeader = onDiskDataSizeWithHeader;
     this.fileContext = fileContext;
+    if (fillHeader)
+      overwriteHeader();
     this.buf.rewind();
   }
 
@@ -322,6 +323,11 @@ public class HFileBlock implements Cacheable {
     buf.putInt(onDiskSizeWithoutHeader);
     buf.putInt(uncompressedSizeWithoutHeader);
     buf.putLong(prevBlockOffset);
+    if (this.fileContext.isUseHBaseChecksum()) {
+      buf.put(fileContext.getChecksumType().getCode());
+      buf.putInt(fileContext.getBytesPerChecksum());
+      buf.putInt(onDiskDataSizeWithHeader);
+    }
   }
 
   /**
@@ -655,6 +661,45 @@ public class HFileBlock implements Cacheable {
   }
 
   /**
+   * Read from an input stream. Analogous to
+   * {@link IOUtils#readFully(InputStream, byte[], int, int)}, but uses
+   * positional read and specifies a number of "extra" bytes that would be
+   * desirable but not absolutely necessary to read.
+   *
+   * @param in the input stream to read from
+   * @param position the position within the stream from which to start reading
+   * @param buf the buffer to read into
+   * @param bufOffset the destination offset in the buffer
+   * @param necessaryLen the number of bytes that are absolutely necessary to
+   *     read
+   * @param extraLen the number of extra bytes that would be nice to read
+   * @return true if and only if extraLen is > 0 and reading those extra bytes
+   *     was successful
+   * @throws IOException if failed to read the necessary bytes
+   */
+  @VisibleForTesting
+  static boolean positionalReadWithExtra(FSDataInputStream in,
+      long position, byte[] buf, int bufOffset, int necessaryLen, int extraLen)
+      throws IOException {
+    int bytesRemaining = necessaryLen + extraLen;
+    int bytesRead = 0;
+    while (bytesRead < necessaryLen) {
+      int ret = in.read(position, buf, bufOffset, bytesRemaining);
+      if (ret < 0) {
+        throw new IOException("Premature EOF from inputStream (positional read "
+            + "returned " + ret + ", was trying to read " + necessaryLen
+            + " necessary bytes and " + extraLen + " extra bytes, "
+            + "successfully read " + bytesRead);
+      }
+      position += ret;
+      bufOffset += ret;
+      bytesRemaining -= ret;
+      bytesRead += ret;
+    }
+    return bytesRead != necessaryLen && bytesRemaining <= 0;
+  }
+
+  /**
    * @return the on-disk size of the next block (including the header size)
    *         that was read by peeking into the next block's header
    */
@@ -728,7 +773,7 @@ public class HFileBlock implements Cacheable {
      * part of onDiskBytesWithHeader. If data is uncompressed, then this
      * variable stores the checksum data for this block.
      */
-    private byte[] onDiskChecksum;
+    private byte[] onDiskChecksum = HConstants.EMPTY_BYTE_ARRAY;
 
     /**
      * Valid in the READY state. Contains the header and the uncompressed (but
@@ -873,7 +918,9 @@ public class HFileBlock implements Cacheable {
           onDiskBytesWithHeader.length + numBytes,
           uncompressedBytesWithHeader.length, onDiskBytesWithHeader.length);
 
-      onDiskChecksum = new byte[numBytes];
+      if (onDiskChecksum.length != numBytes) {
+        onDiskChecksum = new byte[numBytes];
+      }
       ChecksumUtil.generateChecksums(
           onDiskBytesWithHeader, 0, onDiskBytesWithHeader.length,
           onDiskChecksum, 0, fileContext.getChecksumType(), fileContext.getBytesPerChecksum());
@@ -1124,7 +1171,7 @@ public class HFileBlock implements Cacheable {
           cacheConf.shouldCacheCompressed(blockType.getCategory()) ?
             getOnDiskBufferWithHeader() :
             getUncompressedBufferWithHeader(),
-          DONT_FILL_HEADER, startOffset,
+          FILL_HEADER, startOffset,
           onDiskBytesWithHeader.length + onDiskChecksum.length, newContext);
     }
   }
@@ -1317,14 +1364,8 @@ public class HFileBlock implements Cacheable {
       } else {
         // Positional read. Better for random reads; or when the streamLock is already locked.
         int extraSize = peekIntoNextBlock ? hdrSize : 0;
-        int ret = istream.read(fileOffset, dest, destOffset, size + extraSize);
-        if (ret < size) {
-          throw new IOException("Positional read of " + size + " bytes " +
-              "failed at offset " + fileOffset + " (returned " + ret + ")");
-        }
-
-        if (ret == size || ret < size + extraSize) {
-          // Could not read the next block's header, or did not try.
+        if (!positionalReadWithExtra(istream, fileOffset, dest, destOffset,
+            size, extraSize)) {
           return -1;
         }
       }
@@ -1589,7 +1630,7 @@ public class HFileBlock implements Cacheable {
         b.assumeUncompressed();
       }
 
-      if (verifyChecksum && !validateBlockChecksum(b, onDiskBlock, hdrSize)) {
+      if (verifyChecksum && !validateBlockChecksum(b, offset, onDiskBlock, hdrSize)) {
         return null;             // checksum mismatch
       }
 
@@ -1639,9 +1680,10 @@ public class HFileBlock implements Cacheable {
      * If there is a checksum mismatch, then return false. Otherwise
      * return true.
      */
-    protected boolean validateBlockChecksum(HFileBlock block,  byte[] data, int hdrSize)
-        throws IOException {
-      return ChecksumUtil.validateBlockChecksum(path, block, data, hdrSize);
+    protected boolean validateBlockChecksum(HFileBlock block, long offset, byte[] data,
+        int hdrSize)
+    throws IOException {
+      return ChecksumUtil.validateBlockChecksum(path, offset, block, data, hdrSize);
     }
 
     @Override

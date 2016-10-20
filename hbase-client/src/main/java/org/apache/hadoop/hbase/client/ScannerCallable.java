@@ -47,7 +47,6 @@ import org.apache.hadoop.hbase.regionserver.RegionServerStoppedException;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.net.DNS;
 
-import com.google.protobuf.RpcController;
 import com.google.protobuf.ServiceException;
 import com.google.protobuf.TextFormat;
 
@@ -65,7 +64,8 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
   public static final Log LOG = LogFactory.getLog(ScannerCallable.class);
   private long scannerId = -1L;
   protected boolean instantiated = false;
-  private boolean closed = false;
+  protected boolean closed = false;
+  protected boolean renew = false;
   private Scan scan;
   private int caching = 1;
   protected ScanMetrics scanMetrics;
@@ -83,7 +83,7 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
   // indicate if it is a remote server call
   protected boolean isRegionServerRemote = true;
   private long nextCallSeq = 0;
-  protected final PayloadCarryingRpcController controller;
+  protected PayloadCarryingRpcController controller;
   
   /**
    * @param connection which connection
@@ -155,6 +155,10 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
    */
   @SuppressWarnings("deprecation")
   public Result [] call() throws IOException {
+    if (controller == null) {
+      controller = RpcControllerFactory.instantiate(connection.getConfiguration())
+          .newController();
+    }
     if (closed) {
       if (scannerId != -1) {
         close();
@@ -167,7 +171,8 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
         ScanRequest request = null;
         try {
           incRPCcallsMetrics();
-          request = RequestConverter.buildScanRequest(scannerId, caching, false, nextCallSeq);
+          request =
+              RequestConverter.buildScanRequest(scannerId, caching, false, nextCallSeq, renew);
           ScanResponse response = null;
           try {
             controller.setPriority(getTableName());
@@ -194,11 +199,22 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
                   + rows + " rows from scanner=" + scannerId);
               }
             }
-            if (response.hasMoreResults()
-                && !response.getMoreResults()) {
+            // moreResults is only used for the case where a filter exhausts all elements
+            if (response.hasMoreResults() && !response.getMoreResults()) {
               scannerId = -1L;
               closed = true;
+              // Implied that no results were returned back, either.
               return null;
+            }
+            // moreResultsInRegion explicitly defines when a RS may choose to terminate a batch due
+            // to size or quantity of results in the response.
+            if (response.hasMoreResultsInRegion()) {
+              // Set what the RS said
+              setHasMoreResultsContext(true);
+              setServerHasMoreResults(response.getMoreResultsInRegion());
+            } else {
+              // Server didn't respond whether it has more results or not.
+              setHasMoreResultsContext(false);
             }
           } catch (ServiceException se) {
             throw ProtobufUtil.getRemoteException(se);
@@ -262,7 +278,7 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
     }
   }
 
-  private void updateResultsMetrics(Result[] rrs) {
+  protected void updateResultsMetrics(Result[] rrs) {
     if (this.scanMetrics == null || rrs == null || rrs.length == 0) {
       return;
     }
@@ -288,7 +304,7 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
       ScanRequest request =
         RequestConverter.buildScanRequest(this.scannerId, 0, true);
       try {
-        getStub().scan(null, request);
+        getStub().scan(controller, request);
       } catch (ServiceException se) {
         throw ProtobufUtil.getRemoteException(se);
       }
@@ -305,7 +321,7 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
         getLocation().getRegionInfo().getRegionName(),
         this.scan, 0, false);
     try {
-      ScanResponse response = getStub().scan(null, request);
+      ScanResponse response = getStub().scan(controller, request);
       long id = response.getScannerId();
       if (logScannerActivity) {
         LOG.info("Open scanner=" + id + " for scan=" + scan.toString()
@@ -326,6 +342,10 @@ public class ScannerCallable extends RegionServerCallable<Result[]> {
    */
   public void setClose() {
     this.closed = true;
+  }
+
+  public void setRenew(boolean val) {
+    this.renew = val;
   }
 
   /**

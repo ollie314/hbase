@@ -43,16 +43,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.Waiter;
 import org.apache.hadoop.hbase.client.HConnectionManager.HConnectionImplementation;
+import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
+import org.apache.hadoop.hbase.coprocessor.ObserverContext;
+import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.exceptions.RegionMovedException;
 import org.apache.hadoop.hbase.filter.Filter;
@@ -98,9 +103,19 @@ public class TestHCM {
   private static final byte[] ROW_X = Bytes.toBytes("xxx");
   private static Random _randy = new Random();
 
+  public static class SleepCoprocessor extends BaseRegionObserver {
+    public static final int SLEEP_TIME = 5000;
+    @Override
+    public void preGetOp(final ObserverContext<RegionCoprocessorEnvironment> e,
+        final Get get, final List<Cell> results) throws IOException {
+      Threads.sleep(SLEEP_TIME);
+    }
+  }
+
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     TEST_UTIL.getConfiguration().setBoolean(HConstants.STATUS_PUBLISHED, true);
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 5);
     TEST_UTIL.startMiniCluster(2);
   }
 
@@ -227,6 +242,20 @@ public class TestHCM {
 
     t.close();
     hci.getClient(sn);  // will throw an exception: RegionServerStoppedException
+  }
+
+  @Test(expected = RetriesExhaustedException.class)
+  public void testRpcTimeout() throws Exception {
+    HTableDescriptor hdt = TEST_UTIL.createTableDescriptor("HCM-testRpcTimeout");
+    hdt.addCoprocessor(SleepCoprocessor.class.getName());
+    Configuration c = new Configuration(TEST_UTIL.getConfiguration());
+    c.setInt(HConstants.HBASE_RPC_TIMEOUT_KEY, SleepCoprocessor.SLEEP_TIME / 2);
+    HTable table = TEST_UTIL.createTable(hdt, new byte[][] { FAM_NAM }, c);
+    try {
+      table.get(new Get(FAM_NAM));
+    } finally {
+      table.close();
+    }
   }
 
   /**
@@ -866,7 +895,7 @@ public class TestHCM {
     conn.close();
   }
 
-  @Ignore ("Test presumes RETRY_BACKOFF will never change; it has") @Test
+  @Test
   public void testErrorBackoffTimeCalculation() throws Exception {
     // TODO: This test would seem to presume hardcoded RETRY_BACKOFF which it should not.
     final long ANY_PAUSE = 100;
@@ -887,46 +916,24 @@ public class TestHCM {
 
       // Check some backoff values from HConstants sequence.
       tracker.reportServerError(location);
-      assertEqualsWithJitter(ANY_PAUSE, tracker.calculateBackoffTime(location, ANY_PAUSE));
+      assertEqualsWithJitter(ANY_PAUSE * HConstants.RETRY_BACKOFF[0],
+        tracker.calculateBackoffTime(location, ANY_PAUSE));
       tracker.reportServerError(location);
       tracker.reportServerError(location);
       tracker.reportServerError(location);
-      assertEqualsWithJitter(ANY_PAUSE * 5, tracker.calculateBackoffTime(location, ANY_PAUSE));
+      assertEqualsWithJitter(ANY_PAUSE * HConstants.RETRY_BACKOFF[3],
+        tracker.calculateBackoffTime(location, ANY_PAUSE));
 
       // All of this shouldn't affect backoff for different location.
 
       assertEquals(0, tracker.calculateBackoffTime(diffLocation, ANY_PAUSE));
       tracker.reportServerError(diffLocation);
-      assertEqualsWithJitter(ANY_PAUSE, tracker.calculateBackoffTime(diffLocation, ANY_PAUSE));
-
-      // But should still work for a different region in the same location.
-      HRegionInfo ri2 = new HRegionInfo(TABLE_NAME2);
-      HRegionLocation diffRegion = new HRegionLocation(ri2, location.getServerName());
-      assertEqualsWithJitter(ANY_PAUSE * 5, tracker.calculateBackoffTime(diffRegion, ANY_PAUSE));
+      assertEqualsWithJitter(ANY_PAUSE * HConstants.RETRY_BACKOFF[0],
+        tracker.calculateBackoffTime(diffLocation, ANY_PAUSE));
 
       // Check with different base.
-      assertEqualsWithJitter(ANY_PAUSE * 10,
-          tracker.calculateBackoffTime(location, ANY_PAUSE * 2));
-
-      // See that time from last error is taken into account. Time shift is applied after jitter,
-      // so pass the original expected backoff as the base for jitter.
-      long timeShift = (long)(ANY_PAUSE * 0.5);
-      timeMachine.setValue(timeBase + timeShift);
-      assertEqualsWithJitter((ANY_PAUSE * 5) - timeShift,
-        tracker.calculateBackoffTime(location, ANY_PAUSE), ANY_PAUSE * 2);
-
-      // However we should not go into negative.
-      timeMachine.setValue(timeBase + ANY_PAUSE * 100);
-      assertEquals(0, tracker.calculateBackoffTime(location, ANY_PAUSE));
-
-      // We also should not go over the boundary; last retry would be on it.
-      long timeLeft = (long)(ANY_PAUSE * 0.5);
-      timeMachine.setValue(timeBase + largeAmountOfTime - timeLeft);
-      assertTrue(tracker.canRetryMore(1));
-      tracker.reportServerError(location);
-      assertEquals(timeLeft, tracker.calculateBackoffTime(location, ANY_PAUSE));
-      timeMachine.setValue(timeBase + largeAmountOfTime);
-      assertFalse(tracker.canRetryMore(1));
+      assertEqualsWithJitter(ANY_PAUSE * 2 * HConstants.RETRY_BACKOFF[3],
+        tracker.calculateBackoffTime(location, ANY_PAUSE * 2));
     } finally {
       EnvironmentEdgeManager.reset();
     }

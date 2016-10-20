@@ -1,8 +1,6 @@
 #! /usr/bin/env bash
 #
 #/**
-# * Copyright 2007 The Apache Software Foundation
-# *
 # * Licensed to the Apache Software Foundation (ASF) under one
 # * or more contributor license agreements.  See the NOTICE file
 # * distributed with this work for additional information
@@ -78,12 +76,15 @@ if [ $# = 0 ]; then
   echo "Options:"
   echo "  --config DIR    Configuration direction to use. Default: ./conf"
   echo "  --hosts HOSTS   Override the list in 'regionservers' file"
+  echo "  --auth-as-server Authenticate to ZooKeeper using servers configuration"
   echo ""
   echo "Commands:"
   echo "Some commands take arguments. Pass no args or -h for usage."
   echo "  shell           Run the HBase shell"
   echo "  hbck            Run the hbase 'fsck' tool"
   echo "  hlog            Write-ahead-log analyzer"
+  echo "  snapshot        Create a new snapshot of a table"
+  echo "  snapshotinfo    Tool for dumping snapshot information"
   echo "  hfile           Store file analyzer"
   echo "  zkcli           Run the ZooKeeper shell"
   echo "  upgrade         Upgrade hbase"
@@ -98,6 +99,7 @@ if [ $# = 0 ]; then
   echo "  mapredcp        Dump CLASSPATH entries required by mapreduce"
   echo "  pe              Run PerformanceEvaluation"
   echo "  ltt             Run LoadTestTool"
+  echo "  canary          Run the Canary tool"
   echo "  version         Print the version"
   echo "  CLASSNAME       Run the class named CLASSNAME"
   exit 1
@@ -209,14 +211,17 @@ if [ "$HBASE_LIBRARY_PATH" != "" ]; then
 fi
 
 #If avail, add Hadoop to the CLASSPATH and to the JAVA_LIBRARY_PATH
-HADOOP_IN_PATH=$(PATH="${HADOOP_HOME:-${HADOOP_PREFIX}}/bin:$PATH" which hadoop 2>/dev/null)
-if [ -f ${HADOOP_IN_PATH} ]; then
-  HADOOP_JAVA_LIBRARY_PATH=$(HADOOP_CLASSPATH="$CLASSPATH" ${HADOOP_IN_PATH} \
-                             org.apache.hadoop.hbase.util.GetJavaProperty java.library.path 2>/dev/null)
-  if [ -n "$HADOOP_JAVA_LIBRARY_PATH" ]; then
-    JAVA_LIBRARY_PATH=$(append_path "${JAVA_LIBRARY_PATH}" "$HADOOP_JAVA_LIBRARY_PATH")
+# Allow this functionality to be disabled
+if [ "$HBASE_DISABLE_HADOOP_CLASSPATH_LOOKUP" != "true" ] ; then
+  HADOOP_IN_PATH=$(PATH="${HADOOP_HOME:-${HADOOP_PREFIX}}/bin:$PATH" which hadoop 2>/dev/null)
+  if [ -f ${HADOOP_IN_PATH} ]; then
+    HADOOP_JAVA_LIBRARY_PATH=$(HADOOP_CLASSPATH="$CLASSPATH" ${HADOOP_IN_PATH} \
+                               org.apache.hadoop.hbase.util.GetJavaProperty java.library.path 2>/dev/null)
+    if [ -n "$HADOOP_JAVA_LIBRARY_PATH" ]; then
+      JAVA_LIBRARY_PATH=$(append_path "${JAVA_LIBRARY_PATH}" "$HADOOP_JAVA_LIBRARY_PATH")
+    fi
+    CLASSPATH=$(append_path "${CLASSPATH}" `${HADOOP_IN_PATH} classpath 2>/dev/null`)
   fi
-  CLASSPATH=$(append_path "${CLASSPATH}" `${HADOOP_IN_PATH} classpath 2>/dev/null`)
 fi
 
 # Add user-specified CLASSPATH last
@@ -272,6 +277,14 @@ else
 	HBASE_OPTS="$HBASE_OPTS $CLIENT_GC_OPTS"
 fi
 
+if [ "$AUTH_AS_SERVER" == "true" ] || [ "$COMMAND" = "hbck" ]; then
+   if [ -n "$HBASE_SERVER_JAAS_OPTS" ]; then
+     HBASE_OPTS="$HBASE_OPTS $HBASE_SERVER_JAAS_OPTS"
+   else
+     HBASE_OPTS="$HBASE_OPTS $HBASE_REGIONSERVER_OPTS"
+   fi
+fi
+
 # figure out which class to run
 if [ "$COMMAND" = "shell" ] ; then
   # eg export JRUBY_HOME=/usr/local/share/jruby
@@ -297,6 +310,10 @@ elif [ "$COMMAND" = "zkcli" ] ; then
   CLASS="org.apache.hadoop.hbase.zookeeper.ZooKeeperMainServer"
 elif [ "$COMMAND" = "upgrade" ] ; then
   CLASS="org.apache.hadoop.hbase.migration.UpgradeTo96"
+elif [ "$COMMAND" = "snapshot" ] ; then
+  CLASS="org.apache.hadoop.hbase.snapshot.CreateSnapshot"
+elif [ "$COMMAND" = "snapshotinfo" ] ; then
+  CLASS="org.apache.hadoop.hbase.snapshot.SnapshotInfo"
 elif [ "$COMMAND" = "master" ] ; then
   CLASS='org.apache.hadoop.hbase.master.HMaster'
   if [ "$1" != "stop" ] && [ "$1" != "clear" ] ; then
@@ -354,6 +371,9 @@ elif [ "$COMMAND" = "pe" ] ; then
 elif [ "$COMMAND" = "ltt" ] ; then
   CLASS='org.apache.hadoop.hbase.util.LoadTestTool'
   HBASE_OPTS="$HBASE_OPTS $HBASE_LTT_OPTS"
+elif [ "$COMMAND" = "canary" ] ; then
+  CLASS='org.apache.hadoop.hbase.tool.Canary'
+  HBASE_OPTS="$HBASE_OPTS $HBASE_CANARY_OPTS"
 elif [ "$COMMAND" = "version" ] ; then
   CLASS='org.apache.hadoop.hbase.util.VersionInfo'
 else

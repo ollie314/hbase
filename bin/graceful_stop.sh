@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 #
 #/**
-# * Copyright 2011 The Apache Software Foundation
-# *
 # * Licensed to the Apache Software Foundation (ASF) under one
 # * or more contributor license agreements.  See the NOTICE file
 # * distributed with this work for additional information
@@ -86,7 +84,7 @@ fi
 hostname=$1
 filename="/tmp/$hostname"
 
-local=false
+local=
 localhostname=`/bin/hostname`
 
 if [ "$localhostname" == "$hostname" ]; then
@@ -105,46 +103,46 @@ log "Unloaded $hostname region(s)"
 hosts="/tmp/$(basename $0).$$.tmp"
 echo $hostname >> $hosts
 if [ "$thrift" != "" ]; then
-  log "Stopping thrift"
-  if [ "$local" ]; then
+  log "Stopping thrift server on $hostname"
+  if [ "$local" == true ]; then
     "$bin"/hbase-daemon.sh --config ${HBASE_CONF_DIR} stop thrift
   else
     "$bin"/hbase-daemons.sh --config ${HBASE_CONF_DIR} --hosts ${hosts} stop thrift
   fi
 fi
 if [ "$rest" != "" ]; then
-  log "Stopping rest"
-  if [ "$local" ]; then
+  log "Stopping rest server on $hostname"
+  if [ "$local" == true ]; then
     "$bin"/hbase-daemon.sh --config ${HBASE_CONF_DIR} stop rest
   else
     "$bin"/hbase-daemons.sh --config ${HBASE_CONF_DIR} --hosts ${hosts} stop rest
   fi
 fi
-log "Stopping regionserver"
-if [ "$local" ]; then
+log "Stopping regionserver on $hostname"
+if [ "$local" == true ]; then
   "$bin"/hbase-daemon.sh --config ${HBASE_CONF_DIR} stop regionserver
 else
   "$bin"/hbase-daemons.sh --config ${HBASE_CONF_DIR} --hosts ${hosts} stop regionserver
 fi
 if [ "$restart" != "" ]; then
-  log "Restarting regionserver"
-  if [ "$local" ]; then
+  log "Restarting regionserver on $hostname"
+  if [ "$local" == true ]; then
     "$bin"/hbase-daemon.sh --config ${HBASE_CONF_DIR} start regionserver
   else
     "$bin"/hbase-daemons.sh --config ${HBASE_CONF_DIR} --hosts ${hosts} start regionserver
   fi
   if [ "$thrift" != "" ]; then
-    log "Restarting thrift"
+    log "Restarting thrift server on $hostname"
     # -b 0.0.0.0 says listen on all interfaces rather than just default.
-    if [ "$local" ]; then
+    if [ "$local" == true ]; then
       "$bin"/hbase-daemon.sh --config ${HBASE_CONF_DIR} start thrift -b 0.0.0.0
     else
       "$bin"/hbase-daemons.sh --config ${HBASE_CONF_DIR} --hosts ${hosts} start thrift -b 0.0.0.0
     fi
   fi
   if [ "$rest" != "" ]; then
-    log "Restarting rest"
-    if [ "$local" ]; then
+    log "Restarting rest server on $hostname"
+    if [ "$local" == true ]; then
       "$bin"/hbase-daemon.sh --config ${HBASE_CONF_DIR} start rest
     else
       "$bin"/hbase-daemons.sh --config ${HBASE_CONF_DIR} --hosts ${hosts} start rest
@@ -159,7 +157,7 @@ fi
 
 # Restore balancer state
 if [ $HBASE_BALANCER_STATE != "false" ]; then
-  log "Restoring balancer state to " $HBASE_BALANCER_STATE
+  log "Restoring balancer state to $HBASE_BALANCER_STATE"
   echo "balance_switch $HBASE_BALANCER_STATE" | "$bin"/hbase --config ${HBASE_CONF_DIR} shell &> /dev/null
 fi
 

@@ -63,6 +63,7 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.Writable;
@@ -90,6 +91,12 @@ import org.apache.hadoop.util.ToolRunner;
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
 public class ExportSnapshot extends Configured implements Tool {
+  public static final String NAME = "exportsnapshot";
+  /** Configuration prefix for overrides for the source filesystem */
+  public static final String CONF_SOURCE_PREFIX = NAME + ".from.";
+  /** Configuration prefix for overrides for the destination filesystem */
+  public static final String CONF_DEST_PREFIX = NAME + ".to.";
+
   private static final Log LOG = LogFactory.getLog(ExportSnapshot.class);
 
   private static final String MR_NUM_MAPS = "mapreduce.job.maps";
@@ -143,6 +150,9 @@ public class ExportSnapshot extends Configured implements Tool {
     @Override
     public void setup(Context context) throws IOException {
       Configuration conf = context.getConfiguration();
+      Configuration srcConf = HBaseConfiguration.createClusterConf(conf, null, CONF_SOURCE_PREFIX);
+      Configuration destConf = HBaseConfiguration.createClusterConf(conf, null, CONF_DEST_PREFIX);
+
       verifyChecksum = conf.getBoolean(CONF_CHECKSUM_VERIFY, true);
 
       filesGroup = conf.get(CONF_FILES_GROUP);
@@ -157,13 +167,15 @@ public class ExportSnapshot extends Configured implements Tool {
       testFailures = conf.getBoolean(CONF_TEST_FAILURE, false);
 
       try {
-        inputFs = FileSystem.get(inputRoot.toUri(), conf);
+        srcConf.setBoolean("fs." + inputRoot.toUri().getScheme() + ".impl.disable.cache", true);
+        inputFs = FileSystem.get(inputRoot.toUri(), srcConf);
       } catch (IOException e) {
         throw new IOException("Could not get the input FileSystem with root=" + inputRoot, e);
       }
 
       try {
-        outputFs = FileSystem.get(outputRoot.toUri(), conf);
+        destConf.setBoolean("fs." + outputRoot.toUri().getScheme() + ".impl.disable.cache", true);
+        outputFs = FileSystem.get(outputRoot.toUri(), destConf);
       } catch (IOException e) {
         throw new IOException("Could not get the output FileSystem with root="+ outputRoot, e);
       }
@@ -182,6 +194,12 @@ public class ExportSnapshot extends Configured implements Tool {
       byte[] result = new byte[bw.getLength()];
       System.arraycopy(bw.getBytes(), 0, result, 0, bw.getLength());
       return result;
+    }
+
+    @Override
+    protected void cleanup(Context context) {
+      IOUtils.closeStream(inputFs);
+      IOUtils.closeStream(outputFs);
     }
 
     @Override
@@ -271,7 +289,7 @@ public class ExportSnapshot extends Configured implements Tool {
         context.getCounter(Counter.BYTES_EXPECTED).increment(inputStat.getLen());
 
         // Ensure that the output folder is there and copy the file
-        outputFs.mkdirs(outputPath.getParent());
+        createOutputPath(outputPath.getParent());
         FSDataOutputStream out = outputFs.create(outputPath, true);
         try {
           copyData(context, inputStat.getPath(), in, outputPath, out, inputStat.getLen());
@@ -285,6 +303,23 @@ public class ExportSnapshot extends Configured implements Tool {
         }
       } finally {
         in.close();
+      }
+    }
+
+    /**
+     * Create the output folder and optionally set ownership.
+     */
+    private void createOutputPath(final Path path) throws IOException {
+      if (filesUser == null && filesGroup == null) {
+        outputFs.mkdirs(path);
+      } else {
+        Path parent = path.getParent();
+        if (!outputFs.exists(parent) && parent.getParent() != null) {
+          createOutputPath(parent);
+        }
+        outputFs.mkdirs(path);
+        // override the owner when non-null user/group is specified
+        outputFs.setOwner(path, filesUser, filesGroup);
       }
     }
 
@@ -770,8 +805,12 @@ public class ExportSnapshot extends Configured implements Tool {
     job.setNumReduceTasks(0);
 
     // Acquire the delegation Tokens
+    Configuration srcConf = HBaseConfiguration.createClusterConf(conf, null, CONF_SOURCE_PREFIX);
     TokenCache.obtainTokensForNamenodes(job.getCredentials(),
-      new Path[] { inputRoot, outputRoot }, conf);
+      new Path[] { inputRoot }, srcConf);
+    Configuration destConf = HBaseConfiguration.createClusterConf(conf, null, CONF_DEST_PREFIX);
+    TokenCache.obtainTokensForNamenodes(job.getCredentials(),
+        new Path[] { outputRoot }, destConf);
 
     // Run the MR Job
     if (!job.waitForCompletion(true)) {
@@ -789,6 +828,21 @@ public class ExportSnapshot extends Configured implements Tool {
     FSUtils.setFsDefault(conf, FSUtils.getRootDir(conf));
     SnapshotDescription snapshotDesc = SnapshotDescriptionUtils.readSnapshotInfo(fs, snapshotDir);
     SnapshotReferenceUtil.verifySnapshot(conf, fs, snapshotDir, snapshotDesc);
+  }
+
+  /**
+   * Set path ownership.
+   */
+  private void setOwner(final FileSystem fs, final Path path, final String user,
+      final String group, final boolean recursive) throws IOException {
+    if (user != null || group != null) {
+      if (recursive && fs.isDirectory(path)) {
+        for (FileStatus child : fs.listStatus(path)) {
+          setOwner(fs, child.getPath(), user, group, recursive);
+        }
+      }
+      fs.setOwner(path, user, group);
+    }
   }
 
   /**
@@ -863,9 +917,13 @@ public class ExportSnapshot extends Configured implements Tool {
       targetName = snapshotName;
     }
 
-    FileSystem inputFs = FileSystem.get(inputRoot.toUri(), conf);
+    Configuration srcConf = HBaseConfiguration.createClusterConf(conf, null, CONF_SOURCE_PREFIX);
+    srcConf.setBoolean("fs." + inputRoot.toUri().getScheme() + ".impl.disable.cache", true);
+    FileSystem inputFs = FileSystem.get(inputRoot.toUri(), srcConf);
     LOG.debug("inputFs=" + inputFs.getUri().toString() + " inputRoot=" + inputRoot);
-    FileSystem outputFs = FileSystem.get(outputRoot.toUri(), conf);
+    Configuration destConf = HBaseConfiguration.createClusterConf(conf, null, CONF_DEST_PREFIX);
+    destConf.setBoolean("fs." + outputRoot.toUri().getScheme() + ".impl.disable.cache", true);
+    FileSystem outputFs = FileSystem.get(outputRoot.toUri(), destConf);
     LOG.debug("outputFs=" + outputFs.getUri().toString() + " outputRoot=" + outputRoot.toString());
 
     boolean skipTmp = conf.getBoolean(CONF_SKIP_TMP, false);
@@ -912,6 +970,9 @@ public class ExportSnapshot extends Configured implements Tool {
     try {
       LOG.info("Copy Snapshot Manifest");
       FileUtil.copy(inputFs, snapshotDir, outputFs, initialOutputSnapshotDir, false, false, conf);
+      if (filesUser != null || filesGroup != null) {
+        setOwner(outputFs, snapshotTmpDir, filesUser, filesGroup, true);
+      }
     } catch (IOException e) {
       throw new ExportSnapshotException("Failed to copy the snapshot directory: from=" +
         snapshotDir + " to=" + initialOutputSnapshotDir, e);
@@ -946,7 +1007,7 @@ public class ExportSnapshot extends Configured implements Tool {
       // Step 4 - Verify snapshot integrity
       if (verifyTarget) {
         LOG.info("Verify snapshot integrity");
-        verifySnapshot(conf, outputFs, outputRoot, outputSnapshotDir);
+        verifySnapshot(destConf, outputFs, outputRoot, outputSnapshotDir);
       }
 
       LOG.info("Export Completed: " + targetName);
@@ -958,6 +1019,9 @@ public class ExportSnapshot extends Configured implements Tool {
       }
       outputFs.delete(outputSnapshotDir, true);
       return 1;
+    } finally {
+      IOUtils.closeStream(inputFs);
+      IOUtils.closeStream(outputFs);
     }
   }
 

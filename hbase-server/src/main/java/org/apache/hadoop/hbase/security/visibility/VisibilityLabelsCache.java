@@ -29,8 +29,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.AuthUtil;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.MultiUserAuthorizations;
 import org.apache.hadoop.hbase.protobuf.generated.VisibilityLabelsProtos.UserAuthorizations;
@@ -48,7 +49,6 @@ import org.apache.zookeeper.KeeperException;
 public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
 
   private static final Log LOG = LogFactory.getLog(VisibilityLabelsCache.class);
-  private static final int NON_EXIST_LABEL_ORDINAL = 0;
   private static final List<String> EMPTY_LIST = Collections.emptyList();
   private static final Set<Integer> EMPTY_SET = Collections.emptySet();
   private static VisibilityLabelsCache instance;
@@ -57,6 +57,8 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
   private Map<String, Integer> labels = new HashMap<String, Integer>();
   private Map<Integer, String> ordinalVsLabels = new HashMap<Integer, String>();
   private Map<String, Set<Integer>> userAuths = new HashMap<String, Set<Integer>>();
+  private Map<String, Set<Integer>> groupAuths = new HashMap<String, Set<Integer>>();
+
   /**
    * This covers the members labels, ordinalVsLabels and userAuths
    */
@@ -139,9 +141,15 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
     this.lock.writeLock().lock();
     try {
       this.userAuths.clear();
+      this.groupAuths.clear();
       for (UserAuthorizations userAuths : multiUserAuths.getUserAuthsList()) {
         String user = Bytes.toString(userAuths.getUser().toByteArray());
-        this.userAuths.put(user, new HashSet<Integer>(userAuths.getAuthList()));
+        if (AuthUtil.isGroupPrincipal(user)) {
+          this.groupAuths.put(AuthUtil.getGroupName(user),
+            new HashSet<Integer>(userAuths.getAuthList()));
+        } else {
+          this.userAuths.put(user, new HashSet<Integer>(userAuths.getAuthList()));
+        }
       }
     } finally {
       this.lock.writeLock().unlock();
@@ -166,7 +174,7 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
       return ordinal.intValue();
     }
     // 0 denotes not available
-    return NON_EXIST_LABEL_ORDINAL;
+    return VisibilityConstants.NON_EXIST_LABEL_ORDINAL;
   }
 
   /**
@@ -174,6 +182,7 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
    * @return The label having the given ordinal. Returns <code>null</code> when no label exist in
    *         the system with given ordinal
    */
+  @Override
   public String getLabel(int ordinal) {
     this.lock.readLock().lock();
     try {
@@ -195,30 +204,47 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
     }
   }
 
-  public List<String> getAuths(String user) {
-    List<String> auths = EMPTY_LIST;
+  public List<String> getUserAuths(String user) {
     this.lock.readLock().lock();
     try {
-      Set<Integer> authOrdinals = userAuths.get(user);
-      if (authOrdinals != null) {
+      List<String> auths = EMPTY_LIST;
+      Set<Integer> authOrdinals = getUserAuthsAsOrdinals(user);
+      if (!authOrdinals.equals(EMPTY_SET)) {
         auths = new ArrayList<String>(authOrdinals.size());
         for (Integer authOrdinal : authOrdinals) {
           auths.add(ordinalVsLabels.get(authOrdinal));
         }
       }
+      return auths;
     } finally {
       this.lock.readLock().unlock();
     }
-    return auths;
+  }
+
+  public List<String> getGroupAuths(String[] groups) {
+    this.lock.readLock().lock();
+    try {
+      List<String> auths = EMPTY_LIST;
+      Set<Integer> authOrdinals = getGroupAuthsAsOrdinals(groups);
+      if (!authOrdinals.equals(EMPTY_SET)) {
+        auths = new ArrayList<String>(authOrdinals.size());
+        for (Integer authOrdinal : authOrdinals) {
+          auths.add(ordinalVsLabels.get(authOrdinal));
+        }
+      }
+      return auths;
+    } finally {
+      this.lock.readLock().unlock();
+    }
   }
 
   /**
-   * Returns the list of ordinals of authentications associated with the user
+   * Returns the list of ordinals of labels associated with the user
    *
    * @param user Not null value.
    * @return the list of ordinals
    */
-  public Set<Integer> getAuthsAsOrdinals(String user) {
+  public Set<Integer> getUserAuthsAsOrdinals(String user) {
     this.lock.readLock().lock();
     try {
       Set<Integer> auths = userAuths.get(user);
@@ -228,7 +254,40 @@ public class VisibilityLabelsCache implements VisibilityLabelOrdinalProvider {
     }
   }
 
-  public void writeToZookeeper(byte[] data, boolean labelsOrUserAuths) {
+  /**
+   * Returns the list of ordinals of labels associated with the groups
+   *
+   * @param groups
+   * @return the list of ordinals
+   */
+  public Set<Integer> getGroupAuthsAsOrdinals(String[] groups) {
+    this.lock.readLock().lock();
+    try {
+      Set<Integer> authOrdinals = new HashSet<Integer>();
+      if (groups != null && groups.length > 0) {
+        Set<Integer> groupAuthOrdinals = null;
+        for (String group : groups) {
+          groupAuthOrdinals = groupAuths.get(group);
+          if (groupAuthOrdinals != null && !groupAuthOrdinals.isEmpty()) {
+            authOrdinals.addAll(groupAuthOrdinals);
+          }
+        }
+      }
+      return (authOrdinals.isEmpty()) ? EMPTY_SET : authOrdinals;
+    } finally {
+      this.lock.readLock().unlock();
+    }
+  }
+
+  public void writeToZookeeper(byte[] data, boolean labelsOrUserAuths) throws IOException {
+    // Update local state, then send it to zookeeper
+    if (labelsOrUserAuths) {
+      // True for labels
+      this.refreshLabelsCache(data);
+    } else {
+      // False for user auths
+      this.refreshUserAuthsCache(data);
+    }
     this.zkVisibilityWatcher.writeToZookeeper(data, labelsOrUserAuths);
   }
 }

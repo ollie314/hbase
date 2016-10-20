@@ -35,7 +35,6 @@ import org.apache.hadoop.hbase.io.FSDataInputStreamWrapper;
 import org.apache.hadoop.hbase.io.HFileLink;
 import org.apache.hadoop.hbase.io.HalfStoreFileReader;
 import org.apache.hadoop.hbase.io.Reference;
-import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.util.FSUtils;
 
@@ -84,6 +83,9 @@ public class StoreFileInfo {
 
   private RegionCoprocessorHost coprocessorHost;
 
+  // timestamp on when the file was created, is 0 and ignored for reference or link files
+  private long createdTimestamp;
+
   /**
    * Create a Store File Info
    * @param conf the {@link Configuration} to use
@@ -125,6 +127,7 @@ public class StoreFileInfo {
         " reference to " + referencePath);
     } else if (isHFile(p)) {
       // HFile
+      this.createdTimestamp = fileStatus.getModificationTime();
       this.reference = null;
       this.link = null;
     } else {
@@ -175,21 +178,24 @@ public class StoreFileInfo {
    * @return The StoreFile.Reader for the file
    */
   public StoreFile.Reader open(final FileSystem fs,
-      final CacheConfig cacheConf) throws IOException {
+      final CacheConfig cacheConf, final boolean canUseDropBehind) throws IOException {
     FSDataInputStreamWrapper in;
     FileStatus status;
 
+    final boolean doDropBehind = canUseDropBehind && cacheConf.shouldDropBehindCompaction();
     if (this.link != null) {
       // HFileLink
-      in = new FSDataInputStreamWrapper(fs, this.link);
+      in = new FSDataInputStreamWrapper(fs, this.link, doDropBehind);
       status = this.link.getFileStatus(fs);
     } else if (this.reference != null) {
       // HFile Reference
       Path referencePath = getReferredToFile(this.getPath());
-      in = new FSDataInputStreamWrapper(fs, referencePath);
+      in = new FSDataInputStreamWrapper(fs, referencePath,
+          doDropBehind);
       status = fs.getFileStatus(referencePath);
     } else {
-      in = new FSDataInputStreamWrapper(fs, this.getPath());
+      in = new FSDataInputStreamWrapper(fs, this.getPath(),
+          doDropBehind);
       status = fileStatus;
     }
     long length = status.getLen();
@@ -307,6 +313,13 @@ public class StoreFileInfo {
   public static boolean isReference(final String name) {
     Matcher m = REF_NAME_PATTERN.matcher(name);
     return m.matches() && m.groupCount() > 1;
+  }
+
+  /**
+   * @return timestamp when this file was created (as returned by filesystem)
+   */
+  public long getCreatedTimestamp() {
+    return createdTimestamp;
   }
 
   /*

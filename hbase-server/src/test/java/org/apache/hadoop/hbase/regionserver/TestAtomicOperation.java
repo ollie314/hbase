@@ -43,7 +43,7 @@ import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.MultithreadedTestUtil;
 import org.apache.hadoop.hbase.MultithreadedTestUtil.TestContext;
 import org.apache.hadoop.hbase.MultithreadedTestUtil.TestThread;
@@ -612,11 +612,11 @@ public class TestAtomicOperation {
     }
 
     @Override
-    public RowLock getRowLock(final byte[] row, boolean waitForLock) throws IOException {
+    public RowLock getRowLockInternal(final byte[] row, boolean waitForLock) throws IOException {
       if (testStep == TestStep.CHECKANDPUT_STARTED) {
         latch.countDown();
       }
-      return new WrappedRowLock(super.getRowLock(row, waitForLock));
+      return new WrappedRowLock(super.getRowLockInternal(row, waitForLock));
     }
     
     public class WrappedRowLock extends RowLock {

@@ -25,13 +25,16 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
+import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos.MetaRegionServer;
 import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.LongUtils;
 
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 /**
@@ -54,6 +57,8 @@ import java.util.regex.Pattern;
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
 public class ServerName implements Comparable<ServerName>, Serializable {
+  private static final long serialVersionUID = 1367463982557264981L;
+
   /**
    * Version for this class.
    * Its a short rather than a byte so I can for sure distinguish between this
@@ -226,7 +231,7 @@ public class ServerName implements Comparable<ServerName>, Serializable {
    */
   static String getServerName(String hostName, int port, long startcode) {
     final StringBuilder name = new StringBuilder(hostName.length() + 1 + 5 + 1 + 13);
-    name.append(hostName);
+    name.append(hostName.toLowerCase(Locale.ROOT));
     name.append(SERVERNAME_SEPARATOR);
     name.append(port);
     name.append(SERVERNAME_SEPARATOR);
@@ -286,7 +291,7 @@ public class ServerName implements Comparable<ServerName>, Serializable {
     if (compare != 0) return compare;
     compare = this.getPort() - other.getPort();
     if (compare != 0) return compare;
-    return (int)(this.getStartcode() - other.getStartcode());
+    return LongUtils.compare(this.getStartcode(), other.getStartcode());
   }
 
   @Override
@@ -311,7 +316,7 @@ public class ServerName implements Comparable<ServerName>, Serializable {
       final ServerName right) {
     if (left == null) return false;
     if (right == null) return false;
-    return left.getHostname().equals(right.getHostname()) &&
+    return left.getHostname().compareToIgnoreCase(right.getHostname()) == 0 &&
       left.getPort() == right.getPort();
   }
 
@@ -370,9 +375,9 @@ public class ServerName implements Comparable<ServerName>, Serializable {
     if (ProtobufUtil.isPBMagicPrefix(data)) {
       int prefixLen = ProtobufUtil.lengthOfPBMagic();
       try {
-        MetaRegionServer rss =
-          MetaRegionServer.PARSER.parseFrom(data, prefixLen, data.length - prefixLen);
-        org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ServerName sn = rss.getServer();
+        ZooKeeperProtos.Master rss =
+          ZooKeeperProtos.Master.PARSER.parseFrom(data, prefixLen, data.length - prefixLen);
+        org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ServerName sn = rss.getMaster();
         return valueOf(sn.getHostName(), sn.getPort(), sn.getStartCode());
       } catch (InvalidProtocolBufferException e) {
         // A failed parse of the znode is pretty catastrophic. Rather than loop

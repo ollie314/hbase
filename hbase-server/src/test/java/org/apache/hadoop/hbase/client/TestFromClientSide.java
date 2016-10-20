@@ -43,10 +43,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.log4j.Level;
 import org.apache.commons.lang.ArrayUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.Cell;
@@ -59,7 +59,8 @@ import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.KeyValueUtil;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableName;
@@ -73,6 +74,8 @@ import org.apache.hadoop.hbase.filter.CompareFilter;
 import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.Filter;
 import org.apache.hadoop.hbase.filter.FilterList;
+import org.apache.hadoop.hbase.filter.FirstKeyOnlyFilter;
+import org.apache.hadoop.hbase.filter.InclusiveStopFilter;
 import org.apache.hadoop.hbase.filter.KeyOnlyFilter;
 import org.apache.hadoop.hbase.filter.LongComparator;
 import org.apache.hadoop.hbase.filter.PrefixFilter;
@@ -84,8 +87,7 @@ import org.apache.hadoop.hbase.filter.WhileMatchFilter;
 import org.apache.hadoop.hbase.io.hfile.BlockCache;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
-import org.apache.hadoop.hbase.ipc.RpcClient;
-import org.apache.hadoop.hbase.ipc.RpcServer;
+import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto;
@@ -99,7 +101,9 @@ import org.apache.hadoop.hbase.regionserver.Store;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
-import org.apache.log4j.Level;
+import org.apache.log4j.AppenderSkeleton;
+import org.apache.log4j.Logger;
+import org.apache.log4j.spi.LoggingEvent;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -137,6 +141,7 @@ public class TestFromClientSide {
     Configuration conf = TEST_UTIL.getConfiguration();
     conf.setStrings(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,
         MultiRowMutationEndpoint.class.getName());
+    conf.setBoolean("hbase.table.sanity.checks", true); // enable for below tests
     // We need more than one region server in this test
     TEST_UTIL.startMiniCluster(SLAVES);
   }
@@ -4358,7 +4363,7 @@ public class TestFromClientSide {
 
     HTable table =
         TEST_UTIL.createTable(tableAname,
-          new byte[][] { HConstants.CATALOG_FAMILY, Bytes.toBytes("info2") }, 1, 64);
+          new byte[][] { HConstants.CATALOG_FAMILY, Bytes.toBytes("info2") }, 1, 1024);
     // set block size to 64 to making 2 kvs into one block, bypassing the walkForwardInSingleRow
     // in Store.rowAtOrBeforeFromStoreFile
     table.setAutoFlush(true);
@@ -4518,6 +4523,23 @@ public class TestFromClientSide {
     r = t.get(g);
     assertEquals(0, Bytes.compareTo(VALUE, r.getValue(FAMILY, QUALIFIERS[1])));
     assertNull(r.getValue(FAMILY, QUALIFIERS[0]));
+
+    //Test that we get a region level exception
+    try {
+      arm = new RowMutations(ROW);
+      p = new Put(ROW);
+      p.add(new byte[]{'b', 'o', 'g', 'u', 's'}, QUALIFIERS[0], VALUE);
+      arm.add(p);
+      t.mutateRow(arm);
+      fail("Expected NoSuchColumnFamilyException");
+    } catch(RetriesExhaustedWithDetailsException e) {
+      for(Throwable rootCause: e.getCauses()){
+        if(rootCause instanceof NoSuchColumnFamilyException){
+          return;
+        }
+      }
+      throw e;
+    }
   }
 
   @Test
@@ -4690,6 +4712,49 @@ public class TestFromClientSide {
     assertIncrementKey(kvs[0], ROW, FAMILY, QUALIFIERS[1], 2);
     assertIncrementKey(kvs[1], ROW, FAMILY, QUALIFIERS[0], 2);
     assertIncrementKey(kvs[2], ROW, FAMILY, QUALIFIERS[2], 2);
+  }
+
+  @Test
+  public void testIncrementOnSameColumn() throws Exception {
+    LOG.info("Starting testIncrementOnSameColumn");
+    final byte[] TABLENAME = Bytes.toBytes("testIncrementOnSameColumn");
+    HTable ht = TEST_UTIL.createTable(TABLENAME, FAMILY);
+
+    byte[][] QUALIFIERS =
+        new byte[][] { Bytes.toBytes("A"), Bytes.toBytes("B"), Bytes.toBytes("C") };
+
+    Increment inc = new Increment(ROW);
+    for (int i = 0; i < QUALIFIERS.length; i++) {
+      inc.addColumn(FAMILY, QUALIFIERS[i], 1);
+      inc.addColumn(FAMILY, QUALIFIERS[i], 1);
+    }
+    ht.increment(inc);
+
+    // Verify expected results
+    Result r = ht.get(new Get(ROW));
+    Cell[] kvs = r.rawCells();
+    assertEquals(3, kvs.length);
+    assertIncrementKey(kvs[0], ROW, FAMILY, QUALIFIERS[0], 1);
+    assertIncrementKey(kvs[1], ROW, FAMILY, QUALIFIERS[1], 1);
+    assertIncrementKey(kvs[2], ROW, FAMILY, QUALIFIERS[2], 1);
+
+    // Now try multiple columns again
+    inc = new Increment(ROW);
+    for (int i = 0; i < QUALIFIERS.length; i++) {
+      inc.addColumn(FAMILY, QUALIFIERS[i], 1);
+      inc.addColumn(FAMILY, QUALIFIERS[i], 1);
+    }
+    ht.increment(inc);
+
+    // Verify
+    r = ht.get(new Get(ROW));
+    kvs = r.rawCells();
+    assertEquals(3, kvs.length);
+    assertIncrementKey(kvs[0], ROW, FAMILY, QUALIFIERS[0], 2);
+    assertIncrementKey(kvs[1], ROW, FAMILY, QUALIFIERS[1], 2);
+    assertIncrementKey(kvs[2], ROW, FAMILY, QUALIFIERS[2], 2);
+    
+    ht.close();
   }
 
   @Test
@@ -4987,6 +5052,39 @@ public class TestFromClientSide {
     ScanMetrics scanMetrics = getScanMetrics(scan);
     assertEquals("Did not access all the regions in the table", numOfRegions,
         scanMetrics.countOfRegions.get());
+
+    // check byte counters
+    scan = new Scan();
+    scan.setAttribute(Scan.SCAN_ATTRIBUTES_METRICS_ENABLE, Bytes.toBytes(Boolean.TRUE));
+    scan.setCaching(1);
+    scanner = ht.getScanner(scan);
+    int numBytes = 0;
+    for (Result result : scanner.next(1)) {
+      for (Cell cell: result.listCells()) {
+        numBytes += KeyValueUtil.ensureKeyValue(cell).getLength();
+      }
+    }
+    scanner.close();
+    scanMetrics = getScanMetrics(scan);
+    assertEquals("Did not count the result bytes", numBytes,
+      scanMetrics.countOfBytesInResults.get());
+
+    // check byte counters on a small scan
+    scan = new Scan();
+    scan.setAttribute(Scan.SCAN_ATTRIBUTES_METRICS_ENABLE, Bytes.toBytes(Boolean.TRUE));
+    scan.setCaching(1);
+    scan.setSmall(true);
+    scanner = ht.getScanner(scan);
+    numBytes = 0;
+    for (Result result : scanner.next(1)) {
+      for (Cell cell: result.listCells()) {
+        numBytes += KeyValueUtil.ensureKeyValue(cell).getLength();
+      }
+    }
+    scanner.close();
+    scanMetrics = getScanMetrics(scan);
+    assertEquals("Did not count the result bytes", numBytes,
+      scanMetrics.countOfBytesInResults.get());
 
     // now, test that the metrics are still collected even if you don't call close, but do
     // run past the end of all the records
@@ -5359,6 +5457,151 @@ public class TestFromClientSide {
     }
 
     table.close();
+  }
+
+  @Test
+  public void testIllegalTableDescriptor() throws Exception {
+    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf("testIllegalTableDescriptor"));
+    HColumnDescriptor hcd = new HColumnDescriptor(FAMILY);
+
+    // create table with 0 families
+    checkTableIsIllegal(htd);
+    htd.addFamily(hcd);
+    checkTableIsLegal(htd);
+
+    htd.setMaxFileSize(1024); // 1K
+    checkTableIsIllegal(htd);
+    htd.setMaxFileSize(0);
+    checkTableIsIllegal(htd);
+    htd.setMaxFileSize(1024 * 1024 * 1024); // 1G
+    checkTableIsLegal(htd);
+
+    htd.setMemStoreFlushSize(1024);
+    checkTableIsIllegal(htd);
+    htd.setMemStoreFlushSize(0);
+    checkTableIsIllegal(htd);
+    htd.setMemStoreFlushSize(128 * 1024 * 1024); // 128M
+    checkTableIsLegal(htd);
+
+    htd.setRegionSplitPolicyClassName("nonexisting.foo.class");
+    checkTableIsIllegal(htd);
+    htd.setRegionSplitPolicyClassName(null);
+    checkTableIsLegal(htd);
+
+    hcd.setBlocksize(0);
+    checkTableIsIllegal(htd);
+    hcd.setBlocksize(1024 * 1024 * 128); // 128M
+    checkTableIsIllegal(htd);
+    hcd.setBlocksize(1024);
+    checkTableIsLegal(htd);
+
+    hcd.setTimeToLive(0);
+    checkTableIsIllegal(htd);
+    hcd.setTimeToLive(-1);
+    checkTableIsIllegal(htd);
+    hcd.setTimeToLive(1);
+    checkTableIsLegal(htd);
+
+    hcd.setMinVersions(-1);
+    checkTableIsIllegal(htd);
+    hcd.setMinVersions(3);
+    try {
+      hcd.setMaxVersions(2);
+      fail();
+    } catch (IllegalArgumentException ex) {
+      // expected
+      hcd.setMaxVersions(10);
+    }
+    checkTableIsLegal(htd);
+
+    // HBASE-13776 Setting illegal versions for HColumnDescriptor
+    //  does not throw IllegalArgumentException
+    // finally, minVersions must be less than or equal to maxVersions
+    hcd.setMaxVersions(4);
+    hcd.setMinVersions(5);
+    checkTableIsIllegal(htd);
+    hcd.setMinVersions(3);
+
+    hcd.setScope(-1);
+    checkTableIsIllegal(htd);
+    hcd.setScope(0);
+    checkTableIsLegal(htd);
+
+    try {
+      hcd.setDFSReplication((short) -1);
+      fail("Illegal value for setDFSReplication did not throw");
+    } catch (IllegalArgumentException e) {
+      // pass
+    }
+    // set an illegal DFS replication value by hand
+    hcd.setValue(HColumnDescriptor.DFS_REPLICATION, "-1");
+    checkTableIsIllegal(htd);
+    try {
+      hcd.setDFSReplication((short) -1);
+      fail("Should throw exception if an illegal value is explicitly being set");
+    } catch (IllegalArgumentException e) {
+      // pass
+    }
+
+    // check the conf settings to disable sanity checks
+    htd.setMemStoreFlushSize(0);
+
+    // Check that logs warn on invalid table but allow it.
+    ListAppender listAppender = new ListAppender();
+    Logger log = Logger.getLogger(HMaster.class);
+    log.addAppender(listAppender);
+    log.setLevel(Level.WARN);
+
+    htd.setConfiguration("hbase.table.sanity.checks", Boolean.FALSE.toString());
+    checkTableIsLegal(htd);
+
+    assertFalse(listAppender.getMessages().isEmpty());
+    assertTrue(listAppender.getMessages().get(0).startsWith("MEMSTORE_FLUSHSIZE for table "
+        + "descriptor or \"hbase.hregion.memstore.flush.size\" (0) is too small, which might "
+        + "cause very frequent flushing."));
+
+    log.removeAppender(listAppender);
+  }
+
+  private static class ListAppender extends AppenderSkeleton {
+    private final List<String> messages = new ArrayList<String>();
+
+    @Override
+    protected void append(LoggingEvent event) {
+      messages.add(event.getMessage().toString());
+    }
+
+    @Override
+    public void close() {
+    }
+
+    @Override
+    public boolean requiresLayout() {
+      return false;
+    }
+
+    public List<String> getMessages() {
+      return messages;
+    }
+  }
+
+  private void checkTableIsLegal(HTableDescriptor htd) throws IOException {
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+    admin.createTable(htd);
+    assertTrue(admin.tableExists(htd.getTableName()));
+    admin.disableTable(htd.getTableName());
+    admin.deleteTable(htd.getTableName());
+  }
+
+  private void checkTableIsIllegal(HTableDescriptor htd) throws IOException {
+    HBaseAdmin admin = TEST_UTIL.getHBaseAdmin();
+    try {
+      admin.createTable(htd);
+      fail();
+    } catch(Exception ex) {
+      // should throw ex
+    }
+    assertFalse(admin.tableExists(htd.getTableName()));
   }
 
   @Test
@@ -6106,5 +6349,25 @@ public class TestFromClientSide {
       lastRow = thisRow;
     }
     assertEquals(4, count); // 003 004 005 006
+  }
+
+  @Test
+  public void testFilterAllRecords() throws IOException {
+    Scan scan = new Scan();
+    scan.setBatch(1);
+    scan.setCaching(1);
+    // Filter out any records
+    scan.setFilter(new FilterList(new FirstKeyOnlyFilter(), new InclusiveStopFilter(new byte[0])));
+    HTable table = new HTable(TEST_UTIL.getConfiguration(), TableName.NAMESPACE_TABLE_NAME);
+    try {
+      ResultScanner s = table.getScanner(scan);
+      try {
+        assertNull(s.next());
+      } finally {
+        s.close();
+      }
+    } finally {
+      table.close();
+    }
   }
 }

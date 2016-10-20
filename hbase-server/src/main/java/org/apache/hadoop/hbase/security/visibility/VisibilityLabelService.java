@@ -20,19 +20,21 @@ package org.apache.hadoop.hbase.security.visibility;
 import java.io.IOException;
 import java.util.List;
 
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
-import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.hbase.Tag;
+import org.apache.hadoop.hbase.TagType;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
 import org.apache.hadoop.hbase.regionserver.OperationStatus;
+import org.apache.hadoop.hbase.security.User;
 
 /**
  * The interface which deals with visibility labels and user auths admin service as well as the cell
  * visibility expression storage part and read time evaluation.
  */
 @InterfaceAudience.Public
-@InterfaceStability.Evolving
+@InterfaceStability.Unstable
 public interface VisibilityLabelService extends Configurable {
 
   /**
@@ -72,13 +74,43 @@ public interface VisibilityLabelService extends Configurable {
   OperationStatus[] clearAuths(byte[] user, List<byte[]> authLabels) throws IOException;
 
   /**
+   * Retrieve the visibility labels for the user.
+   * @param user
+   *          Name of the user whose authorization to be retrieved
+   * @param systemCall
+   *          Whether a system or user originated call.
+   * @return Visibility labels authorized for the given user.
+   * @deprecated Use {@link#getUserAuths(byte[], boolean)}
+   */
+  @Deprecated
+  List<String> getAuths(byte[] user, boolean systemCall) throws IOException;
+
+  /**
+   * Retrieve the visibility labels for the user.
    * @param user
    *          Name of the user whose authorization to be retrieved
    * @param systemCall
    *          Whether a system or user originated call.
    * @return Visibility labels authorized for the given user.
    */
-  List<String> getAuths(byte[] user, boolean systemCall) throws IOException;
+  List<String> getUserAuths(byte[] user, boolean systemCall) throws IOException;
+
+  /**
+   * Retrieve the visibility labels for the groups.
+   * @param groups
+   *          Name of the groups whose authorization to be retrieved
+   * @param systemCall
+   *          Whether a system or user originated call.
+   * @return Visibility labels authorized for the given group.
+   */
+  List<String> getGroupAuths(String[] groups, boolean systemCall) throws IOException;
+
+  /**
+   * Retrieve the list of visibility labels defined in the system.
+   * @param regex  The regular expression to filter which labels are returned.
+   * @return List of visibility labels
+   */
+  List<String> listLabels(String regex) throws IOException;
 
   /**
    * Creates tags corresponding to given visibility expression.
@@ -115,8 +147,20 @@ public interface VisibilityLabelService extends Configurable {
    * @param user
    *          User for whom system auth check to be done.
    * @return true if the given user is having system/super auth
+   * @deprecated Use {@link#havingSystemAuth(User)}
    */
+  @Deprecated
   boolean havingSystemAuth(byte[] user) throws IOException;
+
+  /**
+   * System checks for user auth during admin operations. (ie. Label add, set/clear auth). The
+   * operation is allowed only for users having system auth. Also during read, if the requesting
+   * user has system auth, he can view all the data irrespective of its labels.
+   * @param user
+   *          User for whom system auth check to be done.
+   * @return true if the given user is having system/super auth
+   */
+  boolean havingSystemAuth(User user) throws IOException;
 
   /**
    * System uses this for deciding whether a Cell can be deleted by matching visibility expression
@@ -139,4 +183,25 @@ public interface VisibilityLabelService extends Configurable {
    */
   boolean matchVisibility(List<Tag> putVisTags, Byte putVisTagFormat, List<Tag> deleteVisTags,
       Byte deleteVisTagFormat) throws IOException;
+
+  /**
+   * Provides a way to modify the visibility tags of type {@link TagType}
+   * .VISIBILITY_TAG_TYPE, that are part of the cell created from the WALEdits
+   * that are prepared for replication while calling
+   * {@link org.apache.hadoop.hbase.replication.ReplicationEndpoint}
+   * .replicate().
+   * {@link org.apache.hadoop.hbase.security.visibility.VisibilityReplicationEndpoint}
+   * calls this API to provide an opportunity to modify the visibility tags
+   * before replicating.
+   *
+   * @param visTags
+   *          the visibility tags associated with the cell
+   * @param serializationFormat
+   *          the serialization format associated with the tag
+   * @return the modified visibility expression in the form of byte[]
+   * @throws IOException
+   */
+  byte[] encodeVisibilityForReplication(final List<Tag> visTags,
+      final Byte serializationFormat) throws IOException;
+
 }

@@ -139,9 +139,6 @@ public interface DataBlockEncoder {
      */
     ByteBuffer getValueShallowCopy();
 
-    /** @return key value at current position with position set to limit */
-    ByteBuffer getKeyValueBuffer();
-
     /**
      * @return the KeyValue object at the current position. Includes memstore
      *         timestamp.

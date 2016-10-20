@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.util.List;
 
 import org.apache.hadoop.hbase.util.ByteStringer;
-
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.CellScannable;
 import org.apache.hadoop.hbase.DoNotRetryIOException;
@@ -90,6 +89,7 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableTableReques
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetClusterStatusRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetSchemaAlterStatusRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescriptorsRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsBalancerEnabledRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsCatalogJanitorEnabledRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsMasterRunningRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyColumnRequest;
@@ -101,8 +101,8 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunnin
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.UnassignRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.GetLastFlushedSequenceIdRequest;
-import org.apache.hadoop.hbase.util.ByteStringer;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Triple;
 
@@ -516,12 +516,13 @@ public final class RequestConverter {
    * @return a scan request
    */
   public static ScanRequest buildScanRequest(final long scannerId, final int numberOfRows,
-      final boolean closeScanner, final long nextCallSeq) {
+      final boolean closeScanner, final long nextCallSeq, final boolean renew) {
     ScanRequest.Builder builder = ScanRequest.newBuilder();
     builder.setNumberOfRows(numberOfRows);
     builder.setCloseScanner(closeScanner);
     builder.setScannerId(scannerId);
     builder.setNextCallSeq(nextCallSeq);
+    builder.setRenew(renew);
     return builder.build();
   }
 
@@ -662,8 +663,15 @@ public final class RequestConverter {
         cells.add(i);
         builder.addAction(actionBuilder.setMutation(ProtobufUtil.toMutationNoData(
           MutationType.INCREMENT, i, mutationBuilder, action.getNonce())));
+      } else if (row instanceof RegionCoprocessorServiceExec) {
+        RegionCoprocessorServiceExec exec = (RegionCoprocessorServiceExec) row;
+        builder.addAction(actionBuilder.setServiceCall(ClientProtos.CoprocessorServiceCall
+            .newBuilder().setRow(ByteStringer.wrap(exec.getRow()))
+            .setServiceName(exec.getMethod().getService().getFullName())
+            .setMethodName(exec.getMethod().getName())
+            .setRequest(exec.getRequest().toByteString())));
       } else if (row instanceof RowMutations) {
-        continue; // ignore RowMutations
+        throw new UnsupportedOperationException("No RowMutations in multi calls; use mutateRow");
       } else {
         throw new DoNotRetryIOException("Multi doesn't support " + row.getClass().getName());
       }
@@ -767,6 +775,8 @@ public final class RequestConverter {
    if (server != null) {
      builder.setServerStartCode(server.getStartcode());
    }
+   // send the master's wall clock time as well, so that the RS can refer to it
+   builder.setMasterSystemTime(EnvironmentEdgeManager.currentTimeMillis());
    return builder.build();
  }
 
@@ -789,6 +799,7 @@ public final class RequestConverter {
    if (server != null) {
      builder.setServerStartCode(server.getStartcode());
    }
+   builder.setMasterSystemTime(EnvironmentEdgeManager.currentTimeMillis());
    return builder.build();
  }
 
@@ -907,6 +918,8 @@ public final class RequestConverter {
     builder.setRegionA(regionASpecifier);
     builder.setRegionB(regionBSpecifier);
     builder.setForcible(forcible);
+    // send the master's wall clock time as well, so that the RS can refer to it
+    builder.setMasterSystemTime(EnvironmentEdgeManager.currentTimeMillis());
     return builder.build();
   }
 
@@ -1286,6 +1299,15 @@ public final class RequestConverter {
    */
   public static SetBalancerRunningRequest buildSetBalancerRunningRequest(boolean on, boolean synchronous) {
     return SetBalancerRunningRequest.newBuilder().setOn(on).setSynchronous(synchronous).build();
+  }
+
+  /**
+   * Creates a protocol buffer IsBalancerEnabledRequest
+   *
+   * @return a IsBalancerEnabledRequest
+   */
+  public static IsBalancerEnabledRequest buildIsBalancerEnabledRequest() {
+    return IsBalancerEnabledRequest.newBuilder().build();
   }
 
   /**

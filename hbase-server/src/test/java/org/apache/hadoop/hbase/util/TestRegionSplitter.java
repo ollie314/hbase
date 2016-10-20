@@ -34,7 +34,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.util.RegionSplitter.HexStringSplit;
@@ -205,6 +205,9 @@ public class TestRegionSplitter {
                 xFF, xFF, xFF}, lastRow);
         assertArrayEquals(splitPoint,
                 new byte[] {(byte)0xef, xFF, xFF, xFF, xFF, xFF, xFF, xFF});
+
+        splitPoint = splitter.split(new byte[] {'a', 'a', 'a'}, new byte[] {'a', 'a', 'b'});
+        assertArrayEquals(splitPoint, new byte[] {'a', 'a', 'a', (byte)0x80 });
     }
 
   @Test
@@ -225,7 +228,7 @@ public class TestRegionSplitter {
     assertTrue(splitFailsPrecondition(algo, "\\xAA", "\\xAA")); // range error
     assertFalse(splitFailsPrecondition(algo, "\\x00", "\\x02", 3)); // should be fine
     assertFalse(splitFailsPrecondition(algo, "\\x00", "\\x0A", 11)); // should be fine
-    assertTrue(splitFailsPrecondition(algo, "\\x00", "\\x0A", 12)); // too granular
+    assertFalse(splitFailsPrecondition(algo, "\\x00", "\\x0A", 12)); // should be fine
   }
 
   private boolean splitFailsPrecondition(SplitAlgorithm algo) {

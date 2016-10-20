@@ -19,11 +19,12 @@
 package org.apache.hadoop.hbase.regionserver;
 
 import org.apache.hadoop.hbase.metrics.BaseSource;
+import org.apache.hadoop.hbase.metrics.JvmPauseMonitorSource;
 
 /**
  * Interface for classes that expose metrics about the regionserver.
  */
-public interface MetricsRegionServerSource extends BaseSource {
+public interface MetricsRegionServerSource extends BaseSource, JvmPauseMonitorSource {
 
   /**
    * The name of the metrics
@@ -88,6 +89,13 @@ public interface MetricsRegionServerSource extends BaseSource {
   void updateReplay(long t);
 
   /**
+   * Update the scan size.
+   *
+   * @param scanSize size of the scan
+   */
+  void updateScannerNext(long scanSize);
+
+  /**
    * Increment the number of slow Puts that have happened.
    */
   void incrSlowPut();
@@ -119,6 +127,16 @@ public interface MetricsRegionServerSource extends BaseSource {
   void updateSplitTime(long t);
 
   /**
+   * Increment number of a requested splits
+   */
+  void incrSplitRequest();
+
+  /**
+   * Increment number of successful splits
+   */
+  void incrSplitSuccess();
+
+  /**
    * Update the flush time histogram
    * @param t time it took, in milliseconds
    */
@@ -138,6 +156,14 @@ public interface MetricsRegionServerSource extends BaseSource {
   String MEMSTORE_SIZE = "memStoreSize";
   String MEMSTORE_SIZE_DESC = "Size of the memstore";
   String STOREFILE_SIZE = "storeFileSize";
+  String MAX_STORE_FILE_AGE = "maxStoreFileAge";
+  String MIN_STORE_FILE_AGE = "minStoreFileAge";
+  String AVG_STORE_FILE_AGE = "avgStoreFileAge";
+  String NUM_REFERENCE_FILES = "numReferenceFiles";
+  String MAX_STORE_FILE_AGE_DESC = "Max age of store files hosted on this region server";
+  String MIN_STORE_FILE_AGE_DESC = "Min age of store files hosted on this region server";
+  String AVG_STORE_FILE_AGE_DESC = "Average age of store files hosted on this region server";
+  String NUM_REFERENCE_FILES_DESC = "Number of reference file on this region server";
   String STOREFILE_SIZE_DESC = "Size of storefiles being served.";
   String TOTAL_REQUEST_COUNT = "totalRequestCount";
   String TOTAL_REQUEST_COUNT_DESC =
@@ -170,6 +196,8 @@ public interface MetricsRegionServerSource extends BaseSource {
   String PERCENT_FILES_LOCAL = "percentFilesLocal";
   String PERCENT_FILES_LOCAL_DESC =
       "The percent of HFiles that are stored on the local hdfs data node.";
+  String SPLIT_QUEUE_LENGTH = "splitQueueLength";
+  String SPLIT_QUEUE_LENGTH_DESC = "Length of the queue for splits.";
   String COMPACTION_QUEUE_LENGTH = "compactionQueueLength";
   String LARGE_COMPACTION_QUEUE_LENGTH = "largeCompactionQueueLength";
   String SMALL_COMPACTION_QUEUE_LENGTH = "smallCompactionQueueLength";
@@ -197,6 +225,32 @@ public interface MetricsRegionServerSource extends BaseSource {
   String BLOCK_CACHE_EXPRESS_HIT_PERCENT = "blockCacheExpressHitPercent";
   String BLOCK_CACHE_EXPRESS_HIT_PERCENT_DESC =
       "The percent of the time that requests with the cache turned on hit the cache.";
+  String BLOCK_CACHE_FAILED_INSERTION_COUNT = "blockCacheFailedInsertionCount";
+  String BLOCK_CACHE_FAILED_INSERTION_COUNT_DESC = "Number of times that a block cache " +
+      "insertion failed. Usually due to size restrictions.";
+  String BLOCK_CACHE_DATA_MISS_COUNT = "blockCacheDataMissCount";
+  String BLOCK_CACHE_ENCODED_DATA_MISS_COUNT = "blockCacheEncodedDataMissCount";
+  String BLOCK_CACHE_LEAF_INDEX_MISS_COUNT = "blockCacheLeafIndexMissCount";
+  String BLOCK_CACHE_BLOOM_CHUNK_MISS_COUNT = "blockCacheBloomChunkMissCount";
+  String BLOCK_CACHE_META_MISS_COUNT = "blockCacheMetaMissCount";
+  String BLOCK_CACHE_ROOT_INDEX_MISS_COUNT = "blockCacheRootIndexMissCount";
+  String BLOCK_CACHE_INTERMEDIATE_INDEX_MISS_COUNT = "blockCacheIntermediateIndexMissCount";
+  String BLOCK_CACHE_FILE_INFO_MISS_COUNT = "blockCacheFileInfoMissCount";
+  String BLOCK_CACHE_GENERAL_BLOOM_META_MISS_COUNT = "blockCacheGeneralBloomMetaMissCount";
+  String BLOCK_CACHE_DELETE_FAMILY_BLOOM_MISS_COUNT = "blockCacheDeleteFamilyBloomMissCount";
+  String BLOCK_CACHE_TRAILER_MISS_COUNT = "blockCacheTrailerMissCount";
+  String BLOCK_CACHE_DATA_HIT_COUNT = "blockCacheDataHitCount";
+  String BLOCK_CACHE_ENCODED_DATA_HIT_COUNT = "blockCacheEncodedDataHitCount";
+  String BLOCK_CACHE_LEAF_INDEX_HIT_COUNT = "blockCacheLeafIndexHitCount";
+  String BLOCK_CACHE_BLOOM_CHUNK_HIT_COUNT = "blockCacheBloomChunkHitCount";
+  String BLOCK_CACHE_META_HIT_COUNT = "blockCacheMetaHitCount";
+  String BLOCK_CACHE_ROOT_INDEX_HIT_COUNT = "blockCacheRootIndexHitCount";
+  String BLOCK_CACHE_INTERMEDIATE_INDEX_HIT_COUNT = "blockCacheIntermediateIndexHitCount";
+  String BLOCK_CACHE_FILE_INFO_HIT_COUNT = "blockCacheFileInfoHitCount";
+  String BLOCK_CACHE_GENERAL_BLOOM_META_HIT_COUNT = "blockCacheGeneralBloomMetaHitCount";
+  String BLOCK_CACHE_DELETE_FAMILY_BLOOM_HIT_COUNT = "blockCacheDeleteFamilyBloomHitCount";
+  String BLOCK_CACHE_TRAILER_HIT_COUNT = "blockCacheTrailerHitCount";
+  
   String RS_START_TIME_NAME = "regionServerStartTime";
   String ZOOKEEPER_QUORUM_NAME = "zookeeperQuorum";
   String SERVER_NAME_NAME = "serverName";
@@ -251,5 +305,13 @@ public interface MetricsRegionServerSource extends BaseSource {
       + "larger than blockingMemStoreSize";
 
   String SPLIT_KEY = "splitTime";
+  String SPLIT_REQUEST_KEY = "splitRequestCount";
+  String SPLIT_REQUEST_DESC = "Number of splits requested";
+  String SPLIT_SUCCESS_KEY = "splitSuccessCount";
+  String SPLIT_SUCCESS_DESC = "Number of successfully executed splits";
   String FLUSH_KEY = "flushTime";
+
+  String AVERAGE_REGION_SIZE = "averageRegionSize";
+  String AVERAGE_REGION_SIZE_DESC = 
+      "Average region size over the region server including memstore and storefile sizes.";
 }

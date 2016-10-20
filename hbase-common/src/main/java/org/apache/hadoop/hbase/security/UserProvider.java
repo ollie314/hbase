@@ -18,10 +18,24 @@
 package org.apache.hadoop.hbase.security;
 
 import java.io.IOException;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.CacheLoader;
+import com.google.common.cache.LoadingCache;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.ListeningExecutorService;
+import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.hbase.BaseConfigurable;
+import org.apache.hadoop.security.Groups;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.ReflectionUtils;
 
@@ -33,6 +47,70 @@ import org.apache.hadoop.util.ReflectionUtils;
 public class UserProvider extends BaseConfigurable {
 
   private static final String USER_PROVIDER_CONF_KEY = "hbase.client.userprovider.class";
+  private static final ListeningExecutorService executor = MoreExecutors.listeningDecorator(
+      Executors.newScheduledThreadPool(
+          1,
+          new ThreadFactoryBuilder().setDaemon(true).setNameFormat("group-cache-%d").build()));
+
+  private LoadingCache<String, String[]> groupCache = null;
+
+  static Groups groups = Groups.getUserToGroupsMappingService();
+
+  @Override
+  public void setConf(final Configuration conf) {
+    super.setConf(conf);
+
+    synchronized (UserProvider.class) {
+      if (!(groups instanceof User.TestingGroups)) {
+        groups = Groups.getUserToGroupsMappingService(conf);
+      }
+    }
+
+    long cacheTimeout =
+        getConf().getLong("hadoop.security.groups.cache.secs", 300) * 1000;
+
+    this.groupCache = CacheBuilder.newBuilder()
+        // This is the same timeout that hadoop uses. So we'll follow suit.
+        .refreshAfterWrite(cacheTimeout, TimeUnit.MILLISECONDS)
+        .expireAfterWrite(10 * cacheTimeout, TimeUnit.MILLISECONDS)
+            // Set concurrency level equal to the default number of handlers that
+            // the simple handler spins up.
+        .concurrencyLevel(20)
+            // create the loader
+            // This just delegates to UGI.
+        .build(new CacheLoader<String, String[]>() {
+
+          // Since UGI's don't hash based on the user id
+          // The cache needs to be keyed on the same thing that Hadoop's Groups class
+          // uses. So this cache uses shortname.
+          @Override
+          public String[] load(String ugi) throws Exception {
+            return getGroupStrings(ugi);
+          }
+
+          private String[] getGroupStrings(String ugi) {
+            try {
+              Set<String> result = new LinkedHashSet<String>(groups.getGroups(ugi));
+              return result.toArray(new String[result.size()]);
+            } catch (Exception e) {
+              return new String[0];
+            }
+          }
+
+          // Provide the reload function that uses the executor thread.
+          public ListenableFuture<String[]> reload(final String k,
+                                                   String[] oldValue) throws Exception {
+
+            return executor.submit(new Callable<String[]>() {
+
+              @Override
+              public String[] call() throws Exception {
+                return getGroupStrings(k);
+              }
+            });
+          }
+        });
+  }
 
   /**
    * Instantiate the {@link UserProvider} specified in the configuration and set the passed
@@ -95,7 +173,10 @@ public class UserProvider extends BaseConfigurable {
    * @return User
    */
   public User create(UserGroupInformation ugi) {
-    return User.create(ugi);
+    if (ugi == null) {
+      return null;
+    }
+    return new User.SecureHadoopUser(ugi, groupCache);
   }
 
   /**

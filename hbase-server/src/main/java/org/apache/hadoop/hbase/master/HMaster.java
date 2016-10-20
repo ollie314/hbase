@@ -29,6 +29,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,6 +39,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 import javax.management.ObjectName;
 
@@ -50,6 +52,7 @@ import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.Chore;
 import org.apache.hadoop.hbase.ClusterId;
 import org.apache.hadoop.hbase.ClusterStatus;
+import org.apache.hadoop.hbase.DoNotRetryIOException;
 import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
@@ -76,13 +79,13 @@ import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
+import org.apache.hadoop.hbase.errorhandling.ForeignException;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.exceptions.MergeRegionException;
 import org.apache.hadoop.hbase.exceptions.UnknownProtocolException;
 import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.executor.ExecutorType;
 import org.apache.hadoop.hbase.ipc.FifoRpcScheduler;
-import org.apache.hadoop.hbase.ipc.RequestContext;
 import org.apache.hadoop.hbase.ipc.RpcServer;
 import org.apache.hadoop.hbase.ipc.RpcServer.BlockingServiceAndInterface;
 import org.apache.hadoop.hbase.ipc.RpcServerInterface;
@@ -114,10 +117,10 @@ import org.apache.hadoop.hbase.protobuf.RequestConverter;
 import org.apache.hadoop.hbase.protobuf.ResponseConverter;
 import org.apache.hadoop.hbase.protobuf.generated.*;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameStringPair;
+import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ProcedureDescription;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionServerInfo;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.RegionSpecifierType;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
-import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ProcedureDescription;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AddColumnRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AddColumnResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.AssignRegionRequest;
@@ -144,6 +147,8 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableCatalogJani
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableCatalogJanitorResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableTableRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.EnableTableResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ExecProcedureRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ExecProcedureResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetClusterStatusRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetClusterStatusResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetCompletedSnapshotsRequest;
@@ -156,10 +161,14 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescripto
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableDescriptorsResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableNamesRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.GetTableNamesResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsBalancerEnabledRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsBalancerEnabledResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsCatalogJanitorEnabledRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsCatalogJanitorEnabledResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsMasterRunningRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsMasterRunningResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsProcedureDoneRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsProcedureDoneResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsRestoreSnapshotDoneRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsRestoreSnapshotDoneResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsSnapshotDoneRequest;
@@ -184,6 +193,9 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotRe
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RunCatalogScanResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesResponse.Capability;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownRequest;
@@ -196,10 +208,6 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableRequ
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.TruncateTableResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.UnassignRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.UnassignRegionResponse;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ExecProcedureRequest;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ExecProcedureResponse;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsProcedureDoneRequest;
-import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsProcedureDoneResponse;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.GetLastFlushedSequenceIdRequest;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.GetLastFlushedSequenceIdResponse;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.RegionServerReportRequest;
@@ -212,14 +220,26 @@ import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.Repor
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.ReportRegionStateTransitionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.ReportRegionStateTransitionResponse;
 import org.apache.hadoop.hbase.protobuf.generated.ZooKeeperProtos.SplitLogTask.RecoveryMode;
+import org.apache.hadoop.hbase.regionserver.DefaultStoreEngine;
+import org.apache.hadoop.hbase.regionserver.HStore;
+import org.apache.hadoop.hbase.regionserver.RegionCoprocessorHost;
+import org.apache.hadoop.hbase.regionserver.RegionSplitPolicy;
+import org.apache.hadoop.hbase.regionserver.compactions.ExploringCompactionPolicy;
+import org.apache.hadoop.hbase.regionserver.compactions.FIFOCompactionPolicy;
 import org.apache.hadoop.hbase.replication.regionserver.Replication;
+import org.apache.hadoop.hbase.security.User;
 import org.apache.hadoop.hbase.security.UserProvider;
+import org.apache.hadoop.hbase.security.access.AccessController;
+import org.apache.hadoop.hbase.security.visibility.VisibilityController;
 import org.apache.hadoop.hbase.snapshot.ClientSnapshotDescriptionUtils;
 import org.apache.hadoop.hbase.snapshot.SnapshotDescriptionUtils;
 import org.apache.hadoop.hbase.trace.SpanReceiverHost;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CompressionTest;
+import org.apache.hadoop.hbase.util.ConfigUtil;
+import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
+import org.apache.hadoop.hbase.util.EncryptionTest;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HFileArchiveUtil;
 import org.apache.hadoop.hbase.util.HasThread;
@@ -240,11 +260,11 @@ import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperListener;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.metrics.util.MBeanUtil;
-import org.apache.hadoop.net.DNS;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Watcher;
 
 import com.google.common.collect.Lists;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Maps;
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.Message;
@@ -275,6 +295,58 @@ RegionServerStatusProtos.RegionServerStatusService.BlockingInterface,
 MasterServices, Server {
   private static final Log LOG = LogFactory.getLog(HMaster.class.getName());
 
+  /**
+   * Protection against zombie master. Started once Master accepts active responsibility and
+   * starts taking over responsibilities. Allows a finite time window before giving up ownership.
+   */
+  private static class InitializationMonitor extends HasThread {
+    /** The amount of time in milliseconds to sleep before checking initialization status. */
+    public static final String TIMEOUT_KEY = "hbase.master.initializationmonitor.timeout";
+    public static final long TIMEOUT_DEFAULT = TimeUnit.MILLISECONDS.convert(15, TimeUnit.MINUTES);
+
+    /**
+     * When timeout expired and initialization has not complete, call {@link System#exit(int)} when
+     * true, do nothing otherwise.
+     */
+    public static final String HALT_KEY = "hbase.master.initializationmonitor.haltontimeout";
+    public static final boolean HALT_DEFAULT = false;
+
+    private final HMaster master;
+    private final long timeout;
+    private final boolean haltOnTimeout;
+
+    /** Creates a Thread that monitors the {@link #isInitialized()} state. */
+    InitializationMonitor(HMaster master) {
+      super("MasterInitializationMonitor");
+      this.master = master;
+      this.timeout = master.getConfiguration().getLong(TIMEOUT_KEY, TIMEOUT_DEFAULT);
+      this.haltOnTimeout = master.getConfiguration().getBoolean(HALT_KEY, HALT_DEFAULT);
+      this.setDaemon(true);
+    }
+
+    @Override
+    public void run() {
+      try {
+        while (!master.isStopped() && master.isActiveMaster()) {
+          Thread.sleep(timeout);
+          if (master.isInitialized()) {
+            LOG.debug("Initialization completed within allotted tolerance. Monitor exiting.");
+          } else {
+            LOG.error("Master failed to complete initialization after " + timeout + "ms. Please"
+                + " consider submitting a bug report including a thread dump of this process.");
+            if (haltOnTimeout) {
+              LOG.error("Zombie Master exiting. Thread dump to stdout");
+              Threads.printThreadInfo(System.out, "Zombie HMaster");
+              System.exit(-1);
+            }
+          }
+        }
+      } catch (InterruptedException ie) {
+        LOG.trace("InitMonitor thread interrupted. Existing.");
+      }
+    }
+  }
+
   // MASTER is name of the webapp and the attribute name used stuffing this
   //instance into web context.
   public static final String MASTER = "master";
@@ -299,7 +371,6 @@ MasterServices, Server {
 
   // RPC server for the HMaster
   private final RpcServerInterface rpcServer;
-  private JvmPauseMonitor pauseMonitor;
   // Set after we've called HBaseServer#openServer and ready to receive RPCs.
   // Set back to false after we stop rpcServer.  Used by tests.
   private volatile boolean rpcServerOpen = false;
@@ -314,6 +385,8 @@ MasterServices, Server {
 
   // Metrics for the HMaster
   private final MetricsMaster metricsMaster;
+  // Pause monitor
+  private final JvmPauseMonitor pauseMonitor;
   // file system manager for the master FS operations
   private MasterFileSystem fileSystemManager;
 
@@ -380,8 +453,11 @@ MasterServices, Server {
    */
   private ObjectName mxBean = null;
 
-  //should we check the compression codec type at master side, default true, HBASE-6370
+  // should we check the compression codec type at master side, default true, HBASE-6370
   private final boolean masterCheckCompression;
+
+  // should we check encryption settings at master side, default true
+  private final boolean masterCheckEncryption;
 
   private SpanReceiverHost spanReceiverHost;
 
@@ -454,8 +530,8 @@ MasterServices, Server {
       conf.getLong("hbase.master.buffer.for.rs.fatals", 1*1024*1024));
 
     // login the zookeeper client principal (if using security)
-    ZKUtil.loginClient(this.conf, "hbase.zookeeper.client.keytab.file",
-      "hbase.zookeeper.client.kerberos.principal", this.isa.getHostName());
+    ZKUtil.loginClient(this.conf, HConstants.ZK_CLIENT_KEYTAB_FILE,
+      HConstants.ZK_CLIENT_KERBEROS_PRINCIPAL, this.isa.getHostName());
 
     // initialize server principal (if using secure Hadoop)
     UserProvider provider = UserProvider.instantiate(conf);
@@ -478,16 +554,19 @@ MasterServices, Server {
 
     this.zooKeeper = new ZooKeeperWatcher(conf, MASTER + ":" + isa.getPort(), this, true);
     this.rpcServer.startThreads();
-    this.pauseMonitor = new JvmPauseMonitor(conf);
-    this.pauseMonitor.start();
 
     // metrics interval: using the same property as region server.
     this.msgInterval = conf.getInt("hbase.regionserver.msginterval", 3 * 1000);
 
-    //should we check the compression codec type at master side, default true, HBASE-6370
+    // should we check the compression codec type at master side, default true, HBASE-6370
     this.masterCheckCompression = conf.getBoolean("hbase.master.check.compression", true);
 
+    // should we check encryption settings at master side, default true
+    this.masterCheckEncryption = conf.getBoolean("hbase.master.check.encryption", true);
+
     this.metricsMaster = new MetricsMaster( new MetricsMasterWrapperImpl(this));
+    this.pauseMonitor = new JvmPauseMonitor(conf, metricsMaster.getMetricsSource());
+    this.pauseMonitor.start();
 
     // preload table descriptor at startup
     this.preLoadTableDescriptors = conf.getBoolean("hbase.master.preload.tabledescriptors", true);
@@ -794,6 +873,8 @@ MasterServices, Server {
   throws IOException, InterruptedException, KeeperException {
 
     isActiveMaster = true;
+    Thread zombieDetector = new Thread(new InitializationMonitor(this));
+    zombieDetector.start();
 
     /*
      * We are active master now... go initialize components we need to run.
@@ -957,6 +1038,10 @@ MasterServices, Server {
     // master initialization. See HBASE-5916.
     this.serverManager.clearDeadServersWithSameHostNameAndPortOfOnlineServer();
 
+    // Check and set the znode ACLs if needed in case we are overtaking a non-secure configuration
+    status.setStatus("Checking ZNode ACLs");
+    zooKeeper.checkAndSetZNodeAcls();
+
     if (!masterRecovery) {
       if (this.cpHost != null) {
         // don't let cp initialization errors kill the master
@@ -967,6 +1052,8 @@ MasterServices, Server {
         }
       }
     }
+
+    zombieDetector.interrupt();
   }
 
   /**
@@ -1001,16 +1088,27 @@ MasterServices, Server {
     status.setStatus("Assigning hbase:meta region");
 
     RegionStates regionStates = assignmentManager.getRegionStates();
-    regionStates.createRegionState(HRegionInfo.FIRST_META_REGIONINFO);
-    boolean rit = this.assignmentManager
-      .processRegionInTransitionAndBlockUntilAssigned(HRegionInfo.FIRST_META_REGIONINFO);
+
+    RegionState regionState = this.catalogTracker.getMetaRegionState();
+    ServerName currentMetaServer = regionState.getServerName();
+
+    if (!ConfigUtil.useZKForAssignment(conf)) {
+      regionStates.createRegionState(HRegionInfo.FIRST_META_REGIONINFO, regionState.getState(),
+        currentMetaServer);
+    } else {
+      regionStates.createRegionState(HRegionInfo.FIRST_META_REGIONINFO);
+    }
+    boolean rit =
+     this.assignmentManager
+         .processRegionInTransitionAndBlockUntilAssigned(HRegionInfo.FIRST_META_REGIONINFO);
     boolean metaRegionLocation = this.catalogTracker.verifyMetaRegionLocation(timeout);
-    ServerName currentMetaServer = this.catalogTracker.getMetaLocation();
-    if (!metaRegionLocation) {
+    if (!metaRegionLocation || !regionState.isOpened()) {
       // Meta location is not verified. It should be in transition, or offline.
       // We will wait for it to be assigned in enableSSHandWaitForMeta below.
       assigned++;
-      if (!rit) {
+      if (!ConfigUtil.useZKForAssignment(conf)) {
+        assignMetaZkLess(regionStates, regionState, timeout, previouslyFailedMetaRSs);
+      } else if (!rit) {
         // Assign meta since not already in transition
         if (currentMetaServer != null) {
           // If the meta server is not known to be dead or online,
@@ -1055,6 +1153,24 @@ MasterServices, Server {
     LOG.info("hbase:meta assigned=" + assigned + ", rit=" + rit +
       ", location=" + catalogTracker.getMetaLocation());
     status.setStatus("META assigned.");
+  }
+
+  private void assignMetaZkLess(RegionStates regionStates, RegionState regionState, long timeout,
+      Set<ServerName> previouslyFailedRs) throws IOException, KeeperException {
+    ServerName currentServer = regionState.getServerName();
+    if (serverManager.isServerOnline(currentServer)) {
+      LOG.info("Meta was in transition on " + currentServer);
+      assignmentManager.processRegionInTransitionZkLess();
+    } else {
+      if (currentServer != null) {
+        splitMetaLogBeforeAssignment(currentServer);
+        regionStates.logSplit(HRegionInfo.FIRST_META_REGIONINFO);
+        previouslyFailedRs.add(currentServer);
+      }
+      LOG.info("Re-assigning hbase:meta, it was on " + currentServer);
+      regionStates.updateRegionState(HRegionInfo.FIRST_META_REGIONINFO, State.OFFLINE);
+      assignmentManager.assignMeta();
+    }
   }
 
   void initNamespace() throws IOException {
@@ -1120,11 +1236,6 @@ MasterServices, Server {
     return result;
   }
 
-  @Override
-  public TableDescriptors getTableDescriptors() {
-    return this.tableDescriptors;
-  }
-
   /** @return InfoServer object. Maybe null.*/
   public InfoServer getInfoServer() {
     return this.infoServer;
@@ -1133,6 +1244,11 @@ MasterServices, Server {
   @Override
   public Configuration getConfiguration() {
     return this.conf;
+  }
+
+  @Override
+  public TableDescriptors getTableDescriptors() {
+    return this.tableDescriptors;
   }
 
   @Override
@@ -1565,8 +1681,7 @@ MasterServices, Server {
    * @return Client info for use as prefix on an audit log string; who did an action
    */
   String getClientIdAuditPrefix() {
-    return "Client=" + RequestContext.getRequestUserName() + "/" +
-      RequestContext.get().getRemoteAddress();
+    return "Client=" + RpcServer.getRequestUserName() + "/" + RpcServer.getRemoteAddress();
   }
 
   public boolean synchronousBalanceSwitch(final boolean b) throws IOException {
@@ -1741,11 +1856,11 @@ MasterServices, Server {
     }
 
     String namespace = hTableDescriptor.getTableName().getNamespaceAsString();
-    getNamespaceDescriptor(namespace); // ensure namespace exists
+    ensureNamespaceExists(namespace);
 
     HRegionInfo[] newRegions = getHRegionInfos(hTableDescriptor, splitKeys);
     checkInitialized();
-    checkCompression(hTableDescriptor);
+    sanityCheckTableDescriptor(hTableDescriptor);
     if (cpHost != null) {
       cpHost.preCreateTable(hTableDescriptor, newRegions);
     }
@@ -1757,6 +1872,198 @@ MasterServices, Server {
       cpHost.postCreateTable(hTableDescriptor, newRegions);
     }
 
+  }
+
+  /**
+   * Checks whether the table conforms to some sane limits, and configured
+   * values (compression, etc) work. Throws an exception if something is wrong.
+   * @throws IOException
+   */
+  private void sanityCheckTableDescriptor(final HTableDescriptor htd) throws IOException {
+    final String CONF_KEY = "hbase.table.sanity.checks";
+    boolean logWarn = false;
+    if (!conf.getBoolean(CONF_KEY, true)) {
+      logWarn = true;
+    }
+    String tableVal = htd.getConfigurationValue(CONF_KEY);
+    if (tableVal != null && !Boolean.valueOf(tableVal)) {
+      logWarn = true;
+    }
+
+    // check max file size
+    long maxFileSizeLowerLimit = 2 * 1024 * 1024L; // 2M is the default lower limit
+    long maxFileSize = htd.getMaxFileSize();
+    if (maxFileSize < 0) {
+      maxFileSize = conf.getLong(HConstants.HREGION_MAX_FILESIZE, maxFileSizeLowerLimit);
+    }
+    if (maxFileSize < conf.getLong("hbase.hregion.max.filesize.limit", maxFileSizeLowerLimit)) {
+      String message = "MAX_FILESIZE for table descriptor or "
+          + "\"hbase.hregion.max.filesize\" (" + maxFileSize
+          + ") is too small, which might cause over splitting into unmanageable "
+          + "number of regions.";
+      warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+    }
+
+    // check flush size
+    long flushSizeLowerLimit = 1024 * 1024L; // 1M is the default lower limit
+    long flushSize = htd.getMemStoreFlushSize();
+    if (flushSize < 0) {
+      flushSize = conf.getLong(HConstants.HREGION_MEMSTORE_FLUSH_SIZE, flushSizeLowerLimit);
+    }
+    if (flushSize < conf.getLong("hbase.hregion.memstore.flush.size.limit", flushSizeLowerLimit)) {
+      String message = "MEMSTORE_FLUSHSIZE for table descriptor or "
+          + "\"hbase.hregion.memstore.flush.size\" ("+flushSize+") is too small, which might cause"
+          + " very frequent flushing.";
+      warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+    }
+
+    // check that coprocessors and other specified plugin classes can be loaded
+    try {
+      checkClassLoading(conf, htd);
+    } catch (Exception ex) {
+      warnOrThrowExceptionForFailure(logWarn, CONF_KEY, ex.getMessage(), null);
+    }
+
+    // check compression can be loaded
+    try {
+      checkCompression(htd);
+    } catch (IOException e) {
+      warnOrThrowExceptionForFailure(logWarn, CONF_KEY, e.getMessage(), e);
+    }
+
+    // check encryption can be loaded
+    try {
+      checkEncryption(conf, htd);
+    } catch (IOException e) {
+      warnOrThrowExceptionForFailure(logWarn, CONF_KEY, e.getMessage(), e);
+    }
+    // Verify compaction policy
+    try{
+      checkCompactionPolicy(conf, htd);
+    } catch(IOException e){
+      warnOrThrowExceptionForFailure(false, CONF_KEY, e.getMessage(), e);
+    }
+    // check that we have at least 1 CF
+    if (htd.getColumnFamilies().length == 0) {
+      String message = "Table should have at least one column family.";
+      warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+    }
+
+    for (HColumnDescriptor hcd : htd.getColumnFamilies()) {
+      if (hcd.getTimeToLive() <= 0) {
+        String message = "TTL for column family " + hcd.getNameAsString() + " must be positive.";
+        warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+      }
+
+      // check blockSize
+      if (hcd.getBlocksize() < 1024 || hcd.getBlocksize() > 16 * 1024 * 1024) {
+        String message = "Block size for column family " + hcd.getNameAsString()
+            + "  must be between 1K and 16MB.";
+        warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+      }
+
+      // check versions
+      if (hcd.getMinVersions() < 0) {
+        String message = "Min versions for column family " + hcd.getNameAsString()
+          + "  must be positive.";
+        warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+      }
+      // max versions already being checked
+
+      // HBASE-13776 Setting illegal versions for HColumnDescriptor
+      //  does not throw IllegalArgumentException
+      // check minVersions <= maxVerions
+      if (hcd.getMinVersions() > hcd.getMaxVersions()) {
+        String message = "Min versions for column family " + hcd.getNameAsString()
+            + " must be less than the Max versions.";
+        warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+      }
+
+      // check replication scope
+      if (hcd.getScope() < 0) {
+        String message = "Replication scope for column family "
+          + hcd.getNameAsString() + "  must be positive.";
+        warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+      }
+
+      // check data replication factor, it can be 0(default value) when user has not explicitly
+      // set the value, in this case we use default replication factor set in the file system.
+      if (hcd.getDFSReplication() < 0) {
+        String message = "HFile Replication for column family " + hcd.getNameAsString()
+            + "  must be greater than zero.";
+        warnOrThrowExceptionForFailure(logWarn, CONF_KEY, message, null);
+      }
+
+      // TODO: should we check coprocessors and encryption ?
+    }
+  }
+
+  private void checkCompactionPolicy(Configuration conf, HTableDescriptor htd)
+      throws IOException {
+    // FIFO compaction has some requirements
+    // Actually FCP ignores periodic major compactions
+    String className =
+        htd.getConfigurationValue(DefaultStoreEngine.DEFAULT_COMPACTION_POLICY_CLASS_KEY);
+    if (className == null) {
+      className =
+          conf.get(DefaultStoreEngine.DEFAULT_COMPACTION_POLICY_CLASS_KEY,
+            ExploringCompactionPolicy.class.getName());
+    }
+
+    int blockingFileCount = HStore.DEFAULT_BLOCKING_STOREFILE_COUNT;
+    String sv = htd.getConfigurationValue(HStore.BLOCKING_STOREFILES_KEY);
+    if (sv != null) {
+      blockingFileCount = Integer.parseInt(sv);
+    } else {
+      blockingFileCount = conf.getInt(HStore.BLOCKING_STOREFILES_KEY, blockingFileCount);
+    }
+
+    for (HColumnDescriptor hcd : htd.getColumnFamilies()) {
+      String compactionPolicy =
+          hcd.getConfigurationValue(DefaultStoreEngine.DEFAULT_COMPACTION_POLICY_CLASS_KEY);
+      if (compactionPolicy == null) {
+        compactionPolicy = className;
+      }
+      if (!compactionPolicy.equals(FIFOCompactionPolicy.class.getName())) {
+        continue;
+      }
+      // FIFOCompaction
+      String message = null;
+
+      // 1. Check TTL
+      if (hcd.getTimeToLive() == HColumnDescriptor.DEFAULT_TTL) {
+        message = "Default TTL is not supported for FIFO compaction";
+        throw new IOException(message);
+      }
+
+      // 2. Check min versions
+      if (hcd.getMinVersions() > 0) {
+        message = "MIN_VERSION > 0 is not supported for FIFO compaction";
+        throw new IOException(message);
+      }
+
+      // 3. blocking file count
+      String sbfc = htd.getConfigurationValue(HStore.BLOCKING_STOREFILES_KEY);
+      if (sbfc != null) {
+        blockingFileCount = Integer.parseInt(sbfc);
+      }
+      if (blockingFileCount < 1000) {
+        message =
+            "blocking file count '" + HStore.BLOCKING_STOREFILES_KEY + "' " + blockingFileCount
+                + " is below recommended minimum of 1000";
+        throw new IOException(message);
+      }
+    }
+  }
+
+  // HBASE-13350 - Helper method to log warning on sanity check failures if checks disabled.
+  private static void warnOrThrowExceptionForFailure(boolean logWarn, String confKey,
+      String message, Exception cause) throws IOException {
+    if (!logWarn) {
+      throw new DoNotRetryIOException(message + " Set " + confKey +
+          " to false at conf or table descriptor if you want to bypass sanity checks", cause);
+    }
+    LOG.warn(message);
   }
 
   private void checkCompression(final HTableDescriptor htd)
@@ -1772,6 +2079,26 @@ MasterServices, Server {
     if (!this.masterCheckCompression) return;
     CompressionTest.testCompression(hcd.getCompression());
     CompressionTest.testCompression(hcd.getCompactionCompression());
+  }
+
+  private void checkEncryption(final Configuration conf, final HTableDescriptor htd)
+  throws IOException {
+    if (!this.masterCheckEncryption) return;
+    for (HColumnDescriptor hcd : htd.getColumnFamilies()) {
+      checkEncryption(conf, hcd);
+    }
+  }
+
+  private void checkEncryption(final Configuration conf, final HColumnDescriptor hcd)
+  throws IOException {
+    if (!this.masterCheckEncryption) return;
+    EncryptionTest.testEncryption(conf, hcd.getEncryptionType(), hcd.getEncryptionKey());
+  }
+
+  private void checkClassLoading(final Configuration conf, final HTableDescriptor htd)
+  throws IOException {
+    RegionSplitPolicy.getSplitPolicyClass(htd, conf);
+    RegionCoprocessorHost.testTableCoprocessorAttrs(conf, htd);
   }
 
   @Override
@@ -1869,6 +2196,7 @@ MasterServices, Server {
       throws IOException {
     checkInitialized();
     checkCompression(columnDescriptor);
+    checkEncryption(conf, columnDescriptor);
     if (cpHost != null) {
       if (cpHost.preAddColumn(tableName, columnDescriptor)) {
         return;
@@ -1898,6 +2226,7 @@ MasterServices, Server {
       throws IOException {
     checkInitialized();
     checkCompression(descriptor);
+    checkEncryption(conf, descriptor);
     if (cpHost != null) {
       if (cpHost.preModifyColumn(tableName, descriptor)) {
         return;
@@ -2040,7 +2369,7 @@ MasterServices, Server {
   public void modifyTable(final TableName tableName, final HTableDescriptor descriptor)
       throws IOException {
     checkInitialized();
-    checkCompression(descriptor);
+    sanityCheckTableDescriptor(descriptor);
     if (cpHost != null) {
       cpHost.preModifyTable(tableName, descriptor);
     }
@@ -2339,16 +2668,12 @@ MasterServices, Server {
     return rsFatals;
   }
 
-  public void shutdown() {
+  public void shutdown() throws IOException {
     if (spanReceiverHost != null) {
       spanReceiverHost.closeReceivers();
     }
     if (cpHost != null) {
-      try {
-        cpHost.preShutdown();
-      } catch (IOException ioe) {
-        LOG.error("Error call master coprocessor preShutdown()", ioe);
-      }
+      cpHost.preShutdown();
     }
     if (mxBean != null) {
       MBeanUtil.unregisterMBean(mxBean);
@@ -2369,17 +2694,18 @@ MasterServices, Server {
   public ShutdownResponse shutdown(RpcController controller, ShutdownRequest request)
   throws ServiceException {
     LOG.info(getClientIdAuditPrefix() + " shutdown");
-    shutdown();
+    try {
+      shutdown();
+    } catch (IOException e) {
+      LOG.error("Exception occurred in HMaster.shutdown()", e);
+      throw new ServiceException(e);
+    }
     return ShutdownResponse.newBuilder().build();
   }
 
-  public void stopMaster() {
+  public void stopMaster() throws IOException {
     if (cpHost != null) {
-      try {
-        cpHost.preStopMaster();
-      } catch (IOException ioe) {
-        LOG.error("Error call master coprocessor preStopMaster()", ioe);
-      }
+      cpHost.preStopMaster();
     }
     stop("Stopped by " + Thread.currentThread().getName());
   }
@@ -2388,7 +2714,12 @@ MasterServices, Server {
   public StopMasterResponse stopMaster(RpcController controller, StopMasterRequest request)
   throws ServiceException {
     LOG.info(getClientIdAuditPrefix() + " stop");
-    stopMaster();
+    try {
+      stopMaster();
+    } catch (IOException e) {
+      LOG.error("Exception occurred while stopping master", e);
+      throw new ServiceException(e);
+    }
     return StopMasterResponse.newBuilder().build();
   }
 
@@ -2740,8 +3071,9 @@ MasterServices, Server {
       }
 
       //invoke the method
-      Message execRequest = service.getRequestPrototype(methodDesc).newBuilderForType()
-          .mergeFrom(call.getRequest()).build();
+      Message.Builder builderForType = service.getRequestPrototype(methodDesc).newBuilderForType();
+      ProtobufUtil.mergeFrom(builderForType, call.getRequest());
+      Message execRequest = builderForType.build();
       final Message.Builder responseBuilder =
           service.getResponsePrototype(methodDesc).newBuilderForType();
       service.callMethod(methodDesc, execController, execRequest, new RpcCallback<Message>() {
@@ -2835,6 +3167,8 @@ MasterServices, Server {
       this.conf);
     try {
       snapshotManager.takeSnapshot(snapshot);
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -2885,6 +3219,8 @@ MasterServices, Server {
       LOG.info(getClientIdAuditPrefix() + " delete " + request.getSnapshot());
       snapshotManager.deleteSnapshot(request.getSnapshot());
       return DeleteSnapshotResponse.newBuilder().build();
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -2907,6 +3243,8 @@ MasterServices, Server {
       boolean done = snapshotManager.isSnapshotDone(request.getSnapshot());
       builder.setDone(done);
       return builder.build();
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -2937,7 +3275,7 @@ MasterServices, Server {
     // ensure namespace exists
     try {
       TableName dstTable = TableName.valueOf(request.getSnapshot().getTable());
-      getNamespaceDescriptor(dstTable.getNamespaceAsString());
+      ensureNamespaceExists(dstTable.getNamespaceAsString());
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
     }
@@ -2946,6 +3284,8 @@ MasterServices, Server {
       SnapshotDescription reqSnapshot = request.getSnapshot();
       snapshotManager.restoreSnapshot(reqSnapshot);
       return RestoreSnapshotResponse.newBuilder().build();
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -2970,6 +3310,8 @@ MasterServices, Server {
       boolean done = snapshotManager.isRestoreDone(snapshot);
       builder.setDone(done);
       return builder.build();
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -2995,6 +3337,8 @@ MasterServices, Server {
 
     try {
       mpm.execProcedure(desc);
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -3032,6 +3376,8 @@ MasterServices, Server {
       boolean done = mpm.isProcedureDone(desc);
       builder.setDone(done);
       return builder.build();
+    } catch (ForeignException e) {
+      throw new ServiceException(e.getCause());
     } catch (IOException e) {
       throw new ServiceException(e);
     }
@@ -3181,39 +3527,80 @@ MasterServices, Server {
     }
   }
 
-  @Override
-  public NamespaceDescriptor getNamespaceDescriptor(String name) throws IOException {
+  private void checkNamespaceManagerReady() throws IOException {
     boolean ready = tableNamespaceManager != null &&
         tableNamespaceManager.isTableAvailableAndInitialized();
     if (!ready) {
       throw new IOException("Table Namespace Manager not ready yet, try again later");
     }
+  }
+
+  /**
+   * Ensure that the specified namespace exists, otherwise throws a NamespaceNotFoundException
+   *
+   * @param name the namespace to check
+   * @throws IOException if the namespace manager is not ready yet.
+   * @throws NamespaceNotFoundException if the namespace does not exists
+   */
+  private void ensureNamespaceExists(final String name)
+      throws IOException, NamespaceNotFoundException {
+    checkNamespaceManagerReady();
     NamespaceDescriptor nsd = tableNamespaceManager.get(name);
     if (nsd == null) {
       throw new NamespaceNotFoundException(name);
     }
+  }
+
+  @Override
+  public NamespaceDescriptor getNamespaceDescriptor(String name) throws IOException {
+    checkNamespaceManagerReady();
+
+    if (cpHost != null) {
+      cpHost.preGetNamespaceDescriptor(name);
+    }
+
+    NamespaceDescriptor nsd = tableNamespaceManager.get(name);
+    if (nsd == null) {
+      throw new NamespaceNotFoundException(name);
+    }
+
+    if (cpHost != null) {
+      cpHost.postGetNamespaceDescriptor(nsd);
+    }
+
     return nsd;
   }
 
   @Override
   public List<NamespaceDescriptor> listNamespaceDescriptors() throws IOException {
-    return Lists.newArrayList(tableNamespaceManager.list());
+    checkNamespaceManagerReady();
+
+    final List<NamespaceDescriptor> descriptors = new ArrayList<NamespaceDescriptor>();
+    boolean bypass = false;
+    if (cpHost != null) {
+      bypass = cpHost.preListNamespaceDescriptors(descriptors);
+    }
+
+    if (!bypass) {
+      descriptors.addAll(tableNamespaceManager.list());
+
+      if (cpHost != null) {
+        cpHost.postListNamespaceDescriptors(descriptors);
+      }
+    }
+    return descriptors;
   }
 
   @Override
   public List<HTableDescriptor> listTableDescriptorsByNamespace(String name) throws IOException {
-    getNamespaceDescriptor(name); // check that namespace exists
-    return Lists.newArrayList(tableDescriptors.getByNamespace(name).values());
+    ensureNamespaceExists(name);
+    return listTableDescriptors(name, null, null, true);
   }
 
   @Override
   public List<TableName> listTableNamesByNamespace(String name) throws IOException {
-    List<TableName> tableNames = Lists.newArrayList();
-    getNamespaceDescriptor(name); // check that namespace exists
-    for (HTableDescriptor descriptor: tableDescriptors.getByNamespace(name).values()) {
-      tableNames.add(descriptor.getTableName());
-    }
-    return tableNames;
+    ensureNamespaceExists(name);
+    return listTableNames(name, null, true);
   }
 
   @Override
@@ -3223,7 +3610,9 @@ MasterServices, Server {
       RegionStateTransition rt = req.getTransition(0);
       TableName tableName = ProtobufUtil.toTableName(
         rt.getRegionInfo(0).getTableName());
-      if (!TableName.META_TABLE_NAME.equals(tableName)
+      RegionStates regionStates = assignmentManager.getRegionStates();
+      if (!(TableName.META_TABLE_NAME.equals(tableName)
+          && regionStates.getRegionState(HRegionInfo.FIRST_META_REGIONINFO) != null)
           && !assignmentManager.isFailoverCleanupDone()) {
         // Meta region is assigned before master finishes the
         // failover cleanup. So no need this check for it
@@ -3257,7 +3646,6 @@ MasterServices, Server {
     }
   }
 
-
   @Override
   public TruncateTableResponse truncateTable(RpcController controller, TruncateTableRequest request)
       throws ServiceException {
@@ -3267,6 +3655,188 @@ MasterServices, Server {
       throw new ServiceException(e);
     }
     return TruncateTableResponse.newBuilder().build();
+  }
+
+  @Override
+  public IsBalancerEnabledResponse isBalancerEnabled(RpcController controller,
+      IsBalancerEnabledRequest request) throws ServiceException {
+    IsBalancerEnabledResponse.Builder response = IsBalancerEnabledResponse.newBuilder();
+    response.setEnabled(isBalancerOn());
+    return response.build();
+  }
+
+  /**
+   * Returns the list of table descriptors that match the specified request
+   *
+   * @param namespace the namespace to query, or null if querying for all
+   * @param regex The regular expression to match against, or null if querying for all
+   * @param tableNameList the list of table names, or null if querying for all
+   * @param includeSysTables False to match only against userspace tables
+   * @return the list of table descriptors
+   */
+  public List<HTableDescriptor> listTableDescriptors(final String namespace, final String regex,
+      final List<TableName> tableNameList, final boolean includeSysTables)
+      throws IOException {
+    final List<HTableDescriptor> descriptors = new ArrayList<HTableDescriptor>();
+
+    boolean bypass = false;
+    if (cpHost != null) {
+      bypass = cpHost.preGetTableDescriptors(tableNameList, descriptors);
+    }
+
+    if (!bypass) {
+      if (tableNameList == null || tableNameList.size() == 0) {
+        // request for all TableDescriptors
+        Collection<HTableDescriptor> htds;
+        if (namespace != null && namespace.length() > 0) {
+          htds = tableDescriptors.getByNamespace(namespace).values();
+        } else {
+          htds = tableDescriptors.getAll().values();
+        }
+
+        for (HTableDescriptor desc: htds) {
+          if (includeSysTables || !desc.getTableName().isSystemTable()) {
+            descriptors.add(desc);
+          }
+        }
+      } else {
+        for (TableName s: tableNameList) {
+          HTableDescriptor desc = tableDescriptors.get(s);
+          if (desc != null) {
+            descriptors.add(desc);
+          }
+        }
+      }
+
+      // Retains only those matched by regular expression.
+      if (regex != null) {
+        filterTablesByRegex(descriptors, Pattern.compile(regex));
+      }
+
+      if (cpHost != null) {
+        cpHost.postGetTableDescriptors(descriptors);
+      }
+    }
+    return descriptors;
+  }
+
+  /**
+   * Returns the list of table names that match the specified request
+   * @param regex The regular expression to match against, or null if querying for all
+   * @param namespace the namespace to query, or null if querying for all
+   * @param includeSysTables False to match only against userspace tables
+   * @return the list of table names
+   */
+  public List<TableName> listTableNames(final String namespace, final String regex,
+      final boolean includeSysTables) throws IOException {
+    final List<HTableDescriptor> descriptors = new ArrayList<HTableDescriptor>();
+    // get all descriptors
+    Collection<HTableDescriptor> htds;
+    if (namespace != null && namespace.length() > 0) {
+      htds = tableDescriptors.getByNamespace(namespace).values();
+    } else {
+      htds = tableDescriptors.getAll().values();
+    }
+
+    for (HTableDescriptor htd: htds) {
+      if (includeSysTables || !htd.getTableName().isSystemTable()) {
+        descriptors.add(htd);
+      }
+    }
+
+    // Retains only those matched by regular expression.
+    if (regex != null) {
+      filterTablesByRegex(descriptors, Pattern.compile(regex));
+    }
+
+    List<TableName> result = new ArrayList<TableName>(descriptors.size());
+    for (HTableDescriptor htd: descriptors) {
+      result.add(htd.getTableName());
+    }
+    return result;
+  }
+
+  /**
+   * Removes the table descriptors that don't match the pattern.
+   * @param descriptors list of table descriptors to filter
+   * @param pattern the regex to use
+   */
+  private static void filterTablesByRegex(final Collection<HTableDescriptor> descriptors,
+      final Pattern pattern) {
+    final String defaultNS = NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR;
+    Iterator<HTableDescriptor> itr = descriptors.iterator();
+    while (itr.hasNext()) {
+      HTableDescriptor htd = itr.next();
+      String tableName = htd.getTableName().getNameAsString();
+      boolean matched = pattern.matcher(tableName).matches();
+      if (!matched && htd.getTableName().getNamespaceAsString().equals(defaultNS)) {
+        matched = pattern.matcher(defaultNS + TableName.NAMESPACE_DELIM + tableName).matches();
+      }
+      if (!matched) {
+        itr.remove();
+      }
+    }
+  }
+
+  /**
+   * Queries the state of the {@link LoadBalancerTracker}. If the balancer is not initialized,
+   * false is returned.
+   *
+   * @return The state of the load balancer, or false if the load balancer isn't defined.
+   */
+  public boolean isBalancerOn() {
+    if (null == loadBalancerTracker) return false;
+    return loadBalancerTracker.isBalancerOn();
+  }
+
+  /**
+   * Fetch the configured {@link LoadBalancer} class name. If none is set, a default is returned.
+   *
+   * @return The name of the {@link LoadBalancer} in use.
+   */
+  public String getLoadBalancerClassName() {
+    return conf.get(HConstants.HBASE_MASTER_LOADBALANCER_CLASS, LoadBalancerFactory
+      .getDefaultLoadBalancerClass().getName());
+  }
+
+  /** 
+   * Returns the security capabilities in effect on the cluster
+   */
+  @Override
+  public SecurityCapabilitiesResponse getSecurityCapabilities(RpcController controller,
+      SecurityCapabilitiesRequest request) throws ServiceException {
+    SecurityCapabilitiesResponse.Builder response = SecurityCapabilitiesResponse.newBuilder();
+    try {
+      checkInitialized();
+      Set<Capability> capabilities = new HashSet<Capability>();
+      // Authentication
+      if (User.isHBaseSecurityEnabled(conf)) {
+        capabilities.add(Capability.SECURE_AUTHENTICATION);
+      } else {
+        capabilities.add(Capability.SIMPLE_AUTHENTICATION);
+      }
+      // The AccessController can provide AUTHORIZATION and CELL_AUTHORIZATION
+      if (cpHost != null &&
+          cpHost.findCoprocessor(AccessController.class.getName()) != null) {
+        if (AccessController.isAuthorizationSupported(conf)) {
+          capabilities.add(Capability.AUTHORIZATION);
+        }
+        if (AccessController.isCellAuthorizationSupported(conf)) {
+          capabilities.add(Capability.CELL_AUTHORIZATION);
+        }
+      }
+      // The VisibilityController can provide CELL_VISIBILITY
+      if (cpHost != null &&
+          cpHost.findCoprocessor(VisibilityController.class.getName()) != null) {
+        if (VisibilityController.isCellAuthorizationSupported(conf)) {
+          capabilities.add(Capability.CELL_VISIBILITY);
+        }
+      }
+      response.addAllCapabilities(capabilities);
+    } catch (IOException e) {
+      throw new ServiceException(e);
+    }
+    return response.build();
   }
 
 }

@@ -33,7 +33,7 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.ipc.protobuf.generated.TestDelayedRpcProtos;
 import org.apache.hadoop.hbase.ipc.protobuf.generated.TestDelayedRpcProtos.TestArg;
@@ -90,9 +90,12 @@ public class TestDelayedRpc {
     rpcServer.start();
     RpcClient rpcClient = new RpcClient(conf, HConstants.DEFAULT_CLUSTER_ID.toString());
     try {
+      InetSocketAddress address = rpcServer.getListenerAddress();
+      if (address == null) {
+        throw new IOException("Listener channel is closed");
+      }
       BlockingRpcChannel channel = rpcClient.createBlockingRpcChannel(
-          ServerName.valueOf(rpcServer.getListenerAddress().getHostName(),
-              rpcServer.getListenerAddress().getPort(), System.currentTimeMillis()),
+          ServerName.valueOf(address.getHostName(),address.getPort(), System.currentTimeMillis()),
           User.getCurrent(), RPC_CLIENT_TIMEOUT);
       TestDelayedRpcProtos.TestDelayedService.BlockingInterface stub =
         TestDelayedRpcProtos.TestDelayedService.newBlockingStub(channel);
@@ -171,9 +174,12 @@ public class TestDelayedRpc {
     rpcServer.start();
     RpcClient rpcClient = new RpcClient(conf, HConstants.DEFAULT_CLUSTER_ID.toString());
     try {
+      InetSocketAddress address = rpcServer.getListenerAddress();
+      if (address == null) {
+        throw new IOException("Listener channel is closed");
+      }
       BlockingRpcChannel channel = rpcClient.createBlockingRpcChannel(
-          ServerName.valueOf(rpcServer.getListenerAddress().getHostName(),
-              rpcServer.getListenerAddress().getPort(), System.currentTimeMillis()),
+          ServerName.valueOf(address.getHostName(),address.getPort(), System.currentTimeMillis()),
           User.getCurrent(), RPC_CLIENT_TIMEOUT);
       TestDelayedRpcProtos.TestDelayedService.BlockingInterface stub =
         TestDelayedRpcProtos.TestDelayedService.newBlockingStub(channel);
@@ -294,9 +300,12 @@ public class TestDelayedRpc {
     rpcServer.start();
     RpcClient rpcClient = new RpcClient(conf, HConstants.DEFAULT_CLUSTER_ID.toString());
     try {
+      InetSocketAddress address = rpcServer.getListenerAddress();
+      if (address == null) {
+        throw new IOException("Listener channel is closed");
+      }
       BlockingRpcChannel channel = rpcClient.createBlockingRpcChannel(
-          ServerName.valueOf(rpcServer.getListenerAddress().getHostName(),
-              rpcServer.getListenerAddress().getPort(), System.currentTimeMillis()),
+          ServerName.valueOf(address.getHostName(),address.getPort(), System.currentTimeMillis()),
         User.getCurrent(), 1000);
       TestDelayedRpcProtos.TestDelayedService.BlockingInterface stub =
         TestDelayedRpcProtos.TestDelayedService.newBlockingStub(channel);

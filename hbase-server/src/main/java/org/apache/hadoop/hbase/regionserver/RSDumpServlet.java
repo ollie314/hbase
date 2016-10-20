@@ -20,6 +20,7 @@ package org.apache.hadoop.hbase.regionserver;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.util.Date;
 
@@ -31,14 +32,14 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.monitoring.LogMonitoring;
 import org.apache.hadoop.hbase.monitoring.StateDumpServlet;
 import org.apache.hadoop.hbase.monitoring.TaskMonitor;
-import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.hbase.util.Threads;
 
 @InterfaceAudience.Private
 public class RSDumpServlet extends StateDumpServlet {
   private static final long serialVersionUID = 1L;
   private static final String LINE =
     "===========================================================";
-  
+
   @Override
   public void doGet(HttpServletRequest request, HttpServletResponse response)
       throws IOException {
@@ -51,7 +52,7 @@ public class RSDumpServlet extends StateDumpServlet {
     assert hrsconf != null : "No RS conf in context";
 
     response.setContentType("text/plain");
- 
+
     if (!hrs.isOnline()) {
       response.getWriter().write("The RegionServer is initializing!");
       response.getWriter().close();
@@ -71,14 +72,20 @@ public class RSDumpServlet extends StateDumpServlet {
     out.println("\n\nTasks:");
     out.println(LINE);
     TaskMonitor.get().dumpAsText(out);
-    
+
+    out.println("\n\nRowLocks:");
+    out.println(LINE);
+    dumpRowLock(hrs, out);
+
     out.println("\n\nExecutors:");
     out.println(LINE);
     dumpExecutors(hrs.getExecutorService(), out);
     
     out.println("\n\nStacks:");
     out.println(LINE);
-    ReflectionUtils.printThreadInfo(out, "");
+    PrintStream ps = new PrintStream(response.getOutputStream(), false, "UTF-8");
+    Threads.printThreadInfo(ps, "");
+    ps.flush();
     
     out.println("\n\nRS Configuration:");
     out.println(LINE);
@@ -116,6 +123,21 @@ public class RSDumpServlet extends StateDumpServlet {
     out.println("\nFlush Queue summary: "
         + hrs.cacheFlusher.toString());
     out.println(hrs.cacheFlusher.dumpQueue());
+  }
+
+  public static void dumpRowLock(HRegionServer hrs, PrintWriter out) {
+    StringBuilder sb = new StringBuilder();
+    for (HRegion hRegion : hrs.getOnlineRegionsLocalContext()) {
+      if (hRegion.getLockedRows().size() > 0) {
+        for (HRegion.RowLockContext rowLockContext : hRegion.getLockedRows().values()) {
+          sb.setLength(0);
+          sb.append(hRegion.getTableDesc().getTableName()).append(",")
+            .append(hRegion.getRegionInfo().getEncodedName()).append(",");
+          sb.append(rowLockContext.toString());
+          out.println(sb.toString());
+        }
+      }
+    }
   }
   
 }

@@ -28,6 +28,7 @@ import org.apache.hadoop.hbase.*;
 import org.apache.hadoop.hbase.executor.EventType;
 import org.apache.hadoop.hbase.regionserver.HRegion;
 import org.apache.hadoop.hbase.regionserver.RegionServerServices;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.MockServer;
 import org.apache.hadoop.hbase.zookeeper.ZKAssign;
@@ -225,7 +226,7 @@ public class TestOpenRegionHandler {
     OpenRegionHandler handler =
       new OpenRegionHandler(server, rsServices, TEST_HRI, TEST_HTD) {
         @Override
-        boolean updateMeta(final HRegion r) {
+        boolean updateMeta(final HRegion r, long masterSystemTime) {
           // Fake failure of updating META
           return false;
         }
@@ -249,7 +250,7 @@ public class TestOpenRegionHandler {
     // Create the handler
     OpenRegionHandler handler = new OpenRegionHandler(server, rsServices, TEST_HRI, TEST_HTD) {
       @Override
-      boolean updateMeta(HRegion r) {
+      boolean updateMeta(HRegion r, long masterSystemTime) {
         return false;
       };
 

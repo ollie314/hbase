@@ -19,7 +19,6 @@ package org.apache.hadoop.hbase.regionserver.wal;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -30,7 +29,8 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.codec.KeyValueCodec;
+import org.apache.hadoop.hbase.KeyValueUtil;
+import org.apache.hadoop.hbase.codec.KeyValueCodecWithTags;
 import org.apache.hadoop.hbase.io.crypto.Decryptor;
 import org.apache.hadoop.hbase.io.crypto.Encryption;
 import org.apache.hadoop.hbase.io.crypto.Encryptor;
@@ -60,7 +60,7 @@ public class SecureWALCellCodec extends WALCellCodec {
     this.decryptor = decryptor;
   }
 
-  static class EncryptedKvDecoder extends KeyValueCodec.KeyValueDecoder {
+  static class EncryptedKvDecoder extends KeyValueCodecWithTags.KeyValueDecoder {
 
     private Decryptor decryptor;
     private byte[] iv;
@@ -83,12 +83,8 @@ public class SecureWALCellCodec extends WALCellCodec {
         return super.parseCell();
       }
       int ivLength = 0;
-      try {
-        ivLength = StreamUtils.readRawVarint32(in);
-      } catch (EOFException e) {
-        // EOF at start is OK
-        return null;
-      }
+
+      ivLength = StreamUtils.readRawVarint32(in);
 
       // TODO: An IV length of 0 could signify an unwrapped cell, when the
       // encoder supports that just read the remainder in directly
@@ -146,7 +142,7 @@ public class SecureWALCellCodec extends WALCellCodec {
 
   }
 
-  static class EncryptedKvEncoder extends KeyValueCodec.KeyValueEncoder {
+  static class EncryptedKvEncoder extends KeyValueCodecWithTags.KeyValueEncoder {
 
     private Encryptor encryptor;
     private final ThreadLocal<byte[]> iv = new ThreadLocal<byte[]>() {

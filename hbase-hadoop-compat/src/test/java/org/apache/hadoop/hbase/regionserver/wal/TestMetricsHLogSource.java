@@ -19,8 +19,12 @@
 package org.apache.hadoop.hbase.regionserver.wal;
 
 import org.apache.hadoop.hbase.CompatibilitySingletonFactory;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.testclassification.MetricsTests;
 import org.junit.Test;
+import org.junit.experimental.categories.Category;
 
+@Category({MetricsTests.class, SmallTests.class})
 public class TestMetricsHLogSource {
 
   @Test(expected=RuntimeException.class)

@@ -1,7 +1,5 @@
 #
 #/**
-# * Copyright 2007 The Apache Software Foundation
-# *
 # * Licensed to the Apache Software Foundation (ASF) under one
 # * or more contributor license agreements.  See the NOTICE file
 # * distributed with this work for additional information
@@ -63,6 +61,11 @@ do
     hosts=$1
     shift
     HBASE_REGIONSERVERS=$hosts
+  elif [ "--auth-as-server" = "$1" ]
+  then
+    shift
+    # shellcheck disable=SC2034
+    AUTH_AS_SERVER="true"
   else
     # Presume we are at end of options and break
     break
@@ -100,22 +103,20 @@ if [ -z "$HBASE_ENV_INIT" ] && [ -f "${HBASE_CONF_DIR}/hbase-env.sh" ]; then
   export HBASE_ENV_INIT="true"
 fi
 
-# Set default value for regionserver uid if not present
-if [ -z "$HBASE_REGIONSERVER_UID" ]; then
-  HBASE_REGIONSERVER_UID="hbase"
-fi
-
 # Verify if hbase has the mlock agent
 if [ "$HBASE_REGIONSERVER_MLOCK" = "true" ]; then
-  MLOCK_AGENT="$HBASE_HOME/native/libmlockall_agent.so"
+  MLOCK_AGENT="$HBASE_HOME/lib/native/libmlockall_agent.so"
   if [ ! -f "$MLOCK_AGENT" ]; then
     cat 1>&2 <<EOF
 Unable to find mlockall_agent, hbase must be compiled with -Pnative
 EOF
     exit 1
   fi
-
-  HBASE_REGIONSERVER_OPTS="$HBASE_REGIONSERVER_OPTS -agentpath:$MLOCK_AGENT=user=$HBASE_REGIONSERVER_UID"
+  if [ -z "$HBASE_REGIONSERVER_UID" ] || [ "$HBASE_REGIONSERVER_UID" == "$USER" ]; then
+      HBASE_REGIONSERVER_OPTS="$HBASE_REGIONSERVER_OPTS -agentpath:$MLOCK_AGENT"
+  else
+      HBASE_REGIONSERVER_OPTS="$HBASE_REGIONSERVER_OPTS -agentpath:$MLOCK_AGENT=user=$HBASE_REGIONSERVER_UID"
+  fi
 fi
 
 # Newer versions of glibc use an arena memory allocator that causes virtual
@@ -126,14 +127,12 @@ export MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-4}
 if [ -z "$JAVA_HOME" ]; then
     cat 1>&2 <<EOF
 +======================================================================+
-|      Error: JAVA_HOME is not set and Java could not be found         |
+|                    Error: JAVA_HOME is not set                       |
 +----------------------------------------------------------------------+
 | Please download the latest Sun JDK from the Sun Java web site        |
-|       > http://java.sun.com/javase/downloads/ <                      |
+|     > http://www.oracle.com/technetwork/java/javase/downloads        |
 |                                                                      |
 | HBase requires Java 1.6 or later.                                    |
-| NOTE: This script will find Sun Java whether you install using the   |
-|       binary or the RPM based installer.                             |
 +======================================================================+
 EOF
     exit 1

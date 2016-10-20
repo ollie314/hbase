@@ -106,6 +106,11 @@ public class MetricMutableHistogram extends MetricMutable implements MetricHisto
   public void snapshot(MetricsRecordBuilder metricsRecordBuilder, boolean all) {
     if (all || changed()) {
       clearChanged();
+      updateSnapshotMetrics(metricsRecordBuilder);
+    }
+  }
+  
+  public void updateSnapshotMetrics(MetricsRecordBuilder metricsRecordBuilder) {
       final Snapshot s = sample.getSnapshot();
       metricsRecordBuilder.addCounter(name + NUM_OPS_METRIC_NAME, "", count.get());
       metricsRecordBuilder.addGauge(name + MIN_METRIC_NAME, "", getMin());
@@ -114,8 +119,8 @@ public class MetricMutableHistogram extends MetricMutable implements MetricHisto
 
       metricsRecordBuilder.addGauge(name + MEDIAN_METRIC_NAME, "", s.getMedian());
       metricsRecordBuilder.addGauge(name + SEVENTY_FIFTH_PERCENTILE_METRIC_NAME, "", s.get75thPercentile());
+      metricsRecordBuilder.addGauge(name + NINETIETH_PERCENTILE_METRIC_NAME, "", s.getValue(0.90));
       metricsRecordBuilder.addGauge(name + NINETY_FIFTH_PERCENTILE_METRIC_NAME, "", s.get95thPercentile());
       metricsRecordBuilder.addGauge(name + NINETY_NINETH_PERCENTILE_METRIC_NAME, "", s.get99thPercentile());
-    }
   }
 }

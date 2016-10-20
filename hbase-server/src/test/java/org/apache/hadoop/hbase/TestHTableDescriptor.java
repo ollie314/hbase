@@ -31,6 +31,7 @@ import org.apache.hadoop.hbase.client.Durability;
 import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
 import org.apache.hadoop.hbase.coprocessor.SampleRegionWALObserver;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
@@ -41,6 +42,50 @@ import org.junit.experimental.categories.Category;
 @Category(SmallTests.class)
 public class TestHTableDescriptor {
   final static Log LOG = LogFactory.getLog(TestHTableDescriptor.class);
+
+  @Test (expected=IOException.class)
+  public void testAddCoprocessorTwice() throws IOException {
+    HTableDescriptor htd = new HTableDescriptor(TableName.META_TABLE_NAME);
+    String cpName = "a.b.c.d";
+    htd.addCoprocessor(cpName);
+    htd.addCoprocessor(cpName);
+  }
+
+  @Test
+  public void testAddCoprocessorWithSpecStr() throws IOException {
+    HTableDescriptor htd = new HTableDescriptor(TableName.META_TABLE_NAME);
+    String cpName = "a.b.c.d";
+    try {
+      htd.addCoprocessorWithSpec(cpName);
+      fail();
+    } catch (IllegalArgumentException iae) {
+      // Expected as cpName is invalid
+    }
+
+    // Try minimal spec.
+    try {
+      htd.addCoprocessorWithSpec("file:///some/path" + "|" + cpName);
+      fail();
+    } catch (IllegalArgumentException iae) {
+      // Expected to be invalid
+    }
+
+    // Try more spec.
+    String spec = "hdfs:///foo.jar|com.foo.FooRegionObserver|1001|arg1=1,arg2=2";
+    try {
+      htd.addCoprocessorWithSpec(spec);
+    } catch (IllegalArgumentException iae) {
+      fail();
+    }
+
+    // Try double add of same coprocessor
+    try {
+      htd.addCoprocessorWithSpec(spec);
+      fail();
+    } catch (IOException ioe) {
+      // Expect that the coprocessor already exists
+    }
+  }
 
   @Test
   public void testPb() throws DeserializationException, IOException {
@@ -204,5 +249,12 @@ public class TestHTableDescriptor {
     assertEquals(value, desc.getConfigurationValue(key));
     desc.removeConfiguration(key);
     assertEquals(null, desc.getConfigurationValue(key));
+  }
+
+  @Test
+  public void testPriority() {
+    HTableDescriptor htd = new HTableDescriptor(TableName.valueOf("table"));
+    htd.setPriority(42);
+    assertEquals(42, htd.getPriority());
   }
 }

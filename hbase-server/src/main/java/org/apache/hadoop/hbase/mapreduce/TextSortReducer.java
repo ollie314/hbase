@@ -18,7 +18,9 @@
 package org.apache.hadoop.hbase.mapreduce;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -28,8 +30,12 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValueUtil;
+import org.apache.hadoop.hbase.Tag;
+import org.apache.hadoop.hbase.TagType;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
+import org.apache.hadoop.hbase.security.visibility.InvalidLabelException;
 import org.apache.hadoop.hbase.util.Base64;
+import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Counter;
 import org.apache.hadoop.mapreduce.Reducer;
@@ -62,6 +68,9 @@ public class TextSortReducer extends
   /** Cell visibility expr **/
   private String cellVisibilityExpr;
 
+  /** Cell TTL */
+  private long ttl;
+
   private CellCreator kvCreator;
 
   public long getTs() {
@@ -90,9 +99,8 @@ public class TextSortReducer extends
    */
   @Override
   protected void setup(Context context) {
-    doSetup(context);
-
     Configuration conf = context.getConfiguration();
+    doSetup(context, conf);
 
     parser = new ImportTsv.TsvParser(conf.get(ImportTsv.COLUMNS_CONF_KEY), separator);
     if (parser.getRowKeyColumnIndex() == -1) {
@@ -104,10 +112,9 @@ public class TextSortReducer extends
   /**
    * Handles common parameter initialization that a subclass might want to leverage.
    * @param context
+   * @param conf
    */
-  protected void doSetup(Context context) {
-    Configuration conf = context.getConfiguration();
-
+  protected void doSetup(Context context, Configuration conf) {
     // If a custom separator has been used,
     // decode it back from Base64 encoding.
     separator = conf.get(ImportTsv.SEPARATOR_CONF_KEY);
@@ -148,22 +155,41 @@ public class TextSortReducer extends
           // Retrieve timestamp if exists
           ts = parsed.getTimestamp(ts);
           cellVisibilityExpr = parsed.getCellVisibility();
+          ttl = parsed.getCellTTL();
 
           for (int i = 0; i < parsed.getColumnCount(); i++) {
             if (i == parser.getRowKeyColumnIndex() || i == parser.getTimestampKeyColumnIndex()
-                || i == parser.getAttributesKeyColumnIndex() || i == parser.getCellVisibilityColumnIndex()) {
+                || i == parser.getAttributesKeyColumnIndex() || i == parser.getCellVisibilityColumnIndex()
+                || i == parser.getCellTTLColumnIndex()) {
               continue;
             }
             // Creating the KV which needs to be directly written to HFiles. Using the Facade
             // KVCreator for creation of kvs.
+            List<Tag> tags = new ArrayList<Tag>();
+            if (cellVisibilityExpr != null) {
+              tags.addAll(kvCreator.getVisibilityExpressionResolver()
+                .createVisibilityExpTags(cellVisibilityExpr));
+            }
+            // Add TTL directly to the KV so we can vary them when packing more than one KV
+            // into puts
+            if (ttl > 0) {
+              tags.add(new Tag(TagType.TTL_TAG_TYPE, Bytes.toBytes(ttl)));
+            }
             Cell cell = this.kvCreator.create(lineBytes, parsed.getRowKeyOffset(),
                 parsed.getRowKeyLength(), parser.getFamily(i), 0, parser.getFamily(i).length,
                 parser.getQualifier(i), 0, parser.getQualifier(i).length, ts, lineBytes,
-                parsed.getColumnOffset(i), parsed.getColumnLength(i), cellVisibilityExpr);
+                parsed.getColumnOffset(i), parsed.getColumnLength(i), tags);
             KeyValue kv = KeyValueUtil.ensureKeyValue(cell);
             kvs.add(kv);
             curSize += kv.heapSize();
           }
+        } catch (InvalidLabelException badLine) {
+          if (skipBadLines) {
+            System.err.println("Bad line." + badLine.getMessage());
+            incrementBadLineCount(1);
+            continue;
+          }
+          throw new IOException(badLine);
         } catch (ImportTsv.TsvParser.BadTsvLineException badLine) {
           if (skipBadLines) {
             System.err.println("Bad line." + badLine.getMessage());

@@ -23,18 +23,20 @@
   <parent>
     <artifactId>hbase</artifactId>
     <groupId>org.apache.hbase</groupId>
-    <version>0.98.9-SNAPSHOT</version>
+    <version>0.98.23</version>
     <relativePath>..</relativePath>
   </parent>
 
   <artifactId>hbase-it</artifactId>
-  <name>HBase - Integration Tests</name>
+  <name>Apache HBase - Integration Tests</name>
   <description>Integration and System tests for HBase</description>
 
   <properties>
     <!-- Test inclusion patterns used by failsafe configuration -->
     <unittest.include>**/Test*.java</unittest.include>
     <integrationtest.include>**/IntegrationTest*.java</integrationtest.include>
+    <!-- To Run Tests with a particular Xmx Value use -Dfailsafe.Xmx=XXXg -->
+    <failsafe.Xmx>3g</failsafe.Xmx>
     <!-- To run a single integration test, use -Dit.test=IntegrationTestXXX -->
   </properties>
 
@@ -43,6 +45,10 @@
       <testResource>
          <!-- We depend on hbase-server test resources -->
         <directory>../hbase-server/src/test/resources</directory>
+        <excludes>
+          <exclude>META-INF/NOTICE</exclude>
+          <exclude>META-INF/LICENSE</exclude>
+        </excludes>
       </testResource>
     </testResources>
     <pluginManagement>
@@ -113,6 +119,45 @@
             </execution>
           </executions>
         </plugin>
+        <!--This plugin's configuration is used to store Eclipse m2e settings
+             only. It has no influence on the Maven build itself.-->
+        <plugin>
+          <groupId>org.eclipse.m2e</groupId>
+          <artifactId>lifecycle-mapping</artifactId>
+          <version>1.0.0</version>
+          <configuration>
+            <lifecycleMappingMetadata>
+              <pluginExecutions>
+                <pluginExecution>
+                  <pluginExecutionFilter>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-dependency-plugin</artifactId>
+                    <versionRange>[2.8,)</versionRange>
+                    <goals>
+                      <goal>build-classpath</goal>
+                    </goals>
+                  </pluginExecutionFilter>
+                  <action>
+                    <ignore></ignore>
+                  </action>
+                </pluginExecution>
+                <pluginExecution>
+                  <pluginExecutionFilter>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <versionRange>[3.2,)</versionRange>
+                    <goals>
+                      <goal>compile</goal>
+                    </goals>
+                  </pluginExecutionFilter>
+                  <action>
+                    <ignore></ignore>
+                  </action>
+                </pluginExecution>
+              </pluginExecutions>
+            </lifecycleMappingMetadata>
+          </configuration>
+        </plugin>
       </plugins>
     </pluginManagement>
 
@@ -127,7 +172,7 @@
             <!-- TODO: failsafe does timeout, but verify does not fail the build because of the timeout.
                  I believe it is a failsafe bug, we may consider using surefire -->
             <forkedProcessTimeoutInSeconds>1800</forkedProcessTimeoutInSeconds>
-            <argLine>-enableassertions -Xmx1900m
+            <argLine>-enableassertions -Xmx${failsafe.Xmx}
               -Djava.security.egd=file:/dev/./urandom</argLine>
             <testFailureIgnore>false</testFailureIgnore>
           </configuration>
@@ -180,6 +225,11 @@
     <dependency>
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.sun.jersey</groupId>
+      <artifactId>jersey-client</artifactId>
+      <version>${jersey.version}</version>
     </dependency>
     <dependency>
       <groupId>commons-logging</groupId>

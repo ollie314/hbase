@@ -22,7 +22,6 @@ import org.apache.hadoop.hbase.metrics.BaseSourceImpl;
 import org.apache.hadoop.metrics2.MetricHistogram;
 import org.apache.hadoop.metrics2.lib.MetricMutableCounterLong;
 
-
 /**
  * Class that transitions metrics from HLog's MetricsWAL into the metrics subsystem.
  *
@@ -35,7 +34,9 @@ public class MetricsWALSourceImpl extends BaseSourceImpl implements MetricsWALSo
   private final MetricMutableCounterLong appendCount;
   private final MetricMutableCounterLong slowAppendCount;
   private final MetricHistogram syncTimeHisto;
-
+  private final MetricMutableCounterLong logRollRequested;
+  private final MetricMutableCounterLong lowReplicationLogRollRequested;
+  private final MetricMutableCounterLong writtenBytes;
 
   public MetricsWALSourceImpl() {
     this(METRICS_NAME, METRICS_DESCRIPTION, METRICS_CONTEXT, METRICS_JMX_CONTEXT);
@@ -48,11 +49,17 @@ public class MetricsWALSourceImpl extends BaseSourceImpl implements MetricsWALSo
     super(metricsName, metricsDescription, metricsContext, metricsJmxContext);
 
     //Create and store the metrics that will be used.
-    appendTimeHisto = this.getMetricsRegistry().newHistogram(APPEND_TIME, APPEND_TIME_DESC);
-    appendSizeHisto = this.getMetricsRegistry().newHistogram(APPEND_SIZE, APPEND_SIZE_DESC);
+    appendTimeHisto = this.getMetricsRegistry().newTimeHistogram(APPEND_TIME, APPEND_TIME_DESC);
+    appendSizeHisto = this.getMetricsRegistry().newSizeHistogram(APPEND_SIZE, APPEND_SIZE_DESC);
     appendCount = this.getMetricsRegistry().newCounter(APPEND_COUNT, APPEND_COUNT_DESC, 0l);
-    slowAppendCount = this.getMetricsRegistry().newCounter(SLOW_APPEND_COUNT, SLOW_APPEND_COUNT_DESC, 0l);
-    syncTimeHisto = this.getMetricsRegistry().newHistogram(SYNC_TIME, SYNC_TIME_DESC);
+    slowAppendCount =
+        this.getMetricsRegistry().newCounter(SLOW_APPEND_COUNT, SLOW_APPEND_COUNT_DESC, 0l);
+    syncTimeHisto = this.getMetricsRegistry().newTimeHistogram(SYNC_TIME, SYNC_TIME_DESC);
+    logRollRequested =
+        this.getMetricsRegistry().newCounter(ROLL_REQUESTED, ROLL_REQUESTED_DESC, 0L);
+    lowReplicationLogRollRequested = this.getMetricsRegistry()
+        .newCounter(LOW_REPLICA_ROLL_REQUESTED, LOW_REPLICA_ROLL_REQUESTED_DESC, 0L);
+    writtenBytes = this.getMetricsRegistry().newCounter(WRITTEN_BYTES, WRITTEN_BYTES_DESC, 0l);
   }
 
   @Override
@@ -78,5 +85,20 @@ public class MetricsWALSourceImpl extends BaseSourceImpl implements MetricsWALSo
   @Override
   public void incrementSyncTime(long time) {
     syncTimeHisto.add(time);
+  }
+
+  @Override
+  public void incrementLogRollRequested() {
+    logRollRequested.incr();
+  }
+
+  @Override
+  public void incrementLowReplicationLogRoll() {
+    lowReplicationLogRollRequested.incr();
+  }
+
+  @Override
+  public void incrementWrittenBytes(long val) {
+    writtenBytes.incr(val);
   }
 }

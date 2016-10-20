@@ -24,10 +24,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hadoop.hbase.CellScannable;
@@ -37,7 +34,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.RegionException;
 import org.apache.hadoop.hbase.RegionTransition;
 import org.apache.hadoop.hbase.Server;
@@ -105,6 +102,8 @@ public class TestAssignmentManager {
       ServerName.valueOf("example.org", 1234, 5678);
   private static final ServerName SERVERNAME_B =
       ServerName.valueOf("example.org", 0, 5678);
+  private static final ServerName SERVERNAME_C =
+      ServerName.valueOf("example.org", 0, 5678);
   private static final HRegionInfo REGIONINFO =
     new HRegionInfo(TableName.valueOf("t"),
       HConstants.EMPTY_START_ROW, HConstants.EMPTY_START_ROW);
@@ -152,10 +151,12 @@ public class TestAssignmentManager {
     this.serverManager = Mockito.mock(ServerManager.class);
     Mockito.when(this.serverManager.isServerOnline(SERVERNAME_A)).thenReturn(true);
     Mockito.when(this.serverManager.isServerOnline(SERVERNAME_B)).thenReturn(true);
+    Mockito.when(this.serverManager.isServerOnline(SERVERNAME_C)).thenReturn(true);
     Mockito.when(this.serverManager.getDeadServers()).thenReturn(new DeadServer());
     final Map<ServerName, ServerLoad> onlineServers = new HashMap<ServerName, ServerLoad>();
     onlineServers.put(SERVERNAME_B, ServerLoad.EMPTY_SERVERLOAD);
     onlineServers.put(SERVERNAME_A, ServerLoad.EMPTY_SERVERLOAD);
+    onlineServers.put(SERVERNAME_C, ServerLoad.EMPTY_SERVERLOAD);
     Mockito.when(this.serverManager.getOnlineServersList()).thenReturn(
         new ArrayList<ServerName>(onlineServers.keySet()));
     Mockito.when(this.serverManager.getOnlineServers()).thenReturn(onlineServers);
@@ -169,12 +170,18 @@ public class TestAssignmentManager {
       thenReturn(true);
     Mockito.when(this.serverManager.sendRegionClose(SERVERNAME_B, REGIONINFO, -1)).
       thenReturn(true);
+    Mockito.when(this.serverManager.sendRegionClose(SERVERNAME_C, REGIONINFO, -1)).
+        thenReturn(true);
     // Ditto on open.
     Mockito.when(this.serverManager.sendRegionOpen(SERVERNAME_A, REGIONINFO, -1, null)).
       thenReturn(RegionOpeningState.OPENED);
     Mockito.when(this.serverManager.sendRegionOpen(SERVERNAME_B, REGIONINFO, -1, null)).
       thenReturn(RegionOpeningState.OPENED);
+    Mockito.when(this.serverManager.sendRegionOpen(SERVERNAME_C, REGIONINFO, -1, null)).
+        thenReturn(RegionOpeningState.OPENED);
     this.master = Mockito.mock(HMaster.class);
+    Mockito.when(this.serverManager.getDrainingServersList())
+        .thenReturn(Arrays.asList(SERVERNAME_C));
 
     Mockito.when(this.master.getServerManager()).thenReturn(serverManager);
   }
@@ -241,6 +248,19 @@ public class TestAssignmentManager {
     } finally {
       am.getExecutorService().shutdown();
       am.shutdown();
+    }
+  }
+
+  @Test(timeout = 60000)
+  public void testGettingAssignmentsExcludesDrainingServers() throws Exception {
+    AssignmentManagerWithExtrasForTesting am =
+        setUpMockedAssignmentManager(this.server, this.serverManager);
+
+    Map<TableName, Map<ServerName, List<HRegionInfo>>>
+        result = am.getRegionStates().getAssignmentsByTable();
+    for (Map<ServerName, List<HRegionInfo>> map : result.values()) {
+      System.out.println(map.keySet());
+      assertFalse(map.containsKey(SERVERNAME_C));
     }
   }
 
@@ -359,7 +379,7 @@ public class TestAssignmentManager {
    * @throws KeeperException
    * @throws DeserializationException
    */
-  @Test
+  @Test (timeout=180000)
   public void testBalance()
     throws IOException, KeeperException, DeserializationException, InterruptedException {
     // Create and startup an executor.  This is used by AssignmentManager
@@ -434,7 +454,7 @@ public class TestAssignmentManager {
    * @throws KeeperException
    * @throws IOException
    */
-  @Test
+  @Test (timeout=180000)
   public void testShutdownHandler()
       throws KeeperException, IOException, ServiceException {
     // Create and startup an executor.  This is used by AssignmentManager
@@ -465,7 +485,7 @@ public class TestAssignmentManager {
    * @throws IOException
    * @throws ServiceException
    */
-  @Test
+  @Test (timeout=180000)
   public void testSSHWhenDisableTableInProgress() throws KeeperException, IOException,
       ServiceException {
     testCaseWithPartiallyDisabledState(Table.State.DISABLING);
@@ -480,7 +500,7 @@ public class TestAssignmentManager {
    * @throws KeeperException
    * @throws IOException
    */
-  @Test
+  @Test (timeout=180000)
   public void testSSHWhenSplitRegionInProgress() throws KeeperException, IOException, Exception {
     // true indicates the region is split but still in RIT
     testCaseWithSplitRegionPartial(true);
@@ -672,7 +692,7 @@ public class TestAssignmentManager {
     return executor;
   }
 
-  @Test
+  @Test (timeout=180000)
   public void testUnassignWithSplitAtSameTime() throws KeeperException, IOException {
     // Region to use in test.
     final HRegionInfo hri = HRegionInfo.FIRST_META_REGIONINFO;
@@ -840,6 +860,50 @@ public class TestAssignmentManager {
     }
   }
 
+  /*
+   * Tests the scenario
+   * - a regionserver (SERVERNAME_A) owns a region (hence the meta would have
+   *   the SERVERNAME_A as the host for the region),
+   * - SERVERNAME_A goes down
+   * - one of the affected regions is assigned to a live regionserver (SERVERNAME_B) but that
+   *   assignment somehow fails. The region ends up in the FAILED_OPEN state on ZK
+   * - [Issue that the patch on HBASE-13330 fixes] when the master is restarted,
+   *   the SSH for SERVERNAME_A rightly thinks that the region is now on transition on
+   *   SERVERNAME_B. But the owner for the region is still SERVERNAME_A in the AM's states.
+   *   The AM thinks that the SSH for SERVERNAME_A will assign the region. The region remains
+   *   unassigned for ever.
+   */
+  @Test(timeout = 60000)
+  public void testAssignmentOfRegionInSSHAndInFailedOpenState() throws IOException,
+  KeeperException, ServiceException, InterruptedException {
+    AssignmentManagerWithExtrasForTesting am = setUpMockedAssignmentManager(
+        this.server, this.serverManager);
+    ZKAssign.createNodeOffline(this.watcher, REGIONINFO, SERVERNAME_B);
+    int v = ZKAssign.getVersion(this.watcher, REGIONINFO);
+    ZKAssign.transitionNode(this.watcher, REGIONINFO, SERVERNAME_B,
+        EventType.M_ZK_REGION_OFFLINE, EventType.RS_ZK_REGION_FAILED_OPEN, v);
+    Mockito.when(this.serverManager.isServerOnline(SERVERNAME_B)).thenReturn(true);
+    Mockito.when(this.serverManager.isServerReachable(SERVERNAME_B)).thenReturn(true);
+    Mockito.when(this.serverManager.isServerOnline(SERVERNAME_A)).thenReturn(false);
+    DeadServer deadServers = new DeadServer();
+    deadServers.add(SERVERNAME_A);
+    Mockito.when(this.serverManager.getDeadServers()).thenReturn(deadServers);
+    final Map<ServerName, ServerLoad> onlineServers = new HashMap<ServerName, ServerLoad>();
+    onlineServers.put(SERVERNAME_B, ServerLoad.EMPTY_SERVERLOAD);
+    Mockito.when(this.serverManager.getOnlineServersList()).thenReturn(
+        new ArrayList<ServerName>(onlineServers.keySet()));
+    Mockito.when(this.serverManager.getOnlineServers()).thenReturn(onlineServers);
+    am.gate.set(false);
+    // join the cluster - that's when the AM is really kicking in after a restart
+    am.joinCluster();
+    while (!am.gate.get()) {
+      Thread.sleep(10);
+    }
+    assertTrue(am.getRegionStates().getRegionState(REGIONINFO).getState()
+        == RegionState.State.PENDING_OPEN);
+    am.shutdown();
+  }
+
   /**
    * Test the scenario when the master is in failover and trying to process a
    * region which is in Opening state on a dead RS. Master will force offline the
@@ -927,7 +991,7 @@ public class TestAssignmentManager {
    * @throws IOException
    * @throws Exception
    */
-  @Test
+  @Test (timeout=180000)
   public void testMasterRestartWhenTableInEnabling() throws KeeperException, IOException, Exception {
     enabling = true;
     List<ServerName> destServers = new ArrayList<ServerName>(1);
@@ -964,7 +1028,7 @@ public class TestAssignmentManager {
    * @throws IOException
    * @throws Exception
    */
-  @Test
+  @Test (timeout=180000)
   public void testMasterRestartShouldRemoveStaleZnodesOfUnknownTableAsForMeta()
       throws KeeperException, IOException, Exception {
     List<ServerName> destServers = new ArrayList<ServerName>(1);
@@ -991,7 +1055,7 @@ public class TestAssignmentManager {
    * the region assignment takes a long time normally (waiting for timeout monitor to trigger assign).
    * This test is to make sure SSH reassigns it right away.
    */
-  @Test
+  @Test (timeout=180000)
   public void testSSHTimesOutOpeningRegionTransition()
       throws KeeperException, IOException, ServiceException {
     // We need a mocked catalog tracker.
@@ -1028,7 +1092,7 @@ public class TestAssignmentManager {
    *  <li> the master must handle this nicely and reassign.
    *  </ul>
    */
-  @Test
+  @Test (timeout=180000)
   public void testClosingFailureDuringRecovery() throws Exception {
 
     AssignmentManagerWithExtrasForTesting am =
@@ -1274,7 +1338,7 @@ public class TestAssignmentManager {
     while (!t.isAlive()) Threads.sleep(1);
   }
 
-  @Test
+  @Test (timeout=180000)
   public void testForceAssignMergingRegion() throws Exception {
     // Region to use in test.
     final HRegionInfo hri = HRegionInfo.FIRST_META_REGIONINFO;
@@ -1308,7 +1372,7 @@ public class TestAssignmentManager {
    * if ZK is used during the assignment action (only hbck doesn't use ZK for region
    * assignment). So during master failover, we can ignored such events too.
    */
-  @Test
+  @Test (timeout=180000)
   public void testAssignmentEventIgnoredIfNotExpected() throws KeeperException, IOException {
     // Region to use in test.
     final HRegionInfo hri = HRegionInfo.FIRST_META_REGIONINFO;
@@ -1357,7 +1421,7 @@ public class TestAssignmentManager {
    * Otherwise, the region will be brought back.
    * @throws Exception
    */
-  @Test
+  @Test (timeout=180000)
   public void testBalanceRegionOfDeletedTable() throws Exception {
     CatalogTracker ct = Mockito.mock(CatalogTracker.class);
     AssignmentManager am = new AssignmentManager(this.server, this.serverManager,
@@ -1379,7 +1443,7 @@ public class TestAssignmentManager {
    * for openRegion. AM should assign this somewhere else. (HBASE-9721)
    */
   @SuppressWarnings("unchecked")
-  @Test
+  @Test (timeout=180000)
   public void testOpenCloseRegionRPCIntendedForPreviousServer() throws Exception {
     Mockito.when(this.serverManager.sendRegionOpen(Mockito.eq(SERVERNAME_B), Mockito.eq(REGIONINFO),
       Mockito.anyInt(), (List<ServerName>)Mockito.any()))

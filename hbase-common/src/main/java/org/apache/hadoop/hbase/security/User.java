@@ -23,17 +23,26 @@ import java.io.IOException;
 import java.lang.reflect.UndeclaredThrowableException;
 import java.security.PrivilegedAction;
 import java.security.PrivilegedExceptionAction;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import com.google.common.cache.LoadingCache;
+
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.util.Methods;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapreduce.Job;
+import org.apache.hadoop.security.Groups;
 import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.security.token.TokenIdentifier;
 
 /**
  * Wrapper to abstract out usage of user and group information in HBase.
@@ -46,12 +55,13 @@ import org.apache.hadoop.security.token.Token;
  * HBase, but can be extended as needs change.
  * </p>
  */
-@InterfaceAudience.Private
+@InterfaceAudience.Public
+@InterfaceStability.Stable
 public abstract class User {
   public static final String HBASE_SECURITY_CONF_KEY =
       "hbase.security.authentication";
-
-  private static Log LOG = LogFactory.getLog(User.class);
+  public static final String HBASE_SECURITY_AUTHORIZATION_CONF_KEY =
+      "hbase.security.authorization";
 
   protected UserGroupInformation ugi;
 
@@ -62,6 +72,7 @@ public abstract class User {
   /**
    * Returns the full user name.  For Kerberos principals this will include
    * the host and realm portions of the principal name.
+   *
    * @return User full name.
    */
   public String getName() {
@@ -80,6 +91,7 @@ public abstract class User {
   /**
    * Returns the shortened version of the user name -- the portion that maps
    * to an operating system user name.
+   *
    * @return Short name
    */
   public abstract String getShortName();
@@ -100,7 +112,10 @@ public abstract class User {
    * user's credentials.
    *
    * @throws IOException
+   * @deprecated Use {@code TokenUtil.obtainAuthTokenForJob(HConnection,User,Job)}
+   *     instead.
    */
+  @Deprecated
   public abstract void obtainAuthTokenForJob(Configuration conf, Job job)
       throws IOException, InterruptedException;
 
@@ -109,7 +124,10 @@ public abstract class User {
    * user's credentials.
    *
    * @throws IOException
+   * @deprecated Use {@code TokenUtil.obtainAuthTokenForJob(HConnection,JobConf,User)}
+   *     instead.
    */
+  @Deprecated
   public abstract void obtainAuthTokenForJob(JobConf job)
       throws IOException, InterruptedException;
 
@@ -122,14 +140,29 @@ public abstract class User {
    * @return the token of the specified kind.
    */
   public Token<?> getToken(String kind, String service) throws IOException {
-    for (Token<?> token: ugi.getTokens()) {
+    for (Token<?> token : ugi.getTokens()) {
       if (token.getKind().toString().equals(kind) &&
-          (service != null && token.getService().toString().equals(service)))
-      {
+          (service != null && token.getService().toString().equals(service))) {
         return token;
       }
     }
     return null;
+  }
+
+  /**
+   * Returns all the tokens stored in the user's credentials.
+   */
+  public Collection<Token<? extends TokenIdentifier>> getTokens() {
+    return ugi.getTokens();
+  }
+
+  /**
+   * Adds the given Token to the user's credentials.
+   *
+   * @param token the token to add
+   */
+  public void addToken(Token<? extends TokenIdentifier> token) {
+    ugi.addToken(token);
   }
 
   @Override
@@ -205,7 +238,8 @@ public abstract class User {
    */
   public static User createUserForTesting(Configuration conf,
       String name, String[] groups) {
-    return SecureHadoopUser.createUserForTesting(conf, name, groups);
+    User userForTesting = SecureHadoopUser.createUserForTesting(conf, name, groups);
+    return userForTesting;
   }
 
   /**
@@ -255,15 +289,25 @@ public abstract class User {
    * {@link org.apache.hadoop.security.UserGroupInformation} for secure Hadoop
    * 0.20 and versions 0.21 and above.
    */
-  private static class SecureHadoopUser extends User {
+  @InterfaceAudience.Private
+   public static final class SecureHadoopUser extends User {
     private String shortName;
+    private LoadingCache<String, String[]> cache;
 
-    private SecureHadoopUser() throws IOException {
+    public SecureHadoopUser() throws IOException {
       ugi = UserGroupInformation.getCurrentUser();
+      this.cache = null;
     }
 
-    private SecureHadoopUser(UserGroupInformation ugi) {
+    public SecureHadoopUser(UserGroupInformation ugi) {
       this.ugi = ugi;
+      this.cache = null;
+    }
+
+    public SecureHadoopUser(UserGroupInformation ugi,
+                            LoadingCache<String, String[]> cache) {
+      this.ugi = ugi;
+      this.cache = cache;
     }
 
     @Override
@@ -276,6 +320,18 @@ public abstract class User {
         throw new RuntimeException("Unexpected error getting user short name",
           e);
       }
+    }
+
+    @Override
+    public String[] getGroupNames() {
+      if (cache != null) {
+        try {
+          return this.cache.get(getShortName());
+        } catch (ExecutionException e) {
+          return new String[0];
+        }
+      }
+      return ugi.getGroupNames();
     }
 
     @Override
@@ -341,6 +397,13 @@ public abstract class User {
     /** @see User#createUserForTesting(org.apache.hadoop.conf.Configuration, String, String[]) */
     public static User createUserForTesting(Configuration conf,
         String name, String[] groups) {
+      synchronized (UserProvider.class) {
+        if (!(UserProvider.groups instanceof TestingGroups)) {
+          UserProvider.groups = new TestingGroups(UserProvider.groups);
+        }
+      }
+
+      ((TestingGroups)UserProvider.groups).setUserGroups(name, groups);
       return new SecureHadoopUser(UserGroupInformation.createUserForTesting(name, groups));
     }
 
@@ -368,6 +431,32 @@ public abstract class User {
      */
     public static boolean isSecurityEnabled() {
       return UserGroupInformation.isSecurityEnabled();
+    }
+  }
+
+  static class TestingGroups extends Groups {
+    private final Map<String, List<String>> userToGroupsMapping =
+        new HashMap<String,List<String>>();
+    private Groups underlyingImplementation;
+
+    TestingGroups(Groups underlyingImplementation) {
+      super(new Configuration());
+      this.underlyingImplementation = underlyingImplementation;
+    }
+
+    @Override
+    public List<String> getGroups(String user) throws IOException {
+      List<String> result = userToGroupsMapping.get(user);
+
+      if (result == null) {
+        result = underlyingImplementation.getGroups(user);
+      }
+
+      return result;
+    }
+
+    private void setUserGroups(String user, String[] groups) {
+      userToGroupsMapping.put(user, Arrays.asList(groups));
     }
   }
 }

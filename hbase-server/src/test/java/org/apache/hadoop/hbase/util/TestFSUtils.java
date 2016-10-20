@@ -39,7 +39,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HDFSBlocksDistribution;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.junit.Test;
@@ -259,7 +259,7 @@ public class TestFSUtils {
     // then that the correct file is created
     Path p = new Path("target" + File.separator + UUID.randomUUID().toString());
     try {
-      FSDataOutputStream out = FSUtils.create(fs, p, filePerm, null);
+      FSDataOutputStream out = FSUtils.create(conf, fs, p, filePerm, null);
       out.close();
       FileStatus stat = fs.getFileStatus(p);
       assertEquals(new FsPermission("700"), stat.getPermission());
@@ -281,13 +281,13 @@ public class TestFSUtils {
     Path p = new Path(htu.getDataTestDir(), "temptarget" + File.separator + file);
     Path p1 = new Path(htu.getDataTestDir(), "temppath" + File.separator + file);
     try {
-      FSDataOutputStream out = FSUtils.create(fs, p, perms, null);
+      FSDataOutputStream out = FSUtils.create(conf, fs, p, perms, null);
       out.close();
       assertTrue("The created file should be present", FSUtils.isExists(fs, p));
       // delete the file with recursion as false. Only the file will be deleted.
       FSUtils.delete(fs, p, false);
       // Create another file
-      FSDataOutputStream out1 = FSUtils.create(fs, p1, perms, null);
+      FSDataOutputStream out1 = FSUtils.create(conf, fs, p1, perms, null);
       out1.close();
       // delete the file with recursion as false. Still the file only will be deleted
       FSUtils.delete(fs, p1, true);
@@ -323,15 +323,18 @@ public class TestFSUtils {
     ManualEnvironmentEdge mockEnv = new ManualEnvironmentEdge();
     mockEnv.setValue(expect);
     EnvironmentEdgeManager.injectEdge(mockEnv);
+    try {
+      String dstFile = UUID.randomUUID().toString();
+      Path dst = new Path(testDir , dstFile);
 
-    String dstFile = UUID.randomUUID().toString();
-    Path dst = new Path(testDir , dstFile);
+      assertTrue(FSUtils.renameAndSetModifyTime(fs, p, dst));
+      assertFalse("The moved file should not be present", FSUtils.isExists(fs, p));
+      assertTrue("The dst file should be present", FSUtils.isExists(fs, dst));
 
-    assertTrue(FSUtils.renameAndSetModifyTime(fs, p, dst));
-    assertFalse("The moved file should not be present", FSUtils.isExists(fs, p));
-    assertTrue("The dst file should be present", FSUtils.isExists(fs, dst));
-
-    assertEquals(expect, fs.getFileStatus(dst).getModificationTime());
-    cluster.shutdown();
+      assertEquals(expect, fs.getFileStatus(dst).getModificationTime());
+      cluster.shutdown();
+    } finally {
+      EnvironmentEdgeManager.reset();
+    }
   }
 }

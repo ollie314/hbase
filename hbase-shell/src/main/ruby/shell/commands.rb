@@ -37,17 +37,25 @@ module Shell
         while rootCause != nil && rootCause.respond_to?(:cause) && rootCause.cause != nil
           rootCause = rootCause.cause
         end
-        puts
-        puts "ERROR: #{rootCause}"
-        puts "Backtrace: #{rootCause.backtrace.join("\n           ")}" if debug
-        puts
-        puts "Here is some help for this command:"
-        puts help
-        puts
+        if @shell.interactive?
+          puts
+          puts "ERROR: #{rootCause}"
+          puts "Backtrace: #{rootCause.backtrace.join("\n           ")}" if debug
+          puts
+          puts "Here is some help for this command:"
+          puts help
+          puts
+        else
+          raise rootCause
+        end
       end
 
       def admin
         @shell.hbase_admin
+      end
+
+      def taskmonitor
+        @shell.hbase_taskmonitor
       end
 
       def table(name)

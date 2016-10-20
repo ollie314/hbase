@@ -39,14 +39,24 @@ public class MetricsRegionServerSourceImpl
   private final MetricHistogram incrementHisto;
   private final MetricHistogram appendHisto;
   private final MetricHistogram replayHisto;
+  private final MetricHistogram scanNextHisto;
+
   private final MetricMutableCounterLong slowPut;
   private final MetricMutableCounterLong slowDelete;
   private final MetricMutableCounterLong slowGet;
   private final MetricMutableCounterLong slowIncrement;
   private final MetricMutableCounterLong slowAppend;
+  private final MetricMutableCounterLong splitRequest;
+  private final MetricMutableCounterLong splitSuccess;
 
   private final MetricHistogram splitTimeHisto;
   private final MetricHistogram flushTimeHisto;
+
+  // pause monitor metrics
+  private final MetricMutableCounterLong infoPauseThresholdExceeded;
+  private final MetricMutableCounterLong warnPauseThresholdExceeded;
+  private final MetricHistogram pausesWithGc;
+  private final MetricHistogram pausesWithoutGc;
 
   public MetricsRegionServerSourceImpl(MetricsRegionServerWrapper rsWrap) {
     this(METRICS_NAME, METRICS_DESCRIPTION, METRICS_CONTEXT, METRICS_JMX_CONTEXT, rsWrap);
@@ -60,25 +70,37 @@ public class MetricsRegionServerSourceImpl
     super(metricsName, metricsDescription, metricsContext, metricsJmxContext);
     this.rsWrap = rsWrap;
 
-    putHisto = getMetricsRegistry().newHistogram(MUTATE_KEY);
+    putHisto = getMetricsRegistry().newTimeHistogram(MUTATE_KEY);
     slowPut = getMetricsRegistry().newCounter(SLOW_MUTATE_KEY, SLOW_MUTATE_DESC, 0l);
 
-    deleteHisto = getMetricsRegistry().newHistogram(DELETE_KEY);
+    deleteHisto = getMetricsRegistry().newTimeHistogram(DELETE_KEY);
     slowDelete = getMetricsRegistry().newCounter(SLOW_DELETE_KEY, SLOW_DELETE_DESC, 0l);
 
-    getHisto = getMetricsRegistry().newHistogram(GET_KEY);
+    getHisto = getMetricsRegistry().newTimeHistogram(GET_KEY);
     slowGet = getMetricsRegistry().newCounter(SLOW_GET_KEY, SLOW_GET_DESC, 0l);
 
-    incrementHisto = getMetricsRegistry().newHistogram(INCREMENT_KEY);
+    incrementHisto = getMetricsRegistry().newTimeHistogram(INCREMENT_KEY);
     slowIncrement = getMetricsRegistry().newCounter(SLOW_INCREMENT_KEY, SLOW_INCREMENT_DESC, 0l);
 
-    appendHisto = getMetricsRegistry().newHistogram(APPEND_KEY);
+    appendHisto = getMetricsRegistry().newTimeHistogram(APPEND_KEY);
     slowAppend = getMetricsRegistry().newCounter(SLOW_APPEND_KEY, SLOW_APPEND_DESC, 0l);
 
-    replayHisto = getMetricsRegistry().newHistogram(REPLAY_KEY);
+    replayHisto = getMetricsRegistry().newTimeHistogram(REPLAY_KEY);
+    scanNextHisto = getMetricsRegistry().newTimeHistogram(SCAN_NEXT_KEY);
 
-    splitTimeHisto = getMetricsRegistry().newHistogram(SPLIT_KEY);
-    flushTimeHisto = getMetricsRegistry().newHistogram(FLUSH_KEY);
+    splitTimeHisto = getMetricsRegistry().newTimeHistogram(SPLIT_KEY);
+    flushTimeHisto = getMetricsRegistry().newTimeHistogram(FLUSH_KEY);
+
+    splitRequest = getMetricsRegistry().newCounter(SPLIT_REQUEST_KEY, SPLIT_REQUEST_DESC, 0l);
+    splitSuccess = getMetricsRegistry().newCounter(SPLIT_SUCCESS_KEY, SPLIT_SUCCESS_DESC, 0l);
+
+    // pause monitor metrics
+    infoPauseThresholdExceeded = getMetricsRegistry().newCounter(INFO_THRESHOLD_COUNT_KEY,
+      INFO_THRESHOLD_COUNT_DESC, 0L);
+    warnPauseThresholdExceeded = getMetricsRegistry().newCounter(WARN_THRESHOLD_COUNT_KEY,
+      WARN_THRESHOLD_COUNT_DESC, 0L);
+    pausesWithGc = getMetricsRegistry().newTimeHistogram(PAUSE_TIME_WITH_GC_KEY);
+    pausesWithoutGc = getMetricsRegistry().newTimeHistogram(PAUSE_TIME_WITHOUT_GC_KEY);
   }
 
   @Override
@@ -112,6 +134,11 @@ public class MetricsRegionServerSourceImpl
   }
 
   @Override
+  public void updateScannerNext(long scanSize) {
+    scanNextHisto.add(scanSize);
+  }
+
+  @Override
   public void incrSlowPut() {
     slowPut.incr();
   }
@@ -137,6 +164,16 @@ public class MetricsRegionServerSourceImpl
   }
 
   @Override
+  public void incrSplitRequest() {
+    splitRequest.incr();
+  }
+
+  @Override
+  public void incrSplitSuccess() {
+    splitSuccess.incr();
+  }
+
+  @Override
   public void updateSplitTime(long t) {
     splitTimeHisto.add(t);
   }
@@ -157,8 +194,7 @@ public class MetricsRegionServerSourceImpl
   @Override
   public void getMetrics(MetricsBuilder metricsBuilder, boolean all) {
 
-    MetricsRecordBuilder mrb = metricsBuilder.addRecord(metricsName)
-        .setContext(metricsContext);
+    MetricsRecordBuilder mrb = metricsBuilder.addRecord(metricsName);
 
     // rsWrap can be null because this function is called inside of init.
     if (rsWrap != null) {
@@ -169,7 +205,12 @@ public class MetricsRegionServerSourceImpl
           .addGauge(STOREFILE_COUNT, STOREFILE_COUNT_DESC, rsWrap.getNumStoreFiles())
           .addGauge(MEMSTORE_SIZE, MEMSTORE_SIZE_DESC, rsWrap.getMemstoreSize())
           .addGauge(STOREFILE_SIZE, STOREFILE_SIZE_DESC, rsWrap.getStoreFileSize())
+          .addGauge(MAX_STORE_FILE_AGE, MAX_STORE_FILE_AGE_DESC, rsWrap.getMaxStoreFileAge())
+          .addGauge(MIN_STORE_FILE_AGE, MIN_STORE_FILE_AGE_DESC, rsWrap.getMinStoreFileAge())
+          .addGauge(AVG_STORE_FILE_AGE, AVG_STORE_FILE_AGE_DESC, rsWrap.getAvgStoreFileAge())
+          .addGauge(NUM_REFERENCE_FILES, NUM_REFERENCE_FILES_DESC, rsWrap.getNumReferenceFiles())
           .addGauge(RS_START_TIME_NAME, RS_START_TIME_DESC, rsWrap.getStartCode())
+          .addGauge(AVERAGE_REGION_SIZE, AVERAGE_REGION_SIZE_DESC, rsWrap.getAverageRegionSize())
           .addCounter(TOTAL_REQUEST_COUNT, TOTAL_REQUEST_COUNT_DESC, rsWrap.getTotalRequestCount())
           .addCounter(READ_REQUEST_COUNT, READ_REQUEST_COUNT_DESC, rsWrap.getReadRequestsCount())
           .addCounter(WRITE_REQUEST_COUNT, WRITE_REQUEST_COUNT_DESC, rsWrap.getWriteRequestsCount())
@@ -217,6 +258,34 @@ public class MetricsRegionServerSourceImpl
           .addGauge(BLOCK_CACHE_EXPRESS_HIT_PERCENT,
               BLOCK_CACHE_EXPRESS_HIT_PERCENT_DESC,
               rsWrap.getBlockCacheHitCachingPercent())
+          .addCounter(BLOCK_CACHE_FAILED_INSERTION_COUNT,
+              BLOCK_CACHE_FAILED_INSERTION_COUNT_DESC,rsWrap.getBlockCacheFailedInsertions())
+          .addCounter(BLOCK_CACHE_DATA_MISS_COUNT, "", rsWrap.getDataMissCount())
+          .addCounter(BLOCK_CACHE_LEAF_INDEX_MISS_COUNT, "", rsWrap.getLeafIndexMissCount())
+          .addCounter(BLOCK_CACHE_BLOOM_CHUNK_MISS_COUNT, "", rsWrap.getBloomChunkMissCount())
+          .addCounter(BLOCK_CACHE_META_MISS_COUNT, "", rsWrap.getMetaMissCount())
+          .addCounter(BLOCK_CACHE_ROOT_INDEX_MISS_COUNT, "", rsWrap.getRootIndexMissCount())
+          .addCounter(BLOCK_CACHE_INTERMEDIATE_INDEX_MISS_COUNT, "",
+              rsWrap.getIntermediateIndexMissCount())
+          .addCounter(BLOCK_CACHE_FILE_INFO_MISS_COUNT, "", rsWrap.getFileInfoMissCount())
+          .addCounter(BLOCK_CACHE_GENERAL_BLOOM_META_MISS_COUNT, "",
+              rsWrap.getGeneralBloomMetaMissCount())
+          .addCounter(BLOCK_CACHE_DELETE_FAMILY_BLOOM_MISS_COUNT, "",
+              rsWrap.getDeleteFamilyBloomMissCount())
+          .addCounter(BLOCK_CACHE_TRAILER_MISS_COUNT, "", rsWrap.getTrailerMissCount())
+          .addCounter(BLOCK_CACHE_DATA_HIT_COUNT, "", rsWrap.getDataHitCount())
+          .addCounter(BLOCK_CACHE_LEAF_INDEX_HIT_COUNT, "", rsWrap.getLeafIndexHitCount())
+          .addCounter(BLOCK_CACHE_BLOOM_CHUNK_HIT_COUNT, "", rsWrap.getBloomChunkHitCount())
+          .addCounter(BLOCK_CACHE_META_HIT_COUNT, "", rsWrap.getMetaHitCount())
+          .addCounter(BLOCK_CACHE_ROOT_INDEX_HIT_COUNT, "", rsWrap.getRootIndexHitCount())
+          .addCounter(BLOCK_CACHE_INTERMEDIATE_INDEX_HIT_COUNT, "",
+              rsWrap.getIntermediateIndexHitCount())
+          .addCounter(BLOCK_CACHE_FILE_INFO_HIT_COUNT, "", rsWrap.getFileInfoHitCount())
+          .addCounter(BLOCK_CACHE_GENERAL_BLOOM_META_HIT_COUNT, "",
+              rsWrap.getGeneralBloomMetaHitCount())
+          .addCounter(BLOCK_CACHE_DELETE_FAMILY_BLOOM_HIT_COUNT, "",
+              rsWrap.getDeleteFamilyBloomHitCount())
+          .addCounter(BLOCK_CACHE_TRAILER_HIT_COUNT, "", rsWrap.getTrailerHitCount())
           .addCounter(UPDATES_BLOCKED_TIME, UPDATES_BLOCKED_DESC, rsWrap.getUpdatesBlockedTime())
           .addCounter(FLUSHED_CELLS, FLUSHED_CELLS_DESC, rsWrap.getFlushedCellsCount())
           .addCounter(COMPACTED_CELLS, COMPACTED_CELLS_DESC, rsWrap.getCompactedCellsCount())
@@ -239,5 +308,23 @@ public class MetricsRegionServerSourceImpl
     metricsRegistry.snapshot(mrb, all);
   }
 
+  @Override
+  public void incInfoThresholdExceeded(int count) {
+    infoPauseThresholdExceeded.incr(count);
+  }
 
+  @Override
+  public void incWarnThresholdExceeded(int count) {
+    warnPauseThresholdExceeded.incr(count);
+  }
+
+  @Override
+  public void updatePauseTimeWithGc(long t) {
+    pausesWithGc.add(t);
+  }
+
+  @Override
+  public void updatePauseTimeWithoutGc(long t) {
+    pausesWithoutGc.add(t);
+  }
 }

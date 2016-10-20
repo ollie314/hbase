@@ -19,12 +19,15 @@
 package org.apache.hadoop.hbase.mapreduce.replication;
 
 import java.io.IOException;
+import java.util.Arrays;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
-import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.Abortable;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.client.HConnectable;
 import org.apache.hadoop.hbase.client.HConnection;
 import org.apache.hadoop.hbase.client.HConnectionManager;
@@ -33,6 +36,9 @@ import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
+import org.apache.hadoop.hbase.filter.Filter;
+import org.apache.hadoop.hbase.filter.FilterList;
+import org.apache.hadoop.hbase.filter.PrefixFilter;
 import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
 import org.apache.hadoop.hbase.mapreduce.TableInputFormat;
 import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
@@ -40,11 +46,12 @@ import org.apache.hadoop.hbase.mapreduce.TableMapper;
 import org.apache.hadoop.hbase.mapreduce.TableSplit;
 import org.apache.hadoop.hbase.replication.ReplicationException;
 import org.apache.hadoop.hbase.replication.ReplicationFactory;
-import org.apache.hadoop.hbase.replication.ReplicationPeer;
+import org.apache.hadoop.hbase.replication.ReplicationPeerConfig;
+import org.apache.hadoop.hbase.replication.ReplicationPeerZKImpl;
 import org.apache.hadoop.hbase.replication.ReplicationPeers;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
-import org.apache.hadoop.hbase.zookeeper.ZKUtil;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.lib.output.NullOutputFormat;
 import org.apache.hadoop.util.Tool;
@@ -66,12 +73,15 @@ public class VerifyReplication extends Configured implements Tool {
       LogFactory.getLog(VerifyReplication.class);
 
   public final static String NAME = "verifyrep";
+  private final static String PEER_CONFIG_PREFIX = NAME + ".peer.";
   static long startTime = 0;
   static long endTime = Long.MAX_VALUE;
+  static int batch = Integer.MAX_VALUE;
   static int versions = -1;
   static String tableName = null;
   static String families = null;
   static String peerId = null;
+  static String rowPrefixes = null;
 
   /**
    * Map-only comparator for 2 tables
@@ -100,6 +110,8 @@ public class VerifyReplication extends Configured implements Tool {
       if (replicatedScanner == null) {
         Configuration conf = context.getConfiguration();
         final Scan scan = new Scan();
+        scan.setBatch(batch);
+        scan.setCacheBlocks(false);
         scan.setCaching(conf.getInt(TableInputFormat.SCAN_CACHEDROWS, 1));
         long startTime = conf.getLong(NAME + ".startTime", 0);
         long endTime = conf.getLong(NAME + ".endTime", Long.MAX_VALUE);
@@ -110,7 +122,11 @@ public class VerifyReplication extends Configured implements Tool {
             scan.addFamily(Bytes.toBytes(fam));
           }
         }
+        String rowPrefixes = conf.get(NAME + ".rowPrefixes", null);
+        setRowPrefixFilter(scan, rowPrefixes);
         scan.setTimeRange(startTime, endTime);
+        int versions = conf.getInt(NAME+".versions", -1);
+        LOG.info("Setting number of version inside map as: " + versions);
         if (versions >= 0) {
           scan.setMaxVersions(versions);
         }
@@ -120,8 +136,8 @@ public class VerifyReplication extends Configured implements Tool {
           @Override
           public Void connect(HConnection conn) throws IOException {
             String zkClusterKey = conf.get(NAME + ".peerQuorumAddress");
-            Configuration peerConf = HBaseConfiguration.create(conf);
-            ZKUtil.applyClusterKeyToConf(peerConf, zkClusterKey);
+            Configuration peerConf = HBaseConfiguration.createClusterConf(conf,
+                zkClusterKey, PEER_CONFIG_PREFIX);
 
             HTable replicatedTable = new HTable(peerConf, conf.get(NAME + ".tableName"));
             scan.setStartRow(tableSplit.getStartRow());
@@ -146,6 +162,7 @@ public class VerifyReplication extends Configured implements Tool {
             context.getCounter(Counters.GOODROWS).increment(1);
           } catch (Exception e) {
             logFailRowAndIncreaseCounter(context, Counters.CONTENT_DIFFERENT_ROWS, value);
+            LOG.error("Exception while comparing row : " + e);
           }
           currentCompareRowInPeerTable = replicatedScanner.next();
           break;
@@ -168,6 +185,7 @@ public class VerifyReplication extends Configured implements Tool {
       LOG.error(counter.toString() + ", rowkey=" + Bytes.toString(row.getRow()));
     }
     
+    @Override
     protected void cleanup(Context context) {
       if (replicatedScanner != null) {
         try {
@@ -186,9 +204,10 @@ public class VerifyReplication extends Configured implements Tool {
     }
   }
 
-  private static String getPeerQuorumAddress(final Configuration conf) throws IOException {
+  private static Pair<ReplicationPeerConfig, Configuration> getPeerQuorumConfig(
+      final Configuration conf) throws IOException {
     ZooKeeperWatcher localZKW = null;
-    ReplicationPeer peer = null;
+    ReplicationPeerZKImpl peer = null;
     try {
       localZKW = new ZooKeeperWatcher(conf, "VerifyReplication",
           new Abortable() {
@@ -199,12 +218,12 @@ public class VerifyReplication extends Configured implements Tool {
       ReplicationPeers rp = ReplicationFactory.getReplicationPeers(localZKW, conf, localZKW);
       rp.init();
 
-      Configuration peerConf = rp.getPeerConf(peerId);
-      if (peerConf == null) {
+      Pair<ReplicationPeerConfig, Configuration> pair = rp.getPeerConf(peerId);
+      if (pair == null) {
         throw new IOException("Couldn't get peer conf!");
       }
 
-      return ZKUtil.getZooKeeperClusterKey(peerConf);
+      return pair;
     } catch (ReplicationException e) {
       throw new IOException(
           "An error occured while trying to connect to the remove peer cluster", e);
@@ -242,10 +261,21 @@ public class VerifyReplication extends Configured implements Tool {
     if (families != null) {
       conf.set(NAME+".families", families);
     }
+    if (rowPrefixes != null){
+      conf.set(NAME+".rowPrefixes", rowPrefixes);
+    }
 
-    String peerQuorumAddress = getPeerQuorumAddress(conf);
+    Pair<ReplicationPeerConfig, Configuration> peerConfigPair = getPeerQuorumConfig(conf);
+    ReplicationPeerConfig peerConfig = peerConfigPair.getFirst();
+    String peerQuorumAddress = peerConfig.getClusterKey();
+    LOG.info("Peer Quorum Address: " + peerQuorumAddress + ", Peer Configuration: " +
+        peerConfig.getConfiguration());
     conf.set(NAME + ".peerQuorumAddress", peerQuorumAddress);
-    LOG.info("Peer Quorum Address: " + peerQuorumAddress);
+    HBaseConfiguration.setWithPrefix(conf, PEER_CONFIG_PREFIX,
+        peerConfig.getConfiguration().entrySet());
+
+    conf.setInt(NAME + ".versions", versions);
+    LOG.info("Number of version: " + versions);
 
     Job job = new Job(conf, NAME + "_" + tableName);
     job.setJarByClass(VerifyReplication.class);
@@ -254,6 +284,7 @@ public class VerifyReplication extends Configured implements Tool {
     scan.setTimeRange(startTime, endTime);
     if (versions >= 0) {
       scan.setMaxVersions(versions);
+      LOG.info("Number of versions set to " + versions);
     }
     if(families != null) {
       String[] fams = families.split(",");
@@ -261,15 +292,42 @@ public class VerifyReplication extends Configured implements Tool {
         scan.addFamily(Bytes.toBytes(fam));
       }
     }
+
+    setRowPrefixFilter(scan, rowPrefixes);
+
     TableMapReduceUtil.initTableMapperJob(tableName, scan,
         Verifier.class, null, null, job);
 
+    Configuration peerClusterConf = peerConfigPair.getSecond();
     // Obtain the auth token from peer cluster
-    TableMapReduceUtil.initCredentialsForCluster(job, peerQuorumAddress);
+    TableMapReduceUtil.initCredentialsForCluster(job, peerClusterConf);
 
     job.setOutputFormatClass(NullOutputFormat.class);
     job.setNumReduceTasks(0);
     return job;
+  }
+
+  private static void setRowPrefixFilter(Scan scan, String rowPrefixes) {
+    if (rowPrefixes != null && !rowPrefixes.isEmpty()) {
+      String[] rowPrefixArray = rowPrefixes.split(",");
+      Arrays.sort(rowPrefixArray);
+      FilterList filterList = new FilterList(FilterList.Operator.MUST_PASS_ONE);
+      for (String prefix : rowPrefixArray) {
+        Filter filter = new PrefixFilter(Bytes.toBytes(prefix));
+        filterList.addFilter(filter);
+      }
+      scan.setFilter(filterList);
+      byte[] startPrefixRow = Bytes.toBytes(rowPrefixArray[0]);
+      byte[] lastPrefixRow = Bytes.toBytes(rowPrefixArray[rowPrefixArray.length -1]);
+      setStartAndStopRows(scan, startPrefixRow, lastPrefixRow);
+    }
+  }
+
+  private static void setStartAndStopRows(Scan scan, byte[] startPrefixRow, byte[] lastPrefixRow) {
+    scan.setStartRow(startPrefixRow);
+    byte[] stopRow = Bytes.add(Bytes.head(lastPrefixRow, lastPrefixRow.length - 1),
+        new byte[]{(byte) (lastPrefixRow[lastPrefixRow.length - 1] + 1)});
+    scan.setStopRow(stopRow);
   }
 
   private static boolean doCommandLine(final String[] args) {
@@ -277,6 +335,10 @@ public class VerifyReplication extends Configured implements Tool {
       printUsage(null);
       return false;
     }
+    //in case we've been run before, restore all parameters to their initial states
+    //Otherwise, if our previous run included a parameter not in args this time,
+    //we might hold on to the old value.
+    restoreDefaults();
     try {
       for (int i = 0; i < args.length; i++) {
         String cmd = args[i];
@@ -302,11 +364,27 @@ public class VerifyReplication extends Configured implements Tool {
           versions = Integer.parseInt(cmd.substring(versionsArgKey.length()));
           continue;
         }
+        
+        final String batchArgKey = "--batch=";
+        if (cmd.startsWith(batchArgKey)) {
+          batch = Integer.parseInt(cmd.substring(batchArgKey.length()));
+          continue;
+        }
 
         final String familiesArgKey = "--families=";
         if (cmd.startsWith(familiesArgKey)) {
           families = cmd.substring(familiesArgKey.length());
           continue;
+        }
+
+        final String rowPrefixesKey = "--row-prefixes=";
+        if (cmd.startsWith(rowPrefixesKey)){
+          rowPrefixes = cmd.substring(rowPrefixesKey.length());
+          continue;
+        }
+
+        if (cmd.startsWith("--")) {
+          printUsage("Invalid argument '" + cmd + "'");
         }
 
         if (i == args.length-2) {
@@ -325,6 +403,17 @@ public class VerifyReplication extends Configured implements Tool {
     return true;
   }
 
+  private static void restoreDefaults() {
+    startTime = 0;
+    endTime = Long.MAX_VALUE;
+    batch = Integer.MAX_VALUE;
+    versions = -1;
+    tableName = null;
+    families = null;
+    peerId = null;
+    rowPrefixes = null;
+  }
+
   /*
    * @param errorMsg Error message.  Can be null.
    */
@@ -333,7 +422,7 @@ public class VerifyReplication extends Configured implements Tool {
       System.err.println("ERROR: " + errorMsg);
     }
     System.err.println("Usage: verifyrep [--starttime=X]" +
-        " [--stoptime=Y] [--families=A] <peerid> <tablename>");
+        " [--endtime=Y] [--families=A] [--row-prefixes=B] <peerid> <tablename>");
     System.err.println();
     System.err.println("Options:");
     System.err.println(" starttime    beginning of the time range");
@@ -341,6 +430,7 @@ public class VerifyReplication extends Configured implements Tool {
     System.err.println(" endtime      end of the time range");
     System.err.println(" versions     number of cell versions to verify");
     System.err.println(" families     comma-separated list of families to copy");
+    System.err.println(" row-prefixes comma-separated list of row key prefixes to filter on ");
     System.err.println();
     System.err.println("Args:");
     System.err.println(" peerid       Id of the peer used for verification, must match the one given for replication");

@@ -38,7 +38,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.MasterNotRunningException;
 import org.apache.hadoop.hbase.MiniHBaseCluster;
 import org.apache.hadoop.hbase.NotServingRegionException;
@@ -171,8 +171,12 @@ public class TestAdmin2 {
   @Test (timeout=300000)
   public void testTableNameClash() throws Exception {
     String name = "testTableNameClash";
-    admin.createTable(new HTableDescriptor(TableName.valueOf(name + "SOMEUPPERCASE")));
-    admin.createTable(new HTableDescriptor(TableName.valueOf(name)));
+    HTableDescriptor htd1 = new HTableDescriptor(TableName.valueOf(name + "SOMEUPPERCASE"));
+    HTableDescriptor htd2 = new HTableDescriptor(TableName.valueOf(name));
+    htd1.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
+    htd2.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
+    admin.createTable(htd1);
+    admin.createTable(htd2);
     // Before fix, below would fail throwing a NoServerForRegionException.
     new HTable(TEST_UTIL.getConfiguration(), name).close();
   }
@@ -196,8 +200,9 @@ public class TestAdmin2 {
       byte [] startKey = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
       byte [] endKey =   { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
       HBaseAdmin hbaseadmin = new HBaseAdmin(TEST_UTIL.getConfiguration());
-      hbaseadmin.createTable(new HTableDescriptor(TableName.valueOf(name)), startKey, endKey,
-        expectedRegions);
+      HTableDescriptor htd = new HTableDescriptor(TableName.valueOf(name));
+      htd.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
+      hbaseadmin.createTable(htd, startKey, endKey, expectedRegions);
       hbaseadmin.close();
     } finally {
       TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_RPC_TIMEOUT_KEY, oldTimeout);
@@ -733,4 +738,27 @@ public class TestAdmin2 {
       ct.stop();
     }
   }
+
+  @Test(timeout = 30000)
+  public void testBalancer() throws Exception {
+    boolean initialState = admin.isBalancerEnabled();
+
+    // Start the balancer, wait for it.
+    boolean prevState = admin.setBalancerRunning(!initialState, true);
+
+    // The previous state should be the original state we observed
+    assertEquals(initialState, prevState);
+
+    // Current state should be opposite of the original
+    assertEquals(!initialState, admin.isBalancerEnabled());
+
+    // Reset it back to what it was
+    prevState = admin.setBalancerRunning(initialState, true);
+
+    // The previous state should be the opposite of the initial state
+    assertEquals(!initialState, prevState);
+    // Current state should be the original state again
+    assertEquals(initialState, admin.isBalancerEnabled());
+  }
+
 }

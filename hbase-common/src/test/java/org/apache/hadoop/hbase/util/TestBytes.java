@@ -24,12 +24,15 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Random;
 
 import junit.framework.TestCase;
 
-import org.apache.hadoop.hbase.SmallTests;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.io.WritableUtils;
 import org.junit.Assert;
 import org.junit.experimental.categories.Category;
 
@@ -45,6 +48,19 @@ public class TestBytes extends TestCase {
       ee = e;
     }
     assertNotNull(ee);
+  }
+
+  public void testAdd () throws Exception {
+    byte[] a = {0,0,0,0,0,0,0,0,0,0};
+    byte[] b = {1,1,1,1,1,1,1,1,1,1,1};
+    byte[] c = {2,2,2,2,2,2,2,2,2,2,2,2};
+    byte[] d = {3,3,3,3,3,3,3,3,3,3,3,3,3};
+    byte[] result1 = Bytes.add (a, b, c);
+    byte[] result2 = Bytes.add (new byte[][] {a, b, c});
+    assertEquals(0, Bytes.compareTo(result1, result2));
+    byte[] result4 = Bytes.add (result1, d);
+    byte[] result5 = Bytes.add (new byte[][] {result1, d});
+    assertEquals(0, Bytes.compareTo(result1, result2));
   }
 
   public void testSplit() throws Exception {
@@ -101,9 +117,10 @@ public class TestBytes extends TestCase {
     }
     assertTrue("Returned split should have 3 parts but has " + parts.length, parts.length == 3);
 
-    // If split more than once, this should fail
+    // If split more than once, use additional byte to split
     parts = Bytes.split(low, high, 2);
-    assertTrue("Returned split but should have failed", parts == null);
+    assertTrue("Split with an additional byte", parts != null);
+    assertEquals(parts.length, low.length + 1);
 
     // Split 0 times should throw IAE
     try {
@@ -209,6 +226,19 @@ public class TestBytes extends TestCase {
     assertTrue(Arrays.equals(expected,  actual));
     assertEquals(2, target.position());
     assertEquals(7, target.limit());
+  }
+
+  public void testReadAsVLong() throws Exception {
+    long [] longs = {-1l, 123l, Long.MIN_VALUE, Long.MAX_VALUE};
+    for (int i = 0; i < longs.length; i++) {
+      ByteArrayOutputStream baos = new ByteArrayOutputStream();
+      DataOutputStream output = new DataOutputStream(baos);
+      WritableUtils.writeVLong(output, longs[i]);
+      byte[] long_bytes_no_offset = baos.toByteArray();
+      assertEquals(longs[i], Bytes.readAsVLong(long_bytes_no_offset, 0));
+      byte[] long_bytes_with_offset = bytesWithOffset(long_bytes_no_offset);
+      assertEquals(longs[i], Bytes.readAsVLong(long_bytes_with_offset, 1));
+    }
   }
 
   public void testToStringBinaryForBytes() {
@@ -471,6 +501,52 @@ public class TestBytes extends TestCase {
     }
     for (byte i = 0; i < 100; i++) {
       Assert.assertEquals(i, b[i]);
+    }
+  }
+  
+  public void testToFromHex() {
+    List<String> testStrings = new ArrayList<String>();
+    testStrings.addAll(Arrays.asList(new String[] {
+        "",
+        "00",
+        "A0",
+        "ff",
+        "FFffFFFFFFFFFF",
+        "12",
+        "0123456789abcdef",
+        "283462839463924623984692834692346ABCDFEDDCA0",
+      }));
+    for (String testString : testStrings)
+    {
+      byte[] byteData = Bytes.fromHex(testString);
+      Assert.assertEquals(testString.length() / 2, byteData.length);
+      String result = Bytes.toHex(byteData);
+      Assert.assertTrue(testString.equalsIgnoreCase(result));
+    }
+    
+    List<byte[]> testByteData = new ArrayList<byte[]>();
+    testByteData.addAll(Arrays.asList(new byte[][] {
+      new byte[0],
+      new byte[1],
+      new byte[10],
+      new byte[] {1, 2, 3, 4, 5},
+      new byte[] {(byte) 0xFF},
+    }));
+    Random r = new Random();
+    for (int i = 0; i < 20; i++)
+    {
+      
+      byte[] bytes = new byte[r.nextInt(100)];
+      r.nextBytes(bytes);
+      testByteData.add(bytes);
+    }
+    
+    for (byte[] testData : testByteData)
+    {
+      String hexString = Bytes.toHex(testData);
+      Assert.assertEquals(testData.length * 2, hexString.length());
+      byte[] result = Bytes.fromHex(hexString);
+      Assert.assertArrayEquals(testData, result);
     }
   }
 }

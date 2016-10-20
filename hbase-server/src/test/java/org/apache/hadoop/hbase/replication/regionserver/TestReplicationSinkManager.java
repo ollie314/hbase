@@ -25,11 +25,12 @@ import java.util.List;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.ServerName;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.client.HConnection;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.AdminService;
+import org.apache.hadoop.hbase.replication.HBaseReplicationEndpoint;
 import org.apache.hadoop.hbase.replication.ReplicationPeers;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationSinkManager.SinkPeer;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
@@ -42,13 +43,15 @@ public class TestReplicationSinkManager {
   private static final String PEER_CLUSTER_ID = "PEER_CLUSTER_ID";
 
   private ReplicationPeers replicationPeers;
+  private HBaseReplicationEndpoint replicationEndpoint;
   private ReplicationSinkManager sinkManager;
 
   @Before
   public void setUp() {
     replicationPeers = mock(ReplicationPeers.class);
+    replicationEndpoint = mock(HBaseReplicationEndpoint.class);
     sinkManager = new ReplicationSinkManager(mock(HConnection.class),
-                      PEER_CLUSTER_ID, replicationPeers, new Configuration());
+                      PEER_CLUSTER_ID, replicationEndpoint, new Configuration());
   }
 
   @Test
@@ -58,7 +61,7 @@ public class TestReplicationSinkManager {
       serverNames.add(mock(ServerName.class));
     }
 
-    when(replicationPeers.getRegionServersOfConnectedPeer(PEER_CLUSTER_ID))
+    when(replicationEndpoint.getRegionServers())
           .thenReturn(serverNames);
 
     sinkManager.chooseSinks();
@@ -72,7 +75,7 @@ public class TestReplicationSinkManager {
     List<ServerName> serverNames = Lists.newArrayList(mock(ServerName.class),
       mock(ServerName.class));
 
-    when(replicationPeers.getRegionServersOfConnectedPeer(PEER_CLUSTER_ID))
+    when(replicationEndpoint.getRegionServers())
           .thenReturn(serverNames);
 
     sinkManager.chooseSinks();
@@ -84,8 +87,8 @@ public class TestReplicationSinkManager {
   public void testReportBadSink() {
     ServerName serverNameA = mock(ServerName.class);
     ServerName serverNameB = mock(ServerName.class);
-    when(replicationPeers.getRegionServersOfConnectedPeer(PEER_CLUSTER_ID)).thenReturn(
-      Lists.newArrayList(serverNameA, serverNameB));
+    when(replicationEndpoint.getRegionServers())
+      .thenReturn(Lists.newArrayList(serverNameA, serverNameB));
 
     sinkManager.chooseSinks();
     // Sanity check
@@ -107,27 +110,53 @@ public class TestReplicationSinkManager {
   @Test
   public void testReportBadSink_PastThreshold() {
     List<ServerName> serverNames = Lists.newArrayList();
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 30; i++) {
       serverNames.add(mock(ServerName.class));
     }
-    when(replicationPeers.getRegionServersOfConnectedPeer(PEER_CLUSTER_ID))
+    when(replicationEndpoint.getRegionServers())
           .thenReturn(serverNames);
 
 
     sinkManager.chooseSinks();
     // Sanity check
-    assertEquals(2, sinkManager.getSinks().size());
+    assertEquals(3, sinkManager.getSinks().size());
 
     ServerName serverName = sinkManager.getSinks().get(0);
 
     SinkPeer sinkPeer = new SinkPeer(serverName, mock(AdminService.BlockingInterface.class));
 
+    sinkManager.reportSinkSuccess(sinkPeer); // has no effect, counter does not go negative
     for (int i = 0; i <= ReplicationSinkManager.DEFAULT_BAD_SINK_THRESHOLD; i++) {
       sinkManager.reportBadSink(sinkPeer);
     }
 
     // Reporting a bad sink more than the threshold count should remove it
     // from the list of potential sinks
+    assertEquals(2, sinkManager.getSinks().size());
+
+    //
+    // now try a sink that has some successes
+    //
+    serverName = sinkManager.getSinks().get(0);
+
+    sinkPeer = new SinkPeer(serverName, mock(AdminService.BlockingInterface.class));
+    for (int i = 0; i <= ReplicationSinkManager.DEFAULT_BAD_SINK_THRESHOLD-1; i++) {
+      sinkManager.reportBadSink(sinkPeer);
+    }
+    sinkManager.reportSinkSuccess(sinkPeer); // one success
+    sinkManager.reportBadSink(sinkPeer);
+
+    // did not remove the sink, since we had one successful try
+    assertEquals(2, sinkManager.getSinks().size());
+
+    for (int i = 0; i <= ReplicationSinkManager.DEFAULT_BAD_SINK_THRESHOLD-2; i++) {
+      sinkManager.reportBadSink(sinkPeer);
+    }
+    // still not remove, since the success reset the counter
+    assertEquals(2, sinkManager.getSinks().size());
+
+    sinkManager.reportBadSink(sinkPeer);
+    // but we exhausted the tries
     assertEquals(1, sinkManager.getSinks().size());
   }
 
@@ -137,7 +166,7 @@ public class TestReplicationSinkManager {
     for (int i = 0; i < 20; i++) {
       serverNames.add(mock(ServerName.class));
     }
-    when(replicationPeers.getRegionServersOfConnectedPeer(PEER_CLUSTER_ID))
+    when(replicationEndpoint.getRegionServers())
           .thenReturn(serverNames);
 
 

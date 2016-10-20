@@ -21,6 +21,7 @@ package org.apache.hadoop.hbase.io;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
@@ -35,6 +36,10 @@ import org.apache.hadoop.hbase.util.Bytes;
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
 public class ByteBufferOutputStream extends OutputStream {
+  
+  // Borrowed from openJDK:
+  // http://grepcode.com/file/repository.grepcode.com/java/root/jdk/openjdk/8-b132/java/util/ArrayList.java#221
+  private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
 
   protected ByteBuffer buf;
 
@@ -43,15 +48,33 @@ public class ByteBufferOutputStream extends OutputStream {
   }
 
   public ByteBufferOutputStream(int capacity, boolean useDirectByteBuffer) {
-    if (useDirectByteBuffer) {
-      buf = ByteBuffer.allocateDirect(capacity);
-    } else {
-      buf = ByteBuffer.allocate(capacity);
-    }
+    this(allocate(capacity, useDirectByteBuffer));
+  }
+
+  /**
+   * @param bb ByteBuffer to use. If too small, will be discarded and a new one allocated in its
+   * place; i.e. the passed in BB may NOT BE RETURNED!! Minimally it will be altered. SIDE EFFECT!!
+   * If you want to get the newly allocated ByteBuffer, you'll need to pick it up when
+   * done with this instance by calling {@link #getByteBuffer()}. All this encapsulation violation
+   * is so we can recycle buffers rather than allocate each time; it can get expensive especially
+   * if the buffers are big doing allocations each time or having them undergo resizing because
+   * initial allocation was small.
+   * @see #getByteBuffer()
+   */
+  public ByteBufferOutputStream(final ByteBuffer bb) {
+    this.buf = bb;
+    this.buf.clear();
   }
 
   public int size() {
     return buf.position();
+  }
+
+  private static ByteBuffer allocate(final int capacity, final boolean useDirectByteBuffer) {
+    if (capacity > MAX_ARRAY_SIZE) { // avoid OutOfMemoryError
+      throw new BufferOverflowException();
+    }
+    return useDirectByteBuffer? ByteBuffer.allocateDirect(capacity): ByteBuffer.allocate(capacity);
   }
 
   /**
@@ -64,14 +87,17 @@ public class ByteBufferOutputStream extends OutputStream {
   }
 
   private void checkSizeAndGrow(int extra) {
-    if ( (buf.position() + extra) > buf.limit()) {
-      // size calculation is complex, because we could overflow negative,
-      // and/or not allocate enough space. this fixes that.
-      int newSize = (int)Math.min((((long)buf.capacity()) * 2),
-          (long)(Integer.MAX_VALUE));
-      newSize = Math.max(newSize, buf.position() + extra);
-
-      ByteBuffer newBuf = ByteBuffer.allocate(newSize);
+    long capacityNeeded = buf.position() + (long) extra;
+    if (capacityNeeded > buf.limit()) {
+      // guarantee it's possible to fit
+      if (capacityNeeded > MAX_ARRAY_SIZE) {
+        throw new BufferOverflowException();
+      }
+      // double until hit the cap
+      long nextCapacity = Math.min(buf.capacity() * 2L, MAX_ARRAY_SIZE);
+      // but make sure there is enough if twice the existing capacity is still too small
+      nextCapacity = Math.max(nextCapacity, capacityNeeded);
+      ByteBuffer newBuf = allocate((int) nextCapacity, buf.isDirect());
       buf.flip();
       newBuf.put(buf);
       buf = newBuf;

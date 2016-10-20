@@ -21,12 +21,12 @@ limitations under the License.
   <parent>
     <artifactId>hbase</artifactId>
     <groupId>org.apache.hbase</groupId>
-    <version>0.98.9-SNAPSHOT</version>
+    <version>0.98.23</version>
     <relativePath>..</relativePath>
   </parent>
 
   <artifactId>hbase-hadoop1-compat</artifactId>
-  <name>HBase - Hadoop One Compatibility</name>
+  <name>Apache HBase - Hadoop One Compatibility</name>
   <description> Interfaces to be implemented in order to smooth over hadoop version differences
     </description>
 
@@ -77,6 +77,12 @@ limitations under the License.
     <dependency>
       <groupId>org.apache.hbase</groupId>
       <artifactId>hbase-annotations</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-annotations</artifactId>
+      <type>test-jar</type>
+      <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.hbase</groupId>

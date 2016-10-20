@@ -223,6 +223,13 @@ message SetBalancerRunningResponse {
   optional bool prev_balance_value = 1;
 }
 
+message IsBalancerEnabledRequest {
+}
+
+message IsBalancerEnabledResponse {
+  required bool enabled = 1;
+}
+
 message RunCatalogScanRequest {
 }
 
@@ -305,6 +312,9 @@ message GetSchemaAlterStatusResponse {
 
 message GetTableDescriptorsRequest {
   repeated TableName table_names = 1;
+  optional string regex = 2;
+  optional bool include_sys_tables = 3 [default=false];
+  optional string namespace = 4;
 }
 
 message GetTableDescriptorsResponse {
@@ -312,6 +322,9 @@ message GetTableDescriptorsResponse {
 }
 
 message GetTableNamesRequest {
+  optional string regex = 1;
+  optional bool include_sys_tables = 2 [default=false];
+  optional string namespace = 3;
 }
 
 message GetTableNamesResponse {
@@ -355,6 +368,21 @@ message TruncateTableRequest {
 }
 
 message TruncateTableResponse {
+}
+
+message SecurityCapabilitiesRequest {
+}
+
+message SecurityCapabilitiesResponse {
+  enum Capability {
+    SIMPLE_AUTHENTICATION = 0;
+    SECURE_AUTHENTICATION = 1;
+    AUTHORIZATION = 2;
+    CELL_AUTHORIZATION = 3;
+    CELL_VISIBILITY = 4;
+  }
+
+  repeated Capability capabilities = 1;
 }
 
 service MasterService {
@@ -462,6 +490,12 @@ service MasterService {
   rpc SetBalancerRunning(SetBalancerRunningRequest)
     returns(SetBalancerRunningResponse);
 
+  /**
+   * Query whether the Region Balancer is running.
+   */
+  rpc IsBalancerEnabled(IsBalancerEnabledRequest)
+    returns(IsBalancerEnabledResponse);
+
   /** Get a run of the catalog janitor */
   rpc RunCatalogScan(RunCatalogScanRequest)
      returns(RunCatalogScanResponse);
@@ -559,4 +593,8 @@ service MasterService {
   /** Truncate a table */
     rpc truncateTable(TruncateTableRequest)
         returns(TruncateTableResponse);
+
+  /** Returns the security capabilities in effect on the cluster */
+  rpc getSecurityCapabilities(SecurityCapabilitiesRequest)
+    returns(SecurityCapabilitiesResponse);
 }

@@ -39,9 +39,7 @@ import org.apache.hadoop.ipc.RemoteException;
 import com.google.protobuf.ServiceException;
 
 /**
- * Runs an rpc'ing {@link RetryingCallable}. Sets into rpc client
- * threadlocal outstanding timeouts as so we don't persist too much.
- * Dynamic rather than static so can set the generic appropriately.
+ * Dynamic rather than static so can set the generic return type appropriately.
  */
 @InterfaceAudience.Private
 @edu.umd.cs.findbugs.annotations.SuppressWarnings
@@ -56,20 +54,25 @@ public class RpcRetryingCaller<T> {
    * When we started making calls.
    */
   private long globalStartTime;
-  /**
-   * Start and end times for a single call.
-   */
+
   private final static int MIN_RPC_TIMEOUT = 2000;
+
   /** How many retries are allowed before we start to log */
   private final int startLogErrorsCnt;
 
   private final long pause;
   private final int retries;
+  private final int rpcTimeout;// timeout for each rpc request
 
   public RpcRetryingCaller(long pause, int retries, int startLogErrorsCnt) {
+    this(pause, retries, startLogErrorsCnt, 0);
+  }
+
+  public RpcRetryingCaller(long pause, int retries, int startLogErrorsCnt, int rpcTimeout) {
     this.pause = pause;
     this.retries = retries;
     this.startLogErrorsCnt = startLogErrorsCnt;
+    this.rpcTimeout = rpcTimeout;
   }
 
   private void beforeCall() {
@@ -78,10 +81,15 @@ public class RpcRetryingCaller<T> {
     if (remaining < MIN_RPC_TIMEOUT) {
       // If there is no time left, we're trying anyway. It's too late.
       // 0 means no timeout, and it's not the intent here. So we secure both cases by
-      // resetting to the minimum.
+      // setting remaining to MIN_RPC_TIMEOUT
       remaining = MIN_RPC_TIMEOUT;
     }
-    RpcClient.setRpcTimeout(remaining);
+    int timeout = remaining;
+    // If we have a nonzero setting for RPC timeout, use it
+    if (rpcTimeout > 0 && rpcTimeout < timeout){
+      timeout = rpcTimeout;
+    }
+    RpcClient.setRpcTimeout(timeout);
   }
 
   private void afterCall() {
@@ -134,8 +142,8 @@ public class RpcRetryingCaller<T> {
         }
         // If the server is dead, we need to wait a little before retrying, to give
         //  a chance to the regions to be
-        // tries hasn't been bumped up yet so we use "tries + 1" to get right pause time
-        expectedSleep = callable.sleep(pause, tries + 1);
+        // get right pause time, start by RETRY_BACKOFF[0] * pause
+        expectedSleep = callable.sleep(pause, tries);
 
         // If, after the planned sleep, there won't be enough time left, we stop now.
         long duration = singleCallDuration(expectedSleep);
@@ -160,8 +168,9 @@ public class RpcRetryingCaller<T> {
    * @return Calculate how long a single call took
    */
   private long singleCallDuration(final long expectedSleep) {
+    int timeout = rpcTimeout > 0 ? rpcTimeout : MIN_RPC_TIMEOUT;
     return (EnvironmentEdgeManager.currentTimeMillis() - this.globalStartTime)
-      + MIN_RPC_TIMEOUT + expectedSleep;
+      + timeout + expectedSleep;
   }
 
   /**

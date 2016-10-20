@@ -23,12 +23,12 @@
     <parent>
         <artifactId>hbase</artifactId>
         <groupId>org.apache.hbase</groupId>
-        <version>0.98.9-SNAPSHOT</version>
+        <version>0.98.23</version>
         <relativePath>..</relativePath>
     </parent>
 
     <artifactId>hbase-hadoop-compat</artifactId>
-    <name>HBase - Hadoop Compatibility</name>
+    <name>Apache HBase - Hadoop Compatibility</name>
     <description>
         Interfaces to be implemented in order to smooth
         over hadoop version differences
@@ -74,9 +74,45 @@
           <artifactId>maven-source-plugin</artifactId>
         </plugin>
         </plugins>
+      <pluginManagement>
+        <plugins>
+          <!--This plugin's configuration is used to store Eclipse m2e settings
+               only. It has no influence on the Maven build itself.-->
+          <plugin>
+            <groupId>org.eclipse.m2e</groupId>
+            <artifactId>lifecycle-mapping</artifactId>
+            <version>1.0.0</version>
+            <configuration>
+              <lifecycleMappingMetadata>
+                <pluginExecutions>
+                  <pluginExecution>
+                    <pluginExecutionFilter>
+                      <groupId>org.apache.maven.plugins</groupId>
+                      <artifactId>maven-compiler-plugin</artifactId>
+                      <versionRange>[3.2,)</versionRange>
+                      <goals>
+                        <goal>compile</goal>
+                      </goals>
+                    </pluginExecutionFilter>
+                    <action>
+                      <ignore></ignore>
+                    </action>
+                  </pluginExecution>
+                </pluginExecutions>
+              </lifecycleMappingMetadata>
+            </configuration>
+          </plugin>
+        </plugins>
+      </pluginManagement>
     </build>
 
     <dependencies>
+      <dependency>
+        <groupId>org.apache.hbase</groupId>
+        <artifactId>hbase-annotations</artifactId>
+        <type>test-jar</type>
+        <scope>test</scope>
+      </dependency>
       <!-- General dependencies -->
       <dependency>
         <groupId>commons-logging</groupId>

@@ -29,6 +29,7 @@ import org.apache.hadoop.hbase.rest.model.CellModel;
 import org.apache.hadoop.hbase.rest.model.CellSetModel;
 import org.apache.hadoop.hbase.rest.model.RowModel;
 import org.apache.hadoop.hbase.rest.provider.JacksonProvider;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.codehaus.jackson.map.ObjectMapper;
 import org.junit.AfterClass;
@@ -147,6 +148,40 @@ public class TestMultiRowResource {
     Response response = client.get(path.toString(), Constants.MIMETYPE_XML);
     assertEquals(response.getCode(), 200);
     assertEquals(Constants.MIMETYPE_XML, response.getHeader("content-type"));
+
+    client.delete(row_5_url);
+    client.delete(row_6_url);
+
+  }
+
+  @Test
+  public void testMultiCellGetWithColsJSON() throws IOException, JAXBException {
+    String row_5_url = "/" + TABLE + "/" + ROW_1 + "/" + COLUMN_1;
+    String row_6_url = "/" + TABLE + "/" + ROW_2 + "/" + COLUMN_2;
+
+    StringBuilder path = new StringBuilder();
+    path.append("/");
+    path.append(TABLE);
+    path.append("/multiget");
+    path.append("/" + COLUMN_1 + "," + CFB);
+    path.append("?row=");
+    path.append(ROW_1);
+    path.append("&row=");
+    path.append(ROW_2);
+
+    client.post(row_5_url, Constants.MIMETYPE_BINARY, Bytes.toBytes(VALUE_1));
+    client.post(row_6_url, Constants.MIMETYPE_BINARY, Bytes.toBytes(VALUE_2));
+
+    Response response = client.get(path.toString(), Constants.MIMETYPE_JSON);
+    assertEquals(response.getCode(), 200);
+    ObjectMapper mapper =
+        new JacksonProvider().locateMapper(CellSetModel.class, MediaType.APPLICATION_JSON_TYPE);
+    CellSetModel cellSet = (CellSetModel) mapper.readValue(response.getBody(), CellSetModel.class);
+    assertEquals(2, cellSet.getRows().size());
+    assertEquals(ROW_1, Bytes.toString(cellSet.getRows().get(0).getKey()));
+    assertEquals(VALUE_1, Bytes.toString(cellSet.getRows().get(0).getCells().get(0).getValue()));
+    assertEquals(ROW_2, Bytes.toString(cellSet.getRows().get(1).getKey()));
+    assertEquals(VALUE_2, Bytes.toString(cellSet.getRows().get(1).getCells().get(0).getValue()));
 
     client.delete(row_5_url);
     client.delete(row_6_url);

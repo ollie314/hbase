@@ -26,6 +26,7 @@ option java_generate_equals_and_hash = true;
 option optimize_for = SPEED;
 
 import "HBase.proto";
+import "ClusterStatus.proto";
 
 /**
  * Content of the meta-region-server znode.
@@ -37,6 +38,8 @@ message MetaRegionServer {
   // clients connecting to the cluster can have prior knowledge of what version
   // to send to a RegionServer.  AsyncHBase will use this to detect versions.
   optional uint32 rpc_version = 2;
+  // State of the region transition. OPEN means fully operational 'hbase:meta'
+  optional RegionState.State state = 3;
 }
 
 /**
@@ -119,6 +122,9 @@ message ReplicationPeer {
   // clusterkey is the concatenation of the slave cluster's
   // hbase.zookeeper.quorum:hbase.zookeeper.property.clientPort:zookeeper.znode.parent
   required string clusterkey = 1;
+  optional string replicationEndpointImpl = 2;
+  repeated BytesBytesPair data = 3;
+  repeated NameStringPair configuration = 4;
 }
 
 /**

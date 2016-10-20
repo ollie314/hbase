@@ -19,7 +19,6 @@
 package org.apache.hadoop.hbase.util;
 
 import java.io.IOException;
-import java.io.PrintWriter;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.util.List;
@@ -169,11 +168,14 @@ public class JVMClusterUtil {
   public static String startup(final List<JVMClusterUtil.MasterThread> masters,
       final List<JVMClusterUtil.RegionServerThread> regionservers) throws IOException {
 
+    Configuration configuration = null;
+
     if (masters == null || masters.isEmpty()) {
       return null;
     }
 
     for (JVMClusterUtil.MasterThread t : masters) {
+      configuration = t.getMaster().getConfiguration();
       t.start();
     }
 
@@ -186,8 +188,10 @@ public class JVMClusterUtil {
         Thread.sleep(100);
       } catch (InterruptedException ignored) {
       }
-      if (System.currentTimeMillis() > startTime + 30000) {
-        throw new RuntimeException("Master not active after 30 seconds");
+      int startTimeout = configuration != null ? Integer.parseInt(
+        configuration.get("hbase.master.start.timeout.localHBaseCluster", "30000")) : 30000;
+      if (System.currentTimeMillis() > startTime + startTimeout) {
+        throw new RuntimeException(String.format("Master not active after %s seconds", startTimeout));
       }
     }
 
@@ -216,7 +220,7 @@ public class JVMClusterUtil {
       }
       if (System.currentTimeMillis() > startTime + maxwait) {
         String msg = "Master not initialized after " + maxwait + "ms seconds";
-        ReflectionUtils.printThreadInfo(new PrintWriter(System.out),
+        Threads.printThreadInfo(System.out,
           "Thread dump because: " + msg);
         throw new RuntimeException(msg);
       }
@@ -240,15 +244,23 @@ public class JVMClusterUtil {
       JVMClusterUtil.MasterThread activeMaster = null;
       for (JVMClusterUtil.MasterThread t : masters) {
         if (!t.master.isActiveMaster()) {
-          t.master.stopMaster();
+          try {
+            t.master.stopMaster();
+          } catch (IOException e) {
+            LOG.error("Exception occurred while stopping master", e);
+          }
         } else {
           activeMaster = t;
         }
       }
       // Do active after.
-      if (activeMaster != null)
-        activeMaster.master.shutdown();
-
+      if (activeMaster != null) {
+        try {
+          activeMaster.master.shutdown();
+        } catch (IOException e) {
+          LOG.error("Exception occurred in HMaster.shutdown()", e);
+        }
+      }
     }
     boolean wasInterrupted = false;
     final long maxTime = System.currentTimeMillis() + 30 * 1000;

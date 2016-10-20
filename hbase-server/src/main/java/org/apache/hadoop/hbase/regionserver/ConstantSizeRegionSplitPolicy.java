@@ -23,6 +23,8 @@ import org.apache.hadoop.hbase.HBaseInterfaceAudience;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
 
+import java.util.Random;
+
 /**
  * A {@link RegionSplitPolicy} implementation which splits a region
  * as soon as any of its store files exceeds a maximum configurable
@@ -34,6 +36,8 @@ import org.apache.hadoop.hbase.HTableDescriptor;
  */
 @InterfaceAudience.LimitedPrivate(HBaseInterfaceAudience.CONFIG)
 public class ConstantSizeRegionSplitPolicy extends RegionSplitPolicy {
+  private static final Random RANDOM = new Random();
+
   private long desiredMaxFileSize;
 
   @Override
@@ -47,6 +51,10 @@ public class ConstantSizeRegionSplitPolicy extends RegionSplitPolicy {
     if (this.desiredMaxFileSize <= 0) {
       this.desiredMaxFileSize = conf.getLong(HConstants.HREGION_MAX_FILESIZE,
         HConstants.DEFAULT_MAX_FILE_SIZE);
+    }
+    float jitter = conf.getFloat("hbase.hregion.max.filesize.jitter", Float.NaN);
+    if (!Float.isNaN(jitter)) {
+      this.desiredMaxFileSize += (long)(desiredMaxFileSize * (RANDOM.nextFloat() - 0.5D) * jitter);
     }
   }
 

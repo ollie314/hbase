@@ -19,6 +19,16 @@ package org.apache.hadoop.hbase.client;
 
 import java.io.IOException;
 
+import org.apache.hadoop.hbase.classification.InterfaceAudience;
+
+/**
+ * Helper callable for internal use when you just want to override a single method of a {@link
+ * RetryingCallable}. By default, this just delegates all {@link RetryingCallable} methods to the
+ * specified delegate.
+ * @param <T> Result class from calls to the delegate {@link RetryingCallable}
+ * @param <D> Type of the delegate class
+ */
+@InterfaceAudience.Private
 public class DelegatingRetryingCallable<T, D extends RetryingCallable<T>> implements
     RetryingCallable<T> {
   protected final D delegate;

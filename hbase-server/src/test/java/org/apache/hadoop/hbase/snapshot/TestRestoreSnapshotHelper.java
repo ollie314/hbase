@@ -30,7 +30,6 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.SmallTests;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.errorhandling.ForeignExceptionDispatcher;
 import org.apache.hadoop.hbase.io.HFileLink;
@@ -38,6 +37,7 @@ import org.apache.hadoop.hbase.monitoring.MonitoredTask;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
 import org.apache.hadoop.hbase.snapshot.SnapshotTestingUtils.SnapshotMock;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.junit.After;
@@ -77,10 +77,19 @@ public class TestRestoreSnapshotHelper {
 
   @Test
   public void testRestore() throws IOException {
+    restoreAndVerify("snapshot", "testRestore");
+  }
+
+  @Test
+  public void testRestoreWithNamespace() throws IOException {
+    restoreAndVerify("snapshot", "namespace1:testRestoreWithNamespace");
+  }
+
+  private void restoreAndVerify(final String snapshotName, final String tableName) throws IOException {
     // Test Rolling-Upgrade like Snapshot.
     // half machines writing using v1 and the others using v2 format.
     SnapshotMock snapshotMock = new SnapshotMock(TEST_UTIL.getConfiguration(), fs, rootDir);
-    SnapshotMock.SnapshotBuilder builder = snapshotMock.createSnapshotV2("snapshot");
+    SnapshotMock.SnapshotBuilder builder = snapshotMock.createSnapshotV2(snapshotName, tableName);
     builder.addRegionV1();
     builder.addRegionV2();
     builder.addRegionV2();

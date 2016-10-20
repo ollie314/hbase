@@ -25,9 +25,14 @@ import com.google.protobuf.Message;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
-import org.apache.hadoop.hbase.SmallTests;
+import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.monitoring.MonitoredRPCHandlerImpl;
+import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
+import org.apache.hadoop.hbase.client.Put;
 import org.apache.hadoop.hbase.ipc.RpcServer.Call;
 import org.apache.hadoop.hbase.protobuf.generated.RPCProtos;
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
@@ -68,10 +73,11 @@ public class TestSimpleRpcScheduler {
   public void testBasic() throws IOException, InterruptedException {
     PriorityFunction qosFunction = mock(PriorityFunction.class);
     RpcScheduler scheduler = new SimpleRpcScheduler(
-        conf, 10, 0, 0, qosFunction, 0);
+      conf, 10, 0, 0, qosFunction, null, 0);
     scheduler.init(CONTEXT);
     scheduler.start();
     CallRunner task = createMockTask();
+    task.setStatus(new MonitoredRPCHandlerImpl());
     scheduler.dispatch(task);
     verify(task, timeout(1000)).run();
     scheduler.stop();
@@ -106,11 +112,12 @@ public class TestSimpleRpcScheduler {
       }
     };
     for (CallRunner task : tasks) {
+      task.setStatus(new MonitoredRPCHandlerImpl());
       doAnswer(answerToRun).when(task).run();
     }
 
     RpcScheduler scheduler = new SimpleRpcScheduler(
-        conf, 1, 1 ,1, qosFunction, HConstants.HIGH_QOS);
+      conf, 1, 1 ,1, qosFunction, null, HConstants.HIGH_QOS);
     scheduler.init(CONTEXT);
     scheduler.start();
     for (CallRunner task : tasks) {
@@ -134,4 +141,5 @@ public class TestSimpleRpcScheduler {
     when(task.getCall()).thenReturn(call);
     return task;
   }
+
 }

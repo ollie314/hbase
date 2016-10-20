@@ -42,7 +42,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.KeepDeletedCells;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValueTestUtil;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.EnvironmentEdge;
@@ -83,6 +83,25 @@ public class TestMemStore extends TestCase {
     KeyValue found = this.memstore.kvset.first();
     assertEquals(1, this.memstore.kvset.size());
     assertTrue(Bytes.toString(found.getValue()), CellUtil.matchingValue(samekey, found));
+  }
+
+  public void testPutSameCell() {
+    byte[] bytes = Bytes.toBytes(getName());
+    KeyValue kv = new KeyValue(bytes, bytes, bytes, bytes);
+    long sizeChangeForFirstCell = this.memstore.add(kv);
+    long sizeChangeForSecondCell = this.memstore.add(kv);
+    // make sure memstore size increase won't double-count MSLAB chunk size
+    assertEquals(MemStore.heapSizeChange(kv, true), sizeChangeForFirstCell);
+    if (this.memstore.allocator != null) {
+      // make sure memstore size increased when using MSLAB
+      assertEquals(memstore.getCellLength(kv), sizeChangeForSecondCell);
+      // make sure chunk size increased even when writing the same cell, if using MSLAB
+      assertEquals(2 * memstore.getCellLength(kv),
+          this.memstore.allocator.getCurrentChunk().getNextFreeOffset());
+    } else {
+      // make sure no memstore size change w/o MSLAB
+      assertEquals(0, sizeChangeForSecondCell);
+    }
   }
 
   /**
@@ -833,11 +852,16 @@ public class TestMemStore extends TestCase {
     long newSize = this.memstore.size.get();
     assert(newSize > oldSize);
 
+   //The kv1 should be removed.
+   assert(memstore.kvset.size() == 2);
+   
     KeyValue kv4 = KeyValueTestUtil.create("r", "f", "q", 104, "v");
     kv4.setMvccVersion(1);
     l.clear(); l.add(kv4);
     this.memstore.upsert(l, 3);
     assertEquals(newSize, this.memstore.size.get());
+   //The kv2 should be removed.
+   assert(memstore.kvset.size() == 2);
     //this.memstore = null;
   }
 

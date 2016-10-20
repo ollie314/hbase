@@ -21,6 +21,9 @@ package org.apache.hadoop.hbase.replication.regionserver;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.google.common.collect.Sets;
+
+import java.io.IOException;
 import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -46,7 +49,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.Server;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
@@ -59,6 +62,7 @@ import org.apache.hadoop.hbase.replication.ReplicationFactory;
 import org.apache.hadoop.hbase.replication.ReplicationPeers;
 import org.apache.hadoop.hbase.replication.ReplicationQueueInfo;
 import org.apache.hadoop.hbase.replication.ReplicationQueues;
+import org.apache.hadoop.hbase.replication.ReplicationQueuesClient;
 import org.apache.hadoop.hbase.replication.ReplicationSourceDummy;
 import org.apache.hadoop.hbase.replication.ReplicationStateZKBase;
 import org.apache.hadoop.hbase.replication.regionserver.ReplicationSourceManager.NodeFailoverWorker;
@@ -70,10 +74,10 @@ import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
-
-import com.google.common.collect.Sets;
+import org.junit.rules.TestName;
 
 @Category(MediumTests.class)
 public class TestReplicationSourceManager {
@@ -171,15 +175,24 @@ public class TestReplicationSourceManager {
     utility.shutdownMiniCluster();
   }
 
-  @Before
-  public void setUp() throws Exception {
+  @Rule
+  public TestName testName = new TestName();
+
+  private void cleanLogDir() throws IOException {
     fs.delete(logDir, true);
     fs.delete(oldLogDir, true);
   }
 
+  @Before
+  public void setUp() throws Exception {
+    LOG.info("Start " + testName.getMethodName());
+    cleanLogDir();
+  }
+
   @After
   public void tearDown() throws Exception {
-    setUp();
+    LOG.info("End " + testName.getMethodName());
+    cleanLogDir();
   }
 
   @Test
@@ -238,7 +251,6 @@ public class TestReplicationSourceManager {
   
   @Test
   public void testClaimQueues() throws Exception {
-    LOG.debug("testNodeFailoverWorkerCopyQueuesFromRSUsingMulti");
     conf.setBoolean(HConstants.ZOOKEEPER_USEMULTI, true);
     final Server server = new DummyServer("hostname0.example.org");
     ReplicationQueues rq =
@@ -358,8 +370,62 @@ public class TestReplicationSourceManager {
 
     server.abort("", null);
   }
-  
-  
+
+  @Test
+  public void testFailoverDeadServerCversionChange() throws Exception {
+    LOG.debug("testFailoverDeadServerCversionChange");
+
+    conf.setBoolean(HConstants.ZOOKEEPER_USEMULTI, true);
+    final Server s0 = new DummyServer("cversion-change0.example.org");
+    ReplicationQueues repQueues =
+        ReplicationFactory.getReplicationQueues(s0.getZooKeeper(), conf, s0);
+    repQueues.init(s0.getServerName().toString());
+    // populate some znodes in the peer znode
+    files.add("log1");
+    files.add("log2");
+    for (String file : files) {
+      repQueues.addLog("1", file);
+    }
+    // simulate queue transfer
+    Server s1 = new DummyServer("cversion-change1.example.org");
+    ReplicationQueues rq1 =
+        ReplicationFactory.getReplicationQueues(s1.getZooKeeper(), s1.getConfiguration(), s1);
+    rq1.init(s1.getServerName().toString());
+
+    ReplicationQueuesClient client =
+        ReplicationFactory.getReplicationQueuesClient(s1.getZooKeeper(), s1.getConfiguration(), s1);
+
+    int v0 = client.getQueuesZNodeCversion();
+    rq1.claimQueues(s0.getServerName().getServerName());
+    int v1 = client.getQueuesZNodeCversion();
+    // cversion should increased by 1 since a child node is deleted
+    assertEquals(v0 + 1, v1);
+
+    s0.abort("", null);
+  }
+
+  @Test
+  public void testCleanupUnknownPeerZNode() throws Exception {
+    final Server server = new DummyServer("hostname2.example.org");
+    ReplicationQueues rq =
+        ReplicationFactory.getReplicationQueues(server.getZooKeeper(), server.getConfiguration(),
+          server);
+    rq.init(server.getServerName().toString());
+    // populate some znodes in the peer znode
+    // add log to an unknown peer
+    String group = "testgroup";
+    rq.addLog("2", group + ".log1");
+    rq.addLog("2", group + ".log2");
+
+    NodeFailoverWorker w1 = manager.new NodeFailoverWorker(server.getServerName().getServerName());
+    w1.run();
+
+    // The log of the unknown peer should be removed from zk
+    for (String peer : manager.getAllQueues()) {
+      assertTrue(peer.startsWith("1"));
+    }
+  }
+
   static class DummyNodeFailoverWorker extends Thread {
     private SortedMap<String, SortedSet<String>> logZnodesMap;
     Server server;

@@ -18,7 +18,7 @@ package org.apache.hadoop.hbase.io.encoding;
 
 import static org.junit.Assert.assertEquals;
 
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
@@ -27,8 +27,7 @@ public class TestBufferedDataBlockEncoder {
 
   @Test
   public void testEnsureSpaceForKey() {
-    BufferedDataBlockEncoder.SeekerState state =
-        new BufferedDataBlockEncoder.SeekerState();
+    BufferedDataBlockEncoder.SeekerState state = new BufferedDataBlockEncoder.SeekerState();
     for (int i = 1; i <= 65536; ++i) {
       state.keyLength = i;
       state.ensureSpaceForKey();

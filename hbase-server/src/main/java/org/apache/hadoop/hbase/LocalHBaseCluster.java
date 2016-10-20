@@ -143,7 +143,9 @@ public class LocalHBaseCluster {
     // clash over default ports.
     conf.set(HConstants.MASTER_PORT, "0");
     conf.set(HConstants.REGIONSERVER_PORT, "0");
-    conf.set(HConstants.REGIONSERVER_INFO_PORT, "0");
+    if (conf.getInt(HConstants.REGIONSERVER_INFO_PORT, 0) != -1) {
+      conf.set(HConstants.REGIONSERVER_INFO_PORT, "0");
+    }
 
     this.masterClass = (Class<? extends HMaster>)
       conf.getClass(HConstants.MASTER_IMPL, masterClass);
@@ -166,6 +168,7 @@ public class LocalHBaseCluster {
     return addRegionServer(new Configuration(conf), this.regionThreads.size());
   }
 
+  @SuppressWarnings("unchecked")
   public JVMClusterUtil.RegionServerThread addRegionServer(
       Configuration config, final int index)
   throws IOException {
@@ -174,7 +177,8 @@ public class LocalHBaseCluster {
     // the guts of HConnectionManager.
     JVMClusterUtil.RegionServerThread rst =
       JVMClusterUtil.createRegionServerThread(config,
-          this.regionServerClass, index);
+        (Class<? extends HRegionServer>) conf.getClass(HConstants.REGION_SERVER_IMPL,
+          this.regionServerClass), index);
     this.regionThreads.add(rst);
     return rst;
   }
@@ -245,6 +249,13 @@ public class LocalHBaseCluster {
       else LOG.info("Not alive " + rst.getName());
     }
     return liveServers;
+  }
+
+  /**
+   * @return the Configuration used by this LocalHBaseCluster
+   */
+  public Configuration getConfiguration() {
+    return this.conf;
   }
 
   /**

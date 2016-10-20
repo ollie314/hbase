@@ -42,8 +42,6 @@ import org.apache.hadoop.hbase.zookeeper.ZooKeeperWatcher;
 import org.apache.hadoop.hbase.zookeeper.lock.ZKInterProcessReadWriteLock;
 import org.apache.zookeeper.KeeperException;
 
-import com.google.protobuf.InvalidProtocolBufferException;
-
 /**
  * A manager for distributed table level locks.
  */
@@ -214,10 +212,10 @@ public abstract class TableLockManager {
       return null;
     }
     try {
-      ZooKeeperProtos.TableLock data = ZooKeeperProtos.TableLock.newBuilder().mergeFrom(
-          bytes, pblen, bytes.length - pblen).build();
-      return data;
-    } catch (InvalidProtocolBufferException ex) {
+      ZooKeeperProtos.TableLock.Builder builder = ZooKeeperProtos.TableLock.newBuilder();
+      ProtobufUtil.mergeFrom(builder, bytes, pblen, bytes.length - pblen);
+      return builder.build();
+    } catch (IOException ex) {
       LOG.warn("Exception in deserialization", ex);
     }
     return null;
@@ -240,8 +238,10 @@ public abstract class TableLockManager {
           return;
         }
         LOG.debug("Table is locked by " +
-            String.format("[tableName=%s, lockOwner=%s, threadId=%s, " +
-                "purpose=%s, isShared=%s, createTime=%s]", Bytes.toString(data.getTableName().toByteArray()),
+            String.format("[tableName=%s:%s, lockOwner=%s, threadId=%s, " +
+                "purpose=%s, isShared=%s, createTime=%s]",
+                data.getTableName().getNamespace().toStringUtf8(),
+                data.getTableName().getQualifier().toStringUtf8(),
                 ProtobufUtil.toServerName(data.getLockOwner()), data.getThreadId(),
                 data.getPurpose(), data.getIsShared(), data.getCreateTime()));
       }

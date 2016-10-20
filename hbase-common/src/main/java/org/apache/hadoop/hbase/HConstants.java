@@ -84,6 +84,7 @@ public final class HConstants {
   /**
    * Status codes used for return values of bulk operations.
    */
+  @InterfaceAudience.Private
   public enum OperationStatusCode {
     NOT_RUN,
     SUCCESS,
@@ -201,6 +202,10 @@ public final class HConstants {
   public static final String ZOOKEEPER_DATA_DIR =
       ZK_CFG_PROPERTY_PREFIX + "dataDir";
 
+  /** Parameter name for the ZK tick time */
+  public static final String ZOOKEEPER_TICK_TIME =
+      ZK_CFG_PROPERTY_PREFIX + "tickTime";
+
   /** Default limit on concurrent client-side zookeeper connections */
   public static final int DEFAULT_ZOOKEPER_MAX_CLIENT_CNXNS = 300;
 
@@ -267,15 +272,15 @@ public final class HConstants {
   /** Parameter name for HBase client IPC pool size */
   public static final String HBASE_CLIENT_IPC_POOL_SIZE = "hbase.client.ipc.pool.size";
 
-  /** Parameter name for HBase client operation timeout, which overrides RPC timeout */
+  /** Parameter name for HBase client operation timeout. */
   public static final String HBASE_CLIENT_OPERATION_TIMEOUT = "hbase.client.operation.timeout";
 
-  /** Parameter name for HBase client operation timeout, which overrides RPC timeout */
+  /** Parameter name for HBase client operation timeout. */
   public static final String HBASE_CLIENT_META_OPERATION_TIMEOUT =
     "hbase.client.meta.operation.timeout";
 
   /** Default HBase client operation timeout, which is tantamount to a blocking call */
-  public static final int DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT = Integer.MAX_VALUE;
+  public static final int DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT = 1200000;
 
   /** Used to construct the name of the log directory for a region server */
   public static final String HREGION_LOGDIR_NAME = "WALs";
@@ -324,6 +329,18 @@ public final class HConstants {
    */
   public static final int DEFAULT_HSTORE_OPEN_AND_CLOSE_THREADS_MAX = 1;
 
+  /**
+   * Block updates if memstore has hbase.hregion.memstore.block.multiplier
+   * times hbase.hregion.memstore.flush.size bytes.  Useful preventing
+   * runaway memstore during spikes in update traffic.
+   */
+  public static final String HREGION_MEMSTORE_BLOCK_MULTIPLIER =
+          "hbase.hregion.memstore.block.multiplier";
+
+  /**
+   * Default value for hbase.hregion.memstore.block.multiplier
+   */
+  public static final int DEFAULT_HREGION_MEMSTORE_BLOCK_MULTIPLIER = 4;
 
   /** Conf key for the memstore size at which we flush the memstore */
   public static final String HREGION_MEMSTORE_FLUSH_SIZE =
@@ -473,7 +490,12 @@ public final class HConstants {
 
   /**
    * Timestamp to use when we want to refer to the oldest cell.
+   * Special! Used in fake Cells only. Should never be the timestamp on an actual Cell returned to
+   * a client.
+   * @deprecated Should not be public since hbase-1.3.0. For internal use only. Move internal to
+   * Scanners flagged as special timestamp value never to be returned as timestamp on a Cell.
    */
+  @Deprecated
   public static final long OLDEST_TIMESTAMP = Long.MIN_VALUE;
 
   /**
@@ -537,6 +559,7 @@ public final class HConstants {
   public static final String REGION_IMPL = "hbase.hregion.impl";
 
   /** modifyTable op for replacing the table descriptor */
+  @InterfaceAudience.Private
   public static enum Modify {
     CLOSE_REGION,
     TABLE_COMPACT,
@@ -572,13 +595,30 @@ public final class HConstants {
       "hbase.client.scanner.max.result.size";
 
   /**
+   * Parameter name for maximum number of bytes returned when calling a scanner's next method.
+   * Controlled by the server.
+   */
+  public static final String HBASE_SERVER_SCANNER_MAX_RESULT_SIZE_KEY =
+      "hbase.server.scanner.max.result.size";
+
+  /**
    * Maximum number of bytes returned when calling a scanner's next method.
    * Note that when a single row is larger than this limit the row is still
    * returned completely.
    *
-   * The default value is unlimited.
+   * The default value is 2MB.
    */
-  public static final long DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE = Long.MAX_VALUE;
+  public static final long DEFAULT_HBASE_CLIENT_SCANNER_MAX_RESULT_SIZE = 2 * 1024 * 1024;
+
+  /**
+   * Maximum number of bytes returned when calling a scanner's next method.
+   * Note that when a single row is larger than this limit the row is still
+   * returned completely.
+   * Safety setting to protect the region server.
+   *
+   * The default value unlimited for backwards compatibility
+   */
+  public static final long DEFAULT_HBASE_SERVER_SCANNER_MAX_RESULT_SIZE = Long.MAX_VALUE;
 
   /**
    * Parameter name for client pause value, used mostly as value to wait
@@ -752,7 +792,8 @@ public final class HConstants {
   /**
    * timeout for short operation RPC
    */
-  public static final String HBASE_RPC_SHORTOPERATION_TIMEOUT_KEY = "hbase.rpc.shortoperation.timeout";
+  public static final String HBASE_RPC_SHORTOPERATION_TIMEOUT_KEY =
+      "hbase.rpc.shortoperation.timeout";
 
   /**
    * Default value of {@link #HBASE_RPC_SHORTOPERATION_TIMEOUT_KEY}
@@ -807,8 +848,17 @@ public final class HConstants {
     */
   public static final float HBASE_CLUSTER_MINIMUM_MEMORY_THRESHOLD = 0.2f;
 
-  public static final Pattern CP_HTD_ATTR_KEY_PATTERN = Pattern.compile
-      ("^coprocessor\\$([0-9]+)$", Pattern.CASE_INSENSITIVE);
+  public static final Pattern CP_HTD_ATTR_KEY_PATTERN =
+      Pattern.compile("^coprocessor\\$([0-9]+)$", Pattern.CASE_INSENSITIVE);
+
+  /**
+   * Pattern that matches a coprocessor specification. Form is:
+   * <code>
+   *&lt;coprocessor jar file location> '|' &lt<class name> ['|' &lt;priority> ['|' &lt;arguments>]]
+   * </code>
+   * ...where arguments are <code>&lt;KEY> '=' &lt;VALUE> [,...]</code>
+   * <p>For example: <code>hdfs:///foo.jar|com.foo.FooRegionObserver|1001|arg1=1,arg2=2</code>
+   */
   public static final Pattern CP_HTD_ATTR_VALUE_PATTERN =
       Pattern.compile("(^[^\\|]*)\\|([^\\|]+)\\|[\\s]*([\\d]*)[\\s]*(\\|.*)?$");
 
@@ -817,6 +867,8 @@ public final class HConstants {
   public static final Pattern CP_HTD_ATTR_VALUE_PARAM_PATTERN = Pattern.compile(
       "(" + CP_HTD_ATTR_VALUE_PARAM_KEY_PATTERN + ")=(" +
       CP_HTD_ATTR_VALUE_PARAM_VALUE_PATTERN + "),?");
+  public static final String CP_HTD_ATTR_INCLUSION_KEY =
+      "hbase.coprocessor.classloader.included.classes";
 
   /** The delay when re-trying a socket operation in a loop (HBASE-4712) */
   public static final int SOCKET_RETRY_WAIT_MS = 200;
@@ -850,6 +902,17 @@ public final class HConstants {
   public static final String REGION_SERVER_HANDLER_COUNT = "hbase.regionserver.handler.count";
   public static final int DEFAULT_REGION_SERVER_HANDLER_COUNT = 30;
 
+  /*
+   * REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT:
+   * -1  => Disable aborting
+   * 0   => Abort if even a single handler has died
+   * 0.x => Abort only when this percent of handlers have died
+   * 1   => Abort only all of the handers have died
+   */
+  public static final String REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT =
+      "hbase.regionserver.handler.abort.on.error.percent";
+  public static final float DEFAULT_REGION_SERVER_HANDLER_ABORT_ON_ERROR_PERCENT = -1;
+  
   public static final String REGION_SERVER_META_HANDLER_COUNT =
       "hbase.regionserver.metahandler.count";
   public static final int DEFAULT_REGION_SERVER_META_HANDLER_COUNT = 10;
@@ -890,7 +953,8 @@ public final class HConstants {
     "hbase.regionserver.wal.enablecompression";
 
   /** Region in Transition metrics threshold time */
-  public static final String METRICS_RIT_STUCK_WARNING_THRESHOLD="hbase.metrics.rit.stuck.warning.threshold";
+  public static final String METRICS_RIT_STUCK_WARNING_THRESHOLD =
+      "hbase.metrics.rit.stuck.warning.threshold";
 
   public static final String LOAD_BALANCER_SLOP_KEY = "hbase.regions.slop";
 
@@ -914,6 +978,7 @@ public final class HConstants {
   public static final int NORMAL_QOS = 0;
   public static final int QOS_THRESHOLD = 10;
   public static final int HIGH_QOS = 100;
+  public static final int ADMIN_QOS = 50;
   public static final int REPLICATION_QOS = 5; // normal_QOS < replication_QOS < high_QOS
   public static final int REPLAY_QOS = 6; // REPLICATION_QOS < REPLAY_QOS < high_QOS
 
@@ -983,7 +1048,8 @@ public final class HConstants {
    * 0.0.0.0.
    * @see <a href="https://issues.apache.org/jira/browse/HBASE-9961">HBASE-9961</a>
    */
-  public static final String STATUS_MULTICAST_BIND_ADDRESS = "hbase.status.multicast.bind.address.ip";
+  public static final String STATUS_MULTICAST_BIND_ADDRESS =
+      "hbase.status.multicast.bind.address.ip";
   public static final String DEFAULT_STATUS_MULTICAST_BIND_ADDRESS = "0.0.0.0";
 
   /**
@@ -994,30 +1060,47 @@ public final class HConstants {
 
   public static final long NO_NONCE = 0;
 
+  /** Default cipher for encryption */
+  public static final String CIPHER_AES = "AES";
+
   /** Configuration key for the crypto algorithm provider, a class name */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_CIPHERPROVIDER_CONF_KEY = "hbase.crypto.cipherprovider";
 
   /** Configuration key for the crypto key provider, a class name */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_KEYPROVIDER_CONF_KEY = "hbase.crypto.keyprovider";
 
   /** Configuration key for the crypto key provider parameters */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_KEYPROVIDER_PARAMETERS_KEY =
       "hbase.crypto.keyprovider.parameters";
 
   /** Configuration key for the name of the master key for the cluster, a string */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_MASTERKEY_NAME_CONF_KEY = "hbase.crypto.master.key.name";
 
   /** Configuration key for the name of the alternate master key for the cluster, a string */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_MASTERKEY_ALTERNATE_NAME_CONF_KEY =
     "hbase.crypto.master.alternate.key.name";
 
   /** Configuration key for the algorithm to use when encrypting the WAL, a string */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_WAL_ALGORITHM_CONF_KEY = "hbase.crypto.wal.algorithm";
 
   /** Configuration key for the name of the master WAL encryption key for the cluster, a string */
+  @InterfaceStability.Unstable
   public static final String CRYPTO_WAL_KEY_NAME_CONF_KEY = "hbase.crypto.wal.key.name";
 
-  /** Configuration key for enabling HLog encryption, a boolean */
+  /** Configuration key for the algorithm used for creating jks key, a string */
+  public static final String CRYPTO_KEY_ALGORITHM_CONF_KEY = "hbase.crypto.key.algorithm";
+
+  /** Configuration key for the name of the alternate cipher algorithm for the cluster, a string */
+  public static final String CRYPTO_ALTERNATE_KEY_ALGORITHM_CONF_KEY =
+      "hbase.crypto.alternate.key.algorithm";
+
+  /** Configuration key for enabling WAL encryption, a boolean */
   public static final String ENABLE_WAL_ENCRYPTION = "hbase.regionserver.wal.encryption";
 
   /** Configuration key for setting RPC codec class name */
@@ -1025,6 +1108,61 @@ public final class HConstants {
 
   /** Configuration key for setting replication codec class name */
   public static final String REPLICATION_CODEC_CONF_KEY = "hbase.replication.rpc.codec";
+
+  /** Config key for if the server should send backpressure and if the client should listen to
+   * that backpressure from the server */
+  public static final String ENABLE_CLIENT_BACKPRESSURE = "hbase.client.backpressure.enabled";
+  public static final boolean DEFAULT_ENABLE_CLIENT_BACKPRESSURE = false;
+
+  public static final String HEAP_OCCUPANCY_LOW_WATERMARK_KEY =
+      "hbase.heap.occupancy.low_water_mark";
+  public static final float DEFAULT_HEAP_OCCUPANCY_LOW_WATERMARK = 0.95f;
+  public static final String HEAP_OCCUPANCY_HIGH_WATERMARK_KEY =
+      "hbase.heap.occupancy.high_water_mark";
+  public static final float DEFAULT_HEAP_OCCUPANCY_HIGH_WATERMARK = 0.98f;
+
+  /**
+   * The max number of threads used for splitting storefiles in parallel during
+   * the region split process.
+   */
+  public static final String REGION_SPLIT_THREADS_MAX =
+    "hbase.regionserver.region.split.threads.max";
+
+  /** Canary config keys */
+  public static final String HBASE_CANARY_WRITE_DATA_TTL_KEY = "hbase.canary.write.data.ttl";
+
+  public static final String HBASE_CANARY_WRITE_PERSERVER_REGIONS_LOWERLIMIT_KEY =
+      "hbase.canary.write.perserver.regions.lowerLimit";
+
+  public static final String HBASE_CANARY_WRITE_PERSERVER_REGIONS_UPPERLIMIT_KEY =
+      "hbase.canary.write.perserver.regions.upperLimit";
+
+  public static final String HBASE_CANARY_WRITE_VALUE_SIZE_KEY = "hbase.canary.write.value.size";
+
+  public static final String HBASE_CANARY_WRITE_TABLE_CHECK_PERIOD_KEY =
+      "hbase.canary.write.table.check.period";
+
+  public static final String HBASE_CANARY_READ_RAW_SCAN_KEY = "hbase.canary.read.raw.enabled";
+
+  /**
+   * Config keys for programmatic JAAS config for secured ZK interaction
+   */
+  public static final String ZK_CLIENT_KEYTAB_FILE = "hbase.zookeeper.client.keytab.file";
+  public static final String ZK_CLIENT_KERBEROS_PRINCIPAL =
+      "hbase.zookeeper.client.kerberos.principal";
+  public static final String ZK_SERVER_KEYTAB_FILE = "hbase.zookeeper.server.keytab.file";
+  public static final String ZK_SERVER_KERBEROS_PRINCIPAL =
+      "hbase.zookeeper.server.kerberos.principal";
+
+  /**
+   * Allow legacy object serialization. Disabled by default because it is a security risk */
+  public static final String ALLOW_LEGACY_OBJECT_SERIALIZATION_KEY =
+      "hbase.allow.legacy.object.serialization";
+
+  /** Config key for hbase temporary directory in hdfs */
+  public static final String TEMPORARY_FS_DIRECTORY_KEY = "hbase.fs.tmp.dir";
+  public static final String DEFAULT_TEMPORARY_HDFS_DIRECTORY = "/user/"
+      + System.getProperty("user.name") + "/hbase-staging";
 
   private HConstants() {
     // Can't be instantiated with this ctor.

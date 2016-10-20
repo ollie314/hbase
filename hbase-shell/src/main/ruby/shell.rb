@@ -71,17 +71,24 @@ module Shell
   class Shell
     attr_accessor :hbase
     attr_accessor :formatter
+    attr_accessor :interactive
+    alias interactive? interactive
 
     @debug = false
     attr_accessor :debug
 
-    def initialize(hbase, formatter)
+    def initialize(hbase, formatter, interactive=true)
       self.hbase = hbase
       self.formatter = formatter
+      self.interactive = interactive
     end
 
     def hbase_admin
       @hbase_admin ||= hbase.admin(formatter)
+    end
+
+    def hbase_taskmonitor
+      @hbase_taskmonitor ||= hbase.taskmonitor(formatter)
     end
 
     def hbase_table(name)
@@ -236,6 +243,7 @@ Shell.load_command_group(
     version
     table_help
     whoami
+    processlist
   ]
 )
 
@@ -294,6 +302,7 @@ Shell.load_command_group(
     truncate
     truncate_preserve
     append
+    get_splits
   ]
 )
 
@@ -305,6 +314,7 @@ Shell.load_command_group(
     assign
     balancer
     balance_switch
+    balancer_enabled
     close_region
     compact
     flush
@@ -336,6 +346,11 @@ Shell.load_command_group(
     show_peer_tableCFs
     set_peer_tableCFs
     list_replicated_tables
+    enable_table_replication
+    disable_table_replication
+    get_peer_config
+    list_peer_configs
+    update_peer_config
   ]
 )
 
@@ -346,9 +361,11 @@ Shell.load_command_group(
     snapshot
     clone_snapshot
     restore_snapshot
-    rename_snapshot
     delete_snapshot
+    delete_all_snapshot
+    delete_table_snapshots
     list_snapshots
+    list_table_snapshots
   ]
 )
 
@@ -357,6 +374,7 @@ Shell.load_command_group(
   :full_name => 'SECURITY TOOLS',
   :comment => "NOTE: Above commands are only applicable if running with the AccessController coprocessor",
   :commands => %w[
+    list_security_capabilities
     grant
     revoke
     user_permission
@@ -369,6 +387,7 @@ Shell.load_command_group(
   :comment => "NOTE: Above commands are only applicable if running with the VisibilityController coprocessor",
   :commands => %w[
     add_labels
+    list_labels
     set_auths
     get_auths
     clear_auths

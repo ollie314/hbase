@@ -23,12 +23,12 @@
   <parent>
     <artifactId>hbase</artifactId>
     <groupId>org.apache.hbase</groupId>
-    <version>0.98.9-SNAPSHOT</version>
+    <version>0.98.23</version>
     <relativePath>..</relativePath>
   </parent>
 
   <artifactId>hbase-annotations</artifactId>
-  <name>HBase - Annotations</name>
+  <name>Apache HBase - Annotations</name>
   <description>Copy of Hadoop's annotations for HBase</description>
 
   <dependencies>

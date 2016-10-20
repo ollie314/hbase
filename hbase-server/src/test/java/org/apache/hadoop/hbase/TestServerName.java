@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.regex.Pattern;
 
+import org.apache.hadoop.hbase.testclassification.SmallTests;
 import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.Test;
@@ -106,5 +107,16 @@ public class TestServerName {
       ServerName.getServerStartcodeFromServerName(sn.toString()));
   }
 
+  @Test
+  public void testHostNameCaseSensitivity() {
+    ServerName lower = ServerName.valueOf("www.example.org", 1234, 5678);
+    ServerName upper = ServerName.valueOf("www.EXAMPLE.org", 1234, 5678);
+    assertEquals(0, lower.compareTo(upper));
+    assertEquals(0, upper.compareTo(lower));
+    assertEquals(lower.hashCode(), upper.hashCode());
+    assertTrue(lower.equals(upper));
+    assertTrue(upper.equals(lower));
+    assertTrue(ServerName.isSameHostnameAndPort(lower, upper));
+  }
 }
 

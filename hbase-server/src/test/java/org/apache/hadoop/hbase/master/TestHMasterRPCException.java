@@ -19,6 +19,7 @@
 
 package org.apache.hadoop.hbase.master;
 
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
@@ -31,6 +32,7 @@ import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.IsMasterRunningRequest;
 import org.apache.hadoop.hbase.security.User;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
@@ -64,8 +66,7 @@ public class TestHMasterRPCException {
         } catch (ServiceException ex) {
           IOException ie = ProtobufUtil.getRemoteException(ex);
           if (!(ie instanceof SocketTimeoutException)) {
-            if (ie.getMessage().startsWith("org.apache.hadoop.hbase.ipc." +
-                "ServerNotRunningYetException: Server is not running yet")) {
+            if (ie.getMessage().contains("ServerNotRunningYetException")) {
               // Done.  Got the exception we wanted.
               System.out.println("Expected exception: " + ie.getMessage());
               return;

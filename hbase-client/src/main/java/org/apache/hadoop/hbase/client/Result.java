@@ -37,6 +37,7 @@ import org.apache.hadoop.hbase.CellScanner;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.KeyValueUtil;
+import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
 import org.apache.hadoop.hbase.util.Bytes;
 
 /**
@@ -83,10 +84,9 @@ public class Result implements CellScannable, CellScanner {
   // Ditto for familyMap.  It can be composed on fly from passed in kvs.
   private transient NavigableMap<byte[], NavigableMap<byte[], NavigableMap<Long, byte[]>>> familyMap = null;
 
-  // never use directly
-  private static byte [] buffer = null;
+  private static ThreadLocal<byte[]> localBuffer = new ThreadLocal<byte[]>();
   private static final int PAD_WIDTH = 128;
-  public static final Result EMPTY_RESULT = new Result();
+  public static final Result EMPTY_RESULT = new Result(true);
 
   private final static int INITIAL_CELLSCANNER_INDEX = -1;
 
@@ -94,6 +94,9 @@ public class Result implements CellScannable, CellScanner {
    * Index for where we are when Result is acting as a {@link CellScanner}.
    */
   private int cellScannerIndex = INITIAL_CELLSCANNER_INDEX;
+  private ClientProtos.RegionLoadStats loadStats;
+
+  private final boolean readonly;
 
   /**
    * Creates an empty Result w/ no KeyValue payload; returns null if you call {@link #rawCells()}.
@@ -102,7 +105,16 @@ public class Result implements CellScannable, CellScanner {
    * instance with a {@link #copyFrom(Result)} call.
    */
   public Result() {
-    super();
+    this(false);
+  }
+
+  /**
+   * Allows to construct special purpose immutable Result objects,
+   * such as EMPTY_RESULT.
+   * @param readonly whether this Result instance is readonly
+   */
+  private Result(boolean readonly) {
+    this.readonly = readonly;
   }
 
   /**
@@ -110,7 +122,7 @@ public class Result implements CellScannable, CellScanner {
    */
   @Deprecated
   public Result(KeyValue [] cells) {
-    this.cells = cells;
+    this(cells, null);
   }
 
   /**
@@ -151,6 +163,7 @@ public class Result implements CellScannable, CellScanner {
   private Result(Cell[] cells, Boolean exists) {
     this.cells = cells;
     this.exists = exists;
+    this.readonly = false;
   }
 
   /**
@@ -322,9 +335,11 @@ public class Result implements CellScannable, CellScanner {
     double keyValueSize = (double)
         KeyValue.getKeyValueDataStructureSize(kvs[0].getRowLength(), flength, qlength, 0);
 
+    byte[] buffer = localBuffer.get();
     if (buffer == null || keyValueSize > buffer.length) {
       // pad to the smallest multiple of the pad width
       buffer = new byte[(int) Math.ceil(keyValueSize / PAD_WIDTH) * PAD_WIDTH];
+      localBuffer.set(buffer);
     }
 
     Cell searchTerm = KeyValue.createFirstOnRow(buffer, 0,
@@ -803,9 +818,12 @@ public class Result implements CellScannable, CellScanner {
 
   /**
    * Copy another Result into this one. Needed for the old Mapred framework
+   * @throws UnsupportedOperationException if invoked on instance of EMPTY_RESULT
+   * (which is supposed to be immutable).
    * @param other
    */
   public void copyFrom(Result other) {
+    checkReadonly();
     this.row = null;
     this.familyMap = null;
     this.cells = other.cells;
@@ -835,7 +853,36 @@ public class Result implements CellScannable, CellScanner {
   }
 
   public void setExists(Boolean exists) {
+    checkReadonly();
     this.exists = exists;
   }
 
+  /**
+   * Add load information about the region to the information about the result
+   * @param loadStats statistics about the current region from which this was returned
+   * @throws UnsupportedOperationException if invoked on instance of EMPTY_RESULT
+   * (which is supposed to be immutable).
+   */
+  public void addResults(ClientProtos.RegionLoadStats loadStats) {
+    checkReadonly();
+    this.loadStats = loadStats;
+  }
+
+  /**
+   * @return the associated statistics about the region from which this was returned. Can be
+   * <tt>null</tt> if stats are disabled.
+   */
+  public ClientProtos.RegionLoadStats getStats() {
+    return loadStats;
+  }
+
+  /**
+   * All methods modifying state of Result object must call this method
+   * to ensure that special purpose immutable Results can't be accidentally modified.
+   */
+  private void checkReadonly() {
+    if (readonly == true) {
+      throw new UnsupportedOperationException("Attempting to modify readonly EMPTY_RESULT!");
+    }
+  }
 }

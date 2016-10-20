@@ -56,6 +56,10 @@ module Hbase
       @shell.hbase_admin
     end
 
+    def taskmonitor
+      @shell.hbase_taskmonitor
+    end
+
     def security_admin
       @shell.hbase_security_admin
     end
@@ -64,11 +68,27 @@ module Hbase
       @shell.hbase_visibility_labels_admin
     end
 
+    def replication_admin
+      @shell.hbase_replication_admin
+    end
+
     def create_test_table(name)
       # Create the table if needed
       unless admin.exists?(name)
         admin.create name, [{'NAME' => 'x', 'VERSIONS' => 5}, 'y']
         return
+      end
+
+      # Enable the table if needed
+      unless admin.enabled?(name)
+        admin.enable(name)
+      end
+    end
+
+    def create_test_table_with_splits(name, splits)
+      # Create the table if needed
+      unless admin.exists?(name)
+        admin.create name, 'f1', splits
       end
 
       # Enable the table if needed
@@ -88,6 +108,18 @@ module Hbase
         admin.drop(name)
       rescue => e
         puts "IGNORING DROP TABLE ERROR: #{e}"
+      end
+    end
+
+    def replication_status(format,type)
+      return admin.status(format,type)
+    end
+
+    def drop_test_snapshot()
+      begin
+        admin.delete_all_snapshot(".*")
+      rescue => e
+        puts "IGNORING DELETE ALL SNAPSHOT ERROR: #{e}"
       end
     end
   end

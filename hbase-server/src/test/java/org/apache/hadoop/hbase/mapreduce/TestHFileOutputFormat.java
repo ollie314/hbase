@@ -50,7 +50,7 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HTableDescriptor;
 import org.apache.hadoop.hbase.HadoopShims;
 import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.PerformanceEvaluation;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
@@ -275,10 +275,9 @@ public class TestHFileOutputFormat  {
       // unmarshall and check values.
       TimeRangeTracker timeRangeTracker = new TimeRangeTracker();
       Writables.copyWritable(range, timeRangeTracker);
-      LOG.info(timeRangeTracker.getMinimumTimestamp() +
-          "...." + timeRangeTracker.getMaximumTimestamp());
-      assertEquals(1000, timeRangeTracker.getMinimumTimestamp());
-      assertEquals(2000, timeRangeTracker.getMaximumTimestamp());
+      LOG.info(timeRangeTracker.getMin() + "...." + timeRangeTracker.getMax());
+      assertEquals(1000, timeRangeTracker.getMin());
+      assertEquals(2000, timeRangeTracker.getMax());
       rd.close();
     } finally {
       if (writer != null && context != null) writer.close(context);
@@ -329,10 +328,13 @@ public class TestHFileOutputFormat  {
 
   @Test
   public void testJobConfiguration() throws Exception {
-    Job job = new Job(util.getConfiguration());
+    Configuration conf = new Configuration(this.util.getConfiguration());
+    conf.set("hbase.fs.tmp.dir", util.getDataTestDir("testJobConfiguration").toString());
+    Job job = new Job(conf);
     job.setWorkingDirectory(util.getDataTestDir("testJobConfiguration"));
     HTable table = Mockito.mock(HTable.class);
     setupMockStartKeys(table);
+    setupMockTableName(table);
     HFileOutputFormat.configureIncrementalLoad(job, table);
     assertEquals(job.getNumReduceTasks(), 4);
   }
@@ -343,7 +345,7 @@ public class TestHFileOutputFormat  {
     // first region start key is always empty
     ret[0] = HConstants.EMPTY_BYTE_ARRAY;
     for (int i = 1; i < numKeys; i++) {
-      ret[i] = PerformanceEvaluation.generateData(random, PerformanceEvaluation.VALUE_LENGTH);
+      ret[i] = PerformanceEvaluation.generateData(random, PerformanceEvaluation.DEFAULT_VALUE_LENGTH);
     }
     return ret;
   }
@@ -774,6 +776,11 @@ public class TestHFileOutputFormat  {
     Mockito.doReturn(mockKeys).when(table).getStartKeys();
   }
 
+  private void setupMockTableName(HTable table) throws IOException {
+    TableName mockTableName = TableName.valueOf("mock_table");
+    Mockito.doReturn(mockTableName).when(table).getName();
+  }
+
   /**
    * Test that {@link HFileOutputFormat} RecordWriter uses compression and
    * bloom filter settings from the column family descriptor
@@ -801,6 +808,10 @@ public class TestHFileOutputFormat  {
       // We turn off the sequence file compression, because DefaultCodec
       // pollutes the GZip codec pool with an incompatible compressor.
       conf.set("io.seqfile.compression.type", "NONE");
+      conf.set("hbase.fs.tmp.dir", dir.toString());
+      // turn locality off to eliminate getRegionLocation fail-and-retry time when writing kvs
+      conf.setBoolean(HFileOutputFormat2.LOCALITY_SENSITIVE_CONF_KEY, false);
+
       Job job = new Job(conf, "testLocalMRIncrementalLoad");
       job.setWorkingDirectory(util.getDataTestDirOnTestFS("testColumnFamilySettings"));
       setupRandomGeneratorMapper(job);

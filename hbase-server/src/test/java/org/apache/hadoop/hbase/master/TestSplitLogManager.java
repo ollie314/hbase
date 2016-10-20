@@ -50,7 +50,7 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.SplitLogCounters;
 import org.apache.hadoop.hbase.SplitLogTask;
@@ -521,12 +521,16 @@ public class TestSplitLogManager {
           for (Map.Entry<String, Task> entry : slm.getTasks().entrySet()) {
             final ServerName worker1 = ServerName.valueOf("worker1,1,1");
             SplitLogTask slt = new SplitLogTask.Done(worker1, RecoveryMode.LOG_SPLITTING);
+            boolean encounteredZKException = false;
             try {
               ZKUtil.setData(zkw, entry.getKey(), slt.toByteArray());
             } catch (KeeperException e) {
               LOG.warn(e);
+              encounteredZKException = true;
             }
-            done = true;
+            if (!encounteredZKException) {
+              done = true;
+            }
           }
         }
       };

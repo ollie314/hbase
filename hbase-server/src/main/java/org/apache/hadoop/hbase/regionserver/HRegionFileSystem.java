@@ -37,7 +37,6 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
@@ -190,7 +189,9 @@ public class HRegionFileSystem {
     Path familyDir = getStoreDir(familyName);
     FileStatus[] files = FSUtils.listStatus(this.fs, familyDir);
     if (files == null) {
-      LOG.debug("No StoreFiles for: " + familyDir);
+      if (LOG.isTraceEnabled()) {
+        LOG.trace("No StoreFiles for: " + familyDir);
+      }
       return null;
     }
 
@@ -239,14 +240,18 @@ public class HRegionFileSystem {
    * @throws IOException
    */
   public boolean hasReferences(final String familyName) throws IOException {
-    FileStatus[] files = FSUtils.listStatus(fs, getStoreDir(familyName),
-      new PathFilter () {
-        public boolean accept(Path path) {
-          return StoreFileInfo.isReference(path);
+    FileStatus[] files = FSUtils.listStatus(fs, getStoreDir(familyName));
+    if (files != null) {
+      for(FileStatus stat: files) {
+        if(stat.isDir()) {
+          continue;
+        }
+        if(StoreFileInfo.isReference(stat.getPath())) {
+          return true;
         }
       }
-    );
-    return files != null && files.length > 0;
+    }
+    return false;
   }
 
   /**
@@ -373,7 +378,9 @@ public class HRegionFileSystem {
     if (!fs.exists(buildPath)) {
       throw new FileNotFoundException(buildPath.toString());
     }
-    LOG.debug("Committing store file " + buildPath + " as " + dstPath);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Committing store file " + buildPath + " as " + dstPath);
+    }
     // buildPath exists, therefore not doing an exists() check.
     if (!rename(buildPath, dstPath)) {
       throw new IOException("Failed rename of " + buildPath + " to " + dstPath);
@@ -515,13 +522,17 @@ public class HRegionFileSystem {
   /**
    * Commit a daughter region, moving it from the split temporary directory
    * to the proper location in the filesystem.
-   * @param regionInfo daughter {@link HRegionInfo}
+   *
+   * @param regionInfo                 daughter {@link org.apache.hadoop.hbase.HRegionInfo}
    * @throws IOException
    */
-  Path commitDaughterRegion(final HRegionInfo regionInfo) throws IOException {
+  Path commitDaughterRegion(final HRegionInfo regionInfo)
+      throws IOException {
     Path regionDir = new Path(this.tableDir, regionInfo.getEncodedName());
     Path daughterTmpDir = this.getSplitsDir(regionInfo);
+
     if (fs.exists(daughterTmpDir)) {
+
       // Write HRI to a file in case we need to recover hbase:meta
       Path regionInfoFile = new Path(daughterTmpDir, REGION_INFO_FILE);
       byte[] regionInfoContent = getRegionInfoFileContent(regionInfo);
@@ -532,6 +543,7 @@ public class HRegionFileSystem {
         throw new IOException("Unable to rename " + daughterTmpDir + " to " + regionDir);
       }
     }
+
     return regionDir;
   }
 
@@ -561,37 +573,42 @@ public class HRegionFileSystem {
    * @param f File to split.
    * @param splitRow Split Row
    * @param top True if we are referring to the top half of the hfile.
+   * @param splitPolicy
    * @return Path to created reference.
    * @throws IOException
    */
-  Path splitStoreFile(final HRegionInfo hri, final String familyName,
-      final StoreFile f, final byte[] splitRow, final boolean top) throws IOException {
+  Path splitStoreFile(final HRegionInfo hri, final String familyName, final StoreFile f,
+      final byte[] splitRow, final boolean top, RegionSplitPolicy splitPolicy) throws IOException {
 
-    // Check whether the split row lies in the range of the store file
-    // If it is outside the range, return directly.
-    if (top) {
-      //check if larger than last key.
-      KeyValue splitKey = KeyValue.createFirstOnRow(splitRow);
-      byte[] lastKey = f.createReader().getLastKey();      
-      // If lastKey is null means storefile is empty.
-      if (lastKey == null) return null;
-      if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
-          splitKey.getKeyOffset(), splitKey.getKeyLength(), lastKey, 0, lastKey.length) > 0) {
-        return null;
-      }
-    } else {
-      //check if smaller than first key
-      KeyValue splitKey = KeyValue.createLastOnRow(splitRow);
-      byte[] firstKey = f.createReader().getFirstKey();
-      // If firstKey is null means storefile is empty.
-      if (firstKey == null) return null;
-      if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
-          splitKey.getKeyOffset(), splitKey.getKeyLength(), firstKey, 0, firstKey.length) < 0) {
-        return null;
+    if (splitPolicy == null || !splitPolicy.skipStoreFileRangeCheck(familyName)) {
+      // Check whether the split row lies in the range of the store file
+      // If it is outside the range, return directly.
+      try {
+        if (top) {
+          //check if larger than last key.
+          KeyValue splitKey = KeyValue.createFirstOnRow(splitRow);
+          byte[] lastKey = f.createReader().getLastKey();
+          // If lastKey is null means storefile is empty.
+          if (lastKey == null) return null;
+          if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
+            splitKey.getKeyOffset(), splitKey.getKeyLength(), lastKey, 0, lastKey.length) > 0) {
+            return null;
+          }
+        } else {
+          //check if smaller than first key
+          KeyValue splitKey = KeyValue.createLastOnRow(splitRow);
+          byte[] firstKey = f.createReader().getFirstKey();
+          // If firstKey is null means storefile is empty.
+          if (firstKey == null) return null;
+          if (f.getReader().getComparator().compareFlatKey(splitKey.getBuffer(),
+            splitKey.getKeyOffset(), splitKey.getKeyLength(), firstKey, 0, firstKey.length) < 0) {
+            return null;
+          }
+        }
+      } finally {
+        f.closeReader(f.getCacheConf() != null ? f.getCacheConf().shouldEvictOnClose() : true);
       }
     }
-
-    f.getReader().close(true);
 
     Path splitDir = new Path(getSplitsDir(hri), familyName);
     // A reference to the bottom half of the hsf store file.
@@ -751,7 +768,7 @@ public class HRegionFileSystem {
     // First check to get the permissions
     FsPermission perms = FSUtils.getFilePermissions(fs, conf, HConstants.DATA_FILE_UMASK_KEY);
     // Write the RegionInfo file content
-    FSDataOutputStream out = FSUtils.create(fs, regionInfoFile, perms, null);
+    FSDataOutputStream out = FSUtils.create(conf, fs, regionInfoFile, perms, null);
     try {
       out.write(content);
     } finally {
@@ -1044,10 +1061,14 @@ public class HRegionFileSystem {
   private static void sleepBeforeRetry(String msg, int sleepMultiplier, int baseSleepBeforeRetries,
       int hdfsClientRetriesNumber) {
     if (sleepMultiplier > hdfsClientRetriesNumber) {
-      LOG.debug(msg + ", retries exhausted");
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(msg + ", retries exhausted");
+      }
       return;
     }
-    LOG.debug(msg + ", sleeping " + baseSleepBeforeRetries + " times " + sleepMultiplier);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug(msg + ", sleeping " + baseSleepBeforeRetries + " times " + sleepMultiplier);
+    }
     Threads.sleep((long)baseSleepBeforeRetries * sleepMultiplier);
   }
 }

@@ -81,10 +81,10 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
     regionAppend = registry.getLongCounter(regionAppendKey, 0l);
 
     regionGetKey = regionNamePrefix + MetricsRegionServerSource.GET_KEY;
-    regionGet = registry.newHistogram(regionGetKey);
+    regionGet = registry.newTimeHistogram(regionGetKey);
 
     regionScanNextKey = regionNamePrefix + MetricsRegionServerSource.SCAN_NEXT_KEY;
-    regionScanNext = registry.newHistogram(regionScanNextKey);
+    regionScanNext = registry.newTimeHistogram(regionScanNextKey);
   }
 
   @Override
@@ -178,6 +178,18 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
     mrb.addGauge(regionNamePrefix + MetricsRegionServerSource.STOREFILE_SIZE,
         MetricsRegionServerSource.STOREFILE_SIZE_DESC,
         this.regionWrapper.getStoreFileSize());
+    mrb.addGauge(regionNamePrefix + MetricsRegionServerSource.MAX_STORE_FILE_AGE,
+        MetricsRegionServerSource.MAX_STORE_FILE_AGE_DESC,
+        this.regionWrapper.getMaxStoreFileAge());
+    mrb.addGauge(regionNamePrefix + MetricsRegionServerSource.MIN_STORE_FILE_AGE,
+        MetricsRegionServerSource.MIN_STORE_FILE_AGE_DESC,
+        this.regionWrapper.getMinStoreFileAge());
+    mrb.addGauge(regionNamePrefix + MetricsRegionServerSource.AVG_STORE_FILE_AGE,
+        MetricsRegionServerSource.AVG_STORE_FILE_AGE_DESC,
+        this.regionWrapper.getAvgStoreFileAge());
+    mrb.addGauge(regionNamePrefix + MetricsRegionServerSource.NUM_REFERENCE_FILES,
+        MetricsRegionServerSource.NUM_REFERENCE_FILES_DESC,
+        this.regionWrapper.getNumReferenceFiles());
     mrb.addCounter(regionNamePrefix + MetricsRegionServerSource.READ_REQUEST_COUNT,
         MetricsRegionServerSource.READ_REQUEST_COUNT_DESC,
         this.regionWrapper.getReadRequestCount());
@@ -187,6 +199,9 @@ public class MetricsRegionSourceImpl implements MetricsRegionSource {
     mrb.addCounter(regionNamePrefix + MetricsRegionSource.COMPACTIONS_COMPLETED_COUNT,
         MetricsRegionSource.COMPACTIONS_COMPLETED_DESC,
         this.regionWrapper.getNumCompactionsCompleted());
+    mrb.addCounter(regionNamePrefix + MetricsRegionSource.COMPACTIONS_FAILED_COUNT,
+        MetricsRegionSource.COMPACTIONS_FAILED_DESC,
+        this.regionWrapper.getNumCompactionsFailed());
     mrb.addCounter(regionNamePrefix + MetricsRegionSource.NUM_BYTES_COMPACTED_COUNT,
         MetricsRegionSource.NUM_BYTES_COMPACTED_DESC,
         this.regionWrapper.getNumBytesCompacted());

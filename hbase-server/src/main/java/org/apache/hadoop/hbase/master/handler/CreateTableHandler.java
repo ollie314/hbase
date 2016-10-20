@@ -40,7 +40,7 @@ import org.apache.hadoop.hbase.catalog.MetaEditor;
 import org.apache.hadoop.hbase.catalog.MetaReader;
 import org.apache.hadoop.hbase.executor.EventHandler;
 import org.apache.hadoop.hbase.executor.EventType;
-import org.apache.hadoop.hbase.ipc.RequestContext;
+import org.apache.hadoop.hbase.ipc.RpcServer;
 import org.apache.hadoop.hbase.master.AssignmentManager;
 import org.apache.hadoop.hbase.master.HMaster;
 import org.apache.hadoop.hbase.master.MasterCoprocessorHost;
@@ -99,9 +99,8 @@ public class CreateTableHandler extends EventHandler {
       // If we are creating the table in service to an RPC request, record the
       // active user for later, so proper permissions will be applied to the
       // new table by the AccessController if it is active
-      if (RequestContext.isInRequestContext()) {
-        this.activeUser = RequestContext.getRequestUser();
-      } else {
+      this.activeUser = RpcServer.getRequestUser();
+      if (this.activeUser == null) {
         this.activeUser = UserProvider.instantiate(conf).getCurrent();
       }
     } catch (InterruptedException e) {
@@ -129,7 +128,12 @@ public class CreateTableHandler extends EventHandler {
       // createTable isn't a frequent operation, that should be ok.
       //TODO: now that we have table locks, re-evaluate above
       try {
-        if (!this.assignmentManager.getZKTable().checkAndSetEnablingTable(tableName)) {
+        // During master initialization, the ZK state could be inconsistent from failed DDL
+        // in the past. If we fail here, it would prevent master to start.  We should force
+        // setting the system table state regardless the table state.
+        if (!((HMaster) this.server).isInitialized() && tableName.isSystemTable()) {
+          this.assignmentManager.getZKTable().setEnablingTable(tableName);
+        } else if (!this.assignmentManager.getZKTable().checkAndSetEnablingTable(tableName)) {
           throw new TableExistsException(tableName);
         }
       } catch (KeeperException e) {

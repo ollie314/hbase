@@ -35,6 +35,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.AuthUtil;
 import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.CellUtil;
 import org.apache.hadoop.hbase.HColumnDescriptor;
@@ -69,7 +70,6 @@ import org.apache.hadoop.io.Text;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Lists;
-import com.google.protobuf.InvalidProtocolBufferException;
 
 /**
  * Maintains lists of permission grants to users and groups to allow for
@@ -112,10 +112,6 @@ public class AccessControlLists {
    * Delimiter to separate user, column family, and qualifier in
    * _acl_ table info: column keys */
   public static final char ACL_KEY_DELIMITER = ',';
-  /** Prefix character to denote group names */
-  public static final String GROUP_PREFIX = "@";
-  /** Configuration key for superusers */
-  public static final String SUPERUSER_CONF_KEY = "hbase.superuser";
 
   private static Log LOG = LogFactory.getLog(AccessControlLists.class);
 
@@ -502,11 +498,19 @@ public class AccessControlLists {
 
     List<UserPermission> perms = new ArrayList<UserPermission>();
 
-    for (Map.Entry<String, TablePermission> entry : allPerms.entries()) {
-      UserPermission up = new UserPermission(Bytes.toBytes(entry.getKey()),
-          entry.getValue().getTableName(), entry.getValue().getFamily(),
-          entry.getValue().getQualifier(), entry.getValue().getActions());
-      perms.add(up);
+    if(isNamespaceEntry(entryName)) {  // Namespace
+      for (Map.Entry<String, TablePermission> entry : allPerms.entries()) {
+        UserPermission up = new UserPermission(Bytes.toBytes(entry.getKey()),
+          entry.getValue().getNamespace(), entry.getValue().getActions());
+        perms.add(up);
+      }
+    } else {  // Table
+      for (Map.Entry<String, TablePermission> entry : allPerms.entries()) {
+        UserPermission up = new UserPermission(Bytes.toBytes(entry.getKey()),
+            entry.getValue().getTableName(), entry.getValue().getFamily(),
+            entry.getValue().getQualifier(), entry.getValue().getActions());
+        perms.add(up);
+      }
     }
     return perms;
   }
@@ -599,11 +603,11 @@ public class AccessControlLists {
     if (ProtobufUtil.isPBMagicPrefix(data)) {
       int pblen = ProtobufUtil.lengthOfPBMagic();
       try {
-        AccessControlProtos.UsersAndPermissions perms =
-          AccessControlProtos.UsersAndPermissions.newBuilder().mergeFrom(
-            data, pblen, data.length - pblen).build();
-        return ProtobufUtil.toUserTablePermissions(perms);
-      } catch (InvalidProtocolBufferException e) {
+        AccessControlProtos.UsersAndPermissions.Builder builder =
+          AccessControlProtos.UsersAndPermissions.newBuilder();
+        ProtobufUtil.mergeFrom(builder, data, pblen, data.length - pblen);
+        return ProtobufUtil.toUserTablePermissions(builder.build());
+      } catch (IOException e) {
         throw new DeserializationException(e);
       }
     } else {
@@ -624,33 +628,12 @@ public class AccessControlLists {
     }
   }
 
-  /**
-   * Returns whether or not the given name should be interpreted as a group
-   * principal.  Currently this simply checks if the name starts with the
-   * special group prefix character ("@").
-   */
-  public static boolean isGroupPrincipal(String name) {
-    return name != null && name.startsWith(GROUP_PREFIX);
-  }
-
-  /**
-   * Returns the actual name for a group principal (stripped of the
-   * group prefix).
-   */
-  public static String getGroupName(String aclKey) {
-    if (!isGroupPrincipal(aclKey)) {
-      return aclKey;
-    }
-
-    return aclKey.substring(GROUP_PREFIX.length());
-  }
-
   public static boolean isNamespaceEntry(String entryName) {
-    return entryName.charAt(0) == NAMESPACE_PREFIX;
+    return entryName != null && entryName.charAt(0) == NAMESPACE_PREFIX;
   }
 
   public static boolean isNamespaceEntry(byte[] entryName) {
-    return entryName[0] == NAMESPACE_PREFIX;
+    return entryName != null && entryName.length !=0 && entryName[0] == NAMESPACE_PREFIX;
   }
 
   public static String toNamespaceEntry(String namespace) {
@@ -691,9 +674,13 @@ public class AccessControlLists {
        Tag tag = tagsIterator.next();
        if (tag.getType() == ACL_TAG_TYPE) {
          // Deserialize the table permissions from the KV
-         ListMultimap<String,Permission> kvPerms = ProtobufUtil.toUsersAndPermissions(
-           AccessControlProtos.UsersAndPermissions.newBuilder().mergeFrom(
-             tag.getBuffer(), tag.getTagOffset(), tag.getTagLength()).build());
+         // TODO: This can be improved. Don't build UsersAndPermissions just to unpack it again,
+         // use the builder
+         AccessControlProtos.UsersAndPermissions.Builder builder = 
+           AccessControlProtos.UsersAndPermissions.newBuilder();
+         ProtobufUtil.mergeFrom(builder, tag.getBuffer(), tag.getTagOffset(), tag.getTagLength());
+         ListMultimap<String,Permission> kvPerms =
+           ProtobufUtil.toUsersAndPermissions(builder.build());
          // Are there permissions for this user?
          List<Permission> userPerms = kvPerms.get(user.getShortName());
          if (userPerms != null) {
@@ -703,7 +690,7 @@ public class AccessControlLists {
          String groupNames[] = user.getGroupNames();
          if (groupNames != null) {
            for (String group : groupNames) {
-             List<Permission> groupPerms = kvPerms.get(GROUP_PREFIX + group);
+             List<Permission> groupPerms = kvPerms.get(AuthUtil.toGroupEntry(group));
              if (results != null) {
                results.addAll(groupPerms);
              }

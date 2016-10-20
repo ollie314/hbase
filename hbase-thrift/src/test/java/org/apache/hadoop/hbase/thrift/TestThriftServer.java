@@ -36,7 +36,7 @@ import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.HBaseTestingUtility;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.LargeTests;
+import org.apache.hadoop.hbase.testclassification.LargeTests;
 import org.apache.hadoop.hbase.filter.ParseFilter;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.test.MetricsAssertHelper;
@@ -227,7 +227,7 @@ public class TestThriftServer {
     assertEquals(handler.getTableNames().size(), 1);
     assertEquals(handler.getColumnDescriptors(tableAname).size(), 2);
     assertTrue(handler.isTableEnabled(tableAname));
-    handler.createTable(tableBname, new ArrayList<ColumnDescriptor>());
+    handler.createTable(tableBname, getColumnDescriptors());
     assertEquals(handler.getTableNames().size(), 2);
   }
 
@@ -555,6 +555,17 @@ public class TestThriftServer {
       assertTrue(Bytes.compareTo(smallerColumn.array(), currentColumn.array()) < 0);
       smallerColumn = currentColumn;
     }
+
+    TScan reversedScan = new TScan();
+    reversedScan.setReversed(true);
+    reversedScan.setStartRow(rowBname);
+    reversedScan.setStopRow(rowAname);
+
+    int scanner8 = handler.scannerOpenWithScan(tableAname , reversedScan, null);
+    List<TRowResult> results = handler.scannerGet(scanner8);
+    handler.scannerClose(scanner8);
+    assertEquals(results.size(), 1);
+    assertEquals(ByteBuffer.wrap(results.get(0).getRow()), rowBname);
 
     // Teardown
     handler.disableTable(tableAname);

@@ -85,7 +85,7 @@ public final class ResponseConverter {
     int requestRegionActionCount = request.getRegionActionCount();
     int responseRegionActionResultCount = response.getRegionActionResultCount();
     if (requestRegionActionCount != responseRegionActionResultCount) {
-      throw new IllegalStateException("Request mutation count=" + responseRegionActionResultCount +
+      throw new IllegalStateException("Request mutation count=" + requestRegionActionCount +
           " does not match response mutation result count=" + responseRegionActionResultCount);
     }
 
@@ -116,19 +116,29 @@ public final class ResponseConverter {
       }
 
       for (ResultOrException roe : actionResult.getResultOrExceptionList()) {
+        Object responseValue;
         if (roe.hasException()) {
-          results.add(regionName, new Pair<Integer, Object>(roe.getIndex(),
-              ProtobufUtil.toException(roe.getException())));
+          responseValue = ProtobufUtil.toException(roe.getException());
         } else if (roe.hasResult()) {
-          results.add(regionName, new Pair<Integer, Object>(roe.getIndex(),
-              ProtobufUtil.toResult(roe.getResult(), cells)));
+          responseValue = ProtobufUtil.toResult(roe.getResult(), cells);
         } else if (roe.hasServiceResult()) {
-          results.add(regionName, roe.getIndex(), roe.getServiceResult());
-        } else {
-          // no result & no exception. Unexpected.
-          throw new IllegalStateException("No result & no exception roe=" + roe +
-              " for region " + actions.getRegion());
+          responseValue = roe.getServiceResult();
+        } else{
+          // Sometimes, the response is just "it was processed". Generally, this occurs for things
+          // like mutateRows where either we get back 'processed' (or not) and optionally some
+          // statistics about the regions we touched.
+          responseValue = response.getProcessed() ?
+                          ProtobufUtil.EMPTY_RESULT_EXISTS_TRUE :
+                          ProtobufUtil.EMPTY_RESULT_EXISTS_FALSE;
         }
+        results.add(regionName, roe.getIndex(), responseValue);
+      }
+    }
+
+    if (response.hasRegionStatistics()) {
+      ClientProtos.MultiRegionLoadStats stats = response.getRegionStatistics();
+      for (int i = 0; i < stats.getRegionCount(); i++) {
+        results.addStatistic(stats.getRegion(i).getValue().toByteArray(), stats.getStat(i));
       }
     }
 
@@ -330,6 +340,24 @@ public final class ResponseConverter {
       }
     }
   }
+
+  /**
+   * Retreivies exception stored during RPC invocation.
+   * @param controller the controller instance provided by the client when calling the service
+   * @return exception if any, or null; Will return DoNotRetryIOException for string represented
+   * failure causes in controller.
+   */
+  public static IOException getControllerException(RpcController controller) throws IOException {
+    if (controller != null && controller.failed()) {
+      if (controller instanceof ServerRpcController) {
+        return ((ServerRpcController)controller).getFailedOn();
+      } else {
+        return new DoNotRetryIOException(controller.errorText());
+      }
+    }
+    return null;
+  }
+
 
   /**
    * Create Results from the cells using the cells meta data. 

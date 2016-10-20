@@ -62,15 +62,16 @@ import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
+import org.apache.hadoop.hbase.client.security.SecurityCapability;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.exceptions.MergeRegionException;
 import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
 import org.apache.hadoop.hbase.ipc.MasterCoprocessorRpcChannel;
 import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
 import org.apache.hadoop.hbase.ipc.RegionServerCoprocessorRpcChannel;
+import org.apache.hadoop.hbase.ipc.RpcControllerFactory;
 import org.apache.hadoop.hbase.protobuf.ProtobufUtil;
 import org.apache.hadoop.hbase.protobuf.RequestConverter;
-import org.apache.hadoop.hbase.protobuf.ResponseConverter;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.AdminService;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.CloseRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.CloseRegionResponse;
@@ -82,9 +83,6 @@ import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.GetRegionInfoRespo
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.RollWALWriterRequest;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.RollWALWriterResponse;
 import org.apache.hadoop.hbase.protobuf.generated.AdminProtos.StopServerRequest;
-import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ClientService;
-import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanRequest;
-import org.apache.hadoop.hbase.protobuf.generated.ClientProtos.ScanResponse;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameStringPair;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.ProcedureDescription;
@@ -125,6 +123,7 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ModifyTableReques
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.MoveRegionRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.RestoreSnapshotResponse;
+import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SecurityCapabilitiesRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SetBalancerRunningRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.ShutdownRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotRequest;
@@ -178,8 +177,11 @@ public class HBaseAdmin implements Abortable, Closeable {
   private boolean aborted;
   private boolean cleanupConnectionOnClose = false; // close the connection in close()
   private boolean closed = false;
+  private int operationTimeout;
+  private int rpcTimeout;
 
   private RpcRetryingCallerFactory rpcCallerFactory;
+  private RpcControllerFactory rpcControllerFactory;
 
   /**
    * Constructor.
@@ -214,7 +216,13 @@ public class HBaseAdmin implements Abortable, Closeable {
         HConstants.DEFAULT_HBASE_CLIENT_RETRIES_NUMBER);
     this.retryLongerMultiplier = this.conf.getInt(
         "hbase.client.retries.longer.multiplier", 10);
-    this.rpcCallerFactory = RpcRetryingCallerFactory.instantiate(this.conf);
+    this.operationTimeout = this.conf.getInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,
+        HConstants.DEFAULT_HBASE_CLIENT_OPERATION_TIMEOUT);
+    this.rpcTimeout = this.conf.getInt(HConstants.HBASE_RPC_TIMEOUT_KEY,
+        HConstants.DEFAULT_HBASE_RPC_TIMEOUT);
+    this.rpcControllerFactory = RpcControllerFactory.instantiate(this.conf);
+    this.rpcCallerFactory = RpcRetryingCallerFactory.instantiate(this.conf,
+      connection.getStatisticsTracker());
   }
 
   /**
@@ -422,7 +430,35 @@ public class HBaseAdmin implements Abortable, Closeable {
    */
   public HTableDescriptor getTableDescriptor(final TableName tableName)
   throws TableNotFoundException, IOException {
-    return this.connection.getHTableDescriptor(tableName);
+     return getTableDescriptor(tableName, getConnection(), rpcCallerFactory, rpcControllerFactory,
+       operationTimeout, rpcTimeout);
+  }
+
+  static HTableDescriptor getTableDescriptor(final TableName tableName, HConnection connection,
+      RpcRetryingCallerFactory rpcCallerFactory, final RpcControllerFactory rpcControllerFactory,
+         int operationTimeout, int rpcTimeout) throws TableNotFoundException, IOException {
+
+      if (tableName == null) return null;
+      HTableDescriptor htd = executeCallable(new MasterCallable<HTableDescriptor>(connection) {
+        @Override
+        public HTableDescriptor call() throws ServiceException {
+          PayloadCarryingRpcController controller = rpcControllerFactory.newController();
+          controller.setPriority(tableName);
+          GetTableDescriptorsResponse htds;
+          GetTableDescriptorsRequest req =
+                  RequestConverter.buildGetTableDescriptorsRequest(tableName);
+          htds = master.getTableDescriptors(controller, req);
+
+          if (!htds.getTableSchemaList().isEmpty()) {
+            return HTableDescriptor.convert(htds.getTableSchemaList().get(0));
+          }
+          return null;
+        }
+      }, rpcCallerFactory, operationTimeout, rpcTimeout);
+      if (htd != null) {
+        return htd;
+      }
+      throw new TableNotFoundException(tableName.getNameAsString());
   }
 
   public HTableDescriptor getTableDescriptor(final byte[] tableName)
@@ -669,27 +705,25 @@ public class HBaseAdmin implements Abortable, Closeable {
     // Wait until all regions deleted
     for (int tries = 0; tries < (this.numRetries * this.retryLongerMultiplier); tries++) {
       try {
-        HRegionLocation firstMetaServer = getFirstMetaServerForTable(tableName);
-        Scan scan = MetaReader.getScanForTableName(tableName);
-        scan.addColumn(HConstants.CATALOG_FAMILY, HConstants.REGIONINFO_QUALIFIER);
-        ScanRequest request = RequestConverter.buildScanRequest(
-          firstMetaServer.getRegionInfo().getRegionName(), scan, 1, true);
-        Result[] values = null;
-        // Get a batch at a time.
-        ClientService.BlockingInterface server = connection.getClient(firstMetaServer
-            .getServerName());
-        PayloadCarryingRpcController controller = new PayloadCarryingRpcController();
-        try {
-          controller.setPriority(tableName);
-          ScanResponse response = server.scan(controller, request);
-          values = ResponseConverter.getResults(controller.cellScanner(), response);
-        } catch (ServiceException se) {
-          throw ProtobufUtil.getRemoteException(se);
-        }
-
+        final AtomicInteger count = new AtomicInteger(0);
+        MetaScannerVisitor visitor = new MetaScannerVisitorBase() {
+          @Override
+          public boolean processRow(Result rowResult) throws IOException {
+            HRegionInfo info = HRegionInfo.getHRegionInfo(rowResult);
+            if (info == null) {
+              return true;
+            }
+            if (!info.getTable().equals(tableName)) {
+              return false;
+            }
+            count.incrementAndGet();
+            return true;
+          }
+        };
+        MetaScanner.metaScan(conf, connection, visitor, tableName);
         // let us wait until hbase:meta table is updated and
         // HMaster removes the table from its HTableDescriptors
-        if (values == null || values.length == 0) {
+        if (count.get() == 0) {
           tableExists = false;
           GetTableDescriptorsResponse htds;
           MasterKeepAliveConnection master = connection.getKeepAliveMasterService();
@@ -709,12 +743,11 @@ public class HBaseAdmin implements Abortable, Closeable {
         }
       } catch (IOException ex) {
         failures++;
-        if(failures == numRetries - 1) {           // no more tries left
+        if (failures == numRetries - 1) {           // no more tries left
           if (ex instanceof RemoteException) {
-            throw ((RemoteException) ex).unwrapRemoteException();
-          } else {
-            throw ex;
+            ex = ((RemoteException) ex).unwrapRemoteException();
           }
+          throw ex;
         }
       }
       try {
@@ -1846,6 +1879,23 @@ public class HBaseAdmin implements Abortable, Closeable {
     MasterKeepAliveConnection stub = connection.getKeepAliveMasterService();
     try {
       return stub.balance(null,RequestConverter.buildBalanceRequest()).getBalancerRan();
+    } finally {
+      stub.close();
+    }
+  }
+
+  /**
+   * Query the state of the balancer from the Master. It's not a guarantee that the balancer is
+   * actually running this very moment, but that it will run.
+   *
+   * @return True if the balancer is enabled, false otherwise.
+   */
+  public boolean isBalancerEnabled()
+      throws ServiceException, MasterNotRunningException {
+    MasterKeepAliveConnection stub = connection.getKeepAliveMasterService();
+    try {
+      return stub.isBalancerEnabled(null, RequestConverter.buildIsBalancerEnabledRequest())
+        .getEnabled();
     } finally {
       stub.close();
     }
@@ -3287,6 +3337,43 @@ public class HBaseAdmin implements Abortable, Closeable {
   }
 
   /**
+   * List all the completed snapshots matching the given table name regular expression and snapshot
+   * name regular expression.
+   * @param tableNameRegex The table name regular expression to match against
+   * @param snapshotNameRegex The snapshot name regular expression to match against
+   * @return returns a List of completed SnapshotDescription
+   * @throws IOException if a remote or network exception occurs
+   */
+  public List<SnapshotDescription> listTableSnapshots(String tableNameRegex,
+      String snapshotNameRegex) throws IOException {
+    return listTableSnapshots(Pattern.compile(tableNameRegex), Pattern.compile(snapshotNameRegex));
+  }
+
+  /**
+   * List all the completed snapshots matching the given table name regular expression and snapshot
+   * name regular expression.
+   * @param tableNamePattern The compiled table name regular expression to match against
+   * @param snapshotNamePattern The compiled snapshot name regular expression to match against
+   * @return returns a List of completed SnapshotDescription
+   * @throws IOException if a remote or network exception occurs
+   */
+  public List<SnapshotDescription> listTableSnapshots(Pattern tableNamePattern,
+      Pattern snapshotNamePattern) throws IOException {
+    String[] tableNames = getTableNames(tableNamePattern);
+
+    List<SnapshotDescription> tableSnapshots = new LinkedList<SnapshotDescription>();
+    List<SnapshotDescription> snapshots = listSnapshots(snapshotNamePattern);
+
+    List<String> listOfTableNames = Arrays.asList(tableNames);
+    for (SnapshotDescription snapshot : snapshots) {
+      if (listOfTableNames.contains(snapshot.getTable())) {
+        tableSnapshots.add(snapshot);
+      }
+    }
+    return tableSnapshots;
+  }
+
+  /**
    * Delete an existing snapshot.
    * @param snapshotName name of the snapshot
    * @throws IOException if a remote or network exception occurs
@@ -3332,16 +3419,57 @@ public class HBaseAdmin implements Abortable, Closeable {
   public void deleteSnapshots(final Pattern pattern) throws IOException {
     List<SnapshotDescription> snapshots = listSnapshots(pattern);
     for (final SnapshotDescription snapshot : snapshots) {
-      // do the delete
-      executeCallable(new MasterCallable<Void>(getConnection()) {
-        @Override
-        public Void call() throws ServiceException {
-          this.master.deleteSnapshot(null,
-            DeleteSnapshotRequest.newBuilder().setSnapshot(snapshot).build());
-          return null;
-        }
-      });
+       try {
+         internalDeleteSnapshot(snapshot);
+       } catch (IOException ex) {
+         LOG.info(
+           "Failed to delete snapshot " + snapshot.getName() + " for table " + snapshot.getTable(),
+           ex);
+       }
     }
+  }
+
+  /**
+   * Delete all existing snapshots matching the given table name regular expression and snapshot
+   * name regular expression.
+   * @param tableNameRegex The table name regular expression to match against
+   * @param snapshotNameRegex The snapshot name regular expression to match against
+   * @throws IOException if a remote or network exception occurs
+   */
+  public void deleteTableSnapshots(String tableNameRegex, String snapshotNameRegex)
+      throws IOException {
+    deleteTableSnapshots(Pattern.compile(tableNameRegex), Pattern.compile(snapshotNameRegex));
+  }
+
+  /**
+   * Delete all existing snapshots matching the given table name regular expression and snapshot
+   * name regular expression.
+   * @param tableNamePattern The compiled table name regular expression to match against
+   * @param snapshotNamePattern The compiled snapshot name regular expression to match against
+   * @throws IOException if a remote or network exception occurs
+   */
+  public void deleteTableSnapshots(Pattern tableNamePattern, Pattern snapshotNamePattern)
+      throws IOException {
+    List<SnapshotDescription> snapshots = listTableSnapshots(tableNamePattern, snapshotNamePattern);
+    for (SnapshotDescription snapshot : snapshots) {
+      try {
+        internalDeleteSnapshot(snapshot);
+        LOG.debug("Successfully deleted snapshot: " + snapshot.getName());
+      } catch (IOException e) {
+        LOG.error("Failed to delete snapshot: " + snapshot.getName(), e);
+      }
+    }
+  }
+
+  private void internalDeleteSnapshot(final SnapshotDescription snapshot) throws IOException {
+    executeCallable(new MasterCallable<Void>(getConnection()) {
+      @Override
+      public Void call() throws ServiceException {
+        this.master.deleteSnapshot(null, DeleteSnapshotRequest.newBuilder().setSnapshot(snapshot)
+            .build());
+        return null;
+      }
+    });
   }
 
   /**
@@ -3384,7 +3512,13 @@ public class HBaseAdmin implements Abortable, Closeable {
   }
 
   private <V> V executeCallable(MasterCallable<V> callable) throws IOException {
-    RpcRetryingCaller<V> caller = rpcCallerFactory.newCaller();
+    return executeCallable(callable, rpcCallerFactory, operationTimeout, rpcTimeout);
+  }
+
+  private static <V> V executeCallable(MasterCallable<V> callable,
+             RpcRetryingCallerFactory rpcCallerFactory, int operationTimeout, int rpcTimeout)
+      throws IOException {
+    RpcRetryingCaller<V> caller = rpcCallerFactory.newCaller(rpcTimeout);
     try {
       return caller.callWithRetries(callable);
     } finally {
@@ -3463,4 +3597,26 @@ public class HBaseAdmin implements Abortable, Closeable {
     });
   }
 
+  /**
+   * Return the set of supported security capabilities.
+   * @throws IOException
+   * @throws UnsupportedOperationException
+   */
+  public List<SecurityCapability> getSecurityCapabilities() throws IOException {
+    try {
+      return executeCallable(new MasterCallable<List<SecurityCapability>>(getConnection()) {
+        @Override
+        public List<SecurityCapability> call() throws ServiceException {
+          SecurityCapabilitiesRequest req = SecurityCapabilitiesRequest.newBuilder().build();
+          return ProtobufUtil.toSecurityCapabilityList(
+            master.getSecurityCapabilities(null, req).getCapabilitiesList());
+        }
+      });
+    } catch (IOException e) {
+      if (e instanceof RemoteException) {
+        e = ((RemoteException)e).unwrapRemoteException();
+      }
+      throw e;
+    }
+  }
 }

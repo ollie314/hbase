@@ -141,9 +141,9 @@ class MemStoreFlusher implements FlushRequester {
   static long getMemStoreLimit(final long max, final float limit,
       final float defaultLimit) {
     float effectiveLimit = limit;
-    if (limit >= 0.9f || limit < 0.1f) {
+    if (limit >= 0.8f || limit <= 0f) {
       LOG.warn("Setting global memstore limit to default of " + defaultLimit +
-        " because supplied value outside allowed range of 0.1 -> 0.9");
+          " because supplied value outside allowed range of (0 -> 0.8]");
       effectiveLimit = defaultLimit;
     }
     return (long)(max * effectiveLimit);
@@ -395,7 +395,7 @@ class MemStoreFlusher implements FlushRequester {
    * on delay queue to retry later.
    * @param fqe
    * @return true if the region was successfully flushed, false otherwise. If
-   * false, there will be accompanying log messages explaining why the log was
+   * false, there will be accompanying log messages explaining why the region was
    * not flushed.
    */
   private boolean flushRegion(final FlushRegionEntry fqe) {
@@ -403,7 +403,7 @@ class MemStoreFlusher implements FlushRequester {
     if (!region.getRegionInfo().isMetaRegion() &&
         isTooManyStoreFiles(region)) {
       if (fqe.isMaximumWait(this.blockingWaitTime)) {
-        LOG.info("Waited " + (System.currentTimeMillis() - fqe.createTime) +
+        LOG.info("Waited " + (EnvironmentEdgeManager.currentTimeMillis() - fqe.createTime) +
           "ms on a compaction to clean up 'too many store files'; waited " +
           "long enough... proceeding with flush of " +
           region.getRegionNameAsString());
@@ -444,7 +444,7 @@ class MemStoreFlusher implements FlushRequester {
    * poll on the flush queue (which removed it).
    *
    * @return true if the region was successfully flushed, false otherwise. If
-   * false, there will be accompanying log messages explaining why the log was
+   * false, there will be accompanying log messages explaining why the region was
    * not flushed.
    */
   private boolean flushRegion(final HRegion region, final boolean emergencyFlush) {
@@ -532,7 +532,7 @@ class MemStoreFlusher implements FlushRequester {
       if (Trace.isTracing()) {
         scope.getSpan().addTimelineAnnotation("Force Flush. We're above high water mark.");
       }
-      long start = System.currentTimeMillis();
+      long start = EnvironmentEdgeManager.currentTimeMillis();
       synchronized (this.blockSignal) {
         boolean blocked = false;
         long startTime = 0;
@@ -554,7 +554,7 @@ class MemStoreFlusher implements FlushRequester {
           } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
           }
-          long took = System.currentTimeMillis() - start;
+          long took = EnvironmentEdgeManager.currentTimeMillis() - start;
           LOG.warn("Memstore is above high water mark and block " + took + "ms");
         }
         if(blocked){
@@ -590,7 +590,8 @@ class MemStoreFlusher implements FlushRequester {
     return queueList.toString();
   }
 
-  interface FlushQueueEntry extends Delayed {}
+  interface FlushQueueEntry extends Delayed {
+  }
 
   /**
    * Token to insert into the flush queue that ensures that the flusher does not sleep
@@ -610,7 +611,6 @@ class MemStoreFlusher implements FlushRequester {
     public boolean equals(Object obj) {
       return (this == obj);
     }
-
   }
 
   /**
@@ -630,7 +630,7 @@ class MemStoreFlusher implements FlushRequester {
 
     FlushRegionEntry(final HRegion r) {
       this.region = r;
-      this.createTime = System.currentTimeMillis();
+      this.createTime = EnvironmentEdgeManager.currentTimeMillis();
       this.whenToExpire = this.createTime;
     }
 
@@ -639,7 +639,7 @@ class MemStoreFlusher implements FlushRequester {
      * @return True if we have been delayed > <code>maximumWait</code> milliseconds.
      */
     public boolean isMaximumWait(final long maximumWait) {
-      return (System.currentTimeMillis() - this.createTime) > maximumWait;
+      return (EnvironmentEdgeManager.currentTimeMillis() - this.createTime) > maximumWait;
     }
 
     /**
@@ -657,26 +657,38 @@ class MemStoreFlusher implements FlushRequester {
      * @return This.
      */
     public FlushRegionEntry requeue(final long when) {
-      this.whenToExpire = System.currentTimeMillis() + when;
+      this.whenToExpire = EnvironmentEdgeManager.currentTimeMillis() + when;
       this.requeueCount++;
       return this;
     }
 
     @Override
     public long getDelay(TimeUnit unit) {
-      return unit.convert(this.whenToExpire - System.currentTimeMillis(),
+      return unit.convert(this.whenToExpire - EnvironmentEdgeManager.currentTimeMillis(),
           TimeUnit.MILLISECONDS);
     }
 
     @Override
     public int compareTo(Delayed other) {
-      return Long.valueOf(getDelay(TimeUnit.MILLISECONDS) -
+      // Delay is compared first. If there is a tie, compare region's hash code
+      int ret = Long.valueOf(getDelay(TimeUnit.MILLISECONDS) -
         other.getDelay(TimeUnit.MILLISECONDS)).intValue();
+      if (ret != 0) {
+        return ret;
+      }
+      FlushQueueEntry otherEntry = (FlushQueueEntry) other;
+      return hashCode() - otherEntry.hashCode();
     }
 
     @Override
     public String toString() {
       return "[flush region " + Bytes.toStringBinary(region.getRegionName()) + "]";
+    }
+
+    @Override
+    public int hashCode() {
+      int hash = (int) getDelay(TimeUnit.MILLISECONDS);
+      return hash ^ region.hashCode();
     }
 
     @Override

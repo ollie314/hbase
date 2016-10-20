@@ -27,9 +27,9 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.classification.InterfaceAudience;
 import org.apache.hadoop.hbase.classification.InterfaceStability;
 import org.apache.hadoop.hbase.security.UserProvider;
+import org.apache.hadoop.hbase.util.DNS;
 import org.apache.hadoop.hbase.util.Strings;
 import org.apache.hadoop.hbase.util.Threads;
-import org.apache.hadoop.net.DNS;
 import org.apache.hadoop.security.UserGroupInformation;
 
 /**
@@ -39,6 +39,14 @@ import org.apache.hadoop.security.UserGroupInformation;
 @InterfaceStability.Evolving
 public class AuthUtil {
   private static final Log LOG = LogFactory.getLog(AuthUtil.class);
+
+  /** Prefix character to denote group names */
+  public static final String GROUP_PREFIX = "@";
+
+  private AuthUtil() {
+    super();
+  }
+
   /**
    * Checks if security is enabled and if so, launches chore for refreshing kerberos ticket.
    */
@@ -55,10 +63,10 @@ public class AuthUtil {
           conf.get("hbase.client.dns.nameserver", "default")));
       userProvider.login("hbase.client.keytab.file", "hbase.client.kerberos.principal", host);
     } catch (UnknownHostException e) {
-      LOG.error("Error resolving host name");
+      LOG.error("Error resolving host name: " + e.getMessage(), e);
       throw e;
     } catch (IOException e) {
-      LOG.error("Error while trying to perform the initial login");
+      LOG.error("Error while trying to perform the initial login: " + e.getMessage(), e);
       throw e;
     }
 
@@ -88,11 +96,39 @@ public class AuthUtil {
         try {
           ugi.checkTGTAndReloginFromKeytab();
         } catch (IOException e) {
-          LOG.info("Got exception while trying to refresh credentials ");
+          LOG.error("Got exception while trying to refresh credentials: " + e.getMessage(), e);
         }
       }
     };
     // Start the chore for refreshing credentials
     Threads.setDaemonThreadRunning(refreshCredentials.getThread());
+  }
+
+  /**
+   * Returns whether or not the given name should be interpreted as a group
+   * principal.  Currently this simply checks if the name starts with the
+   * special group prefix character ("@").
+   */
+  public static boolean isGroupPrincipal(String name) {
+    return name != null && name.startsWith(GROUP_PREFIX);
+  }
+
+  /**
+   * Returns the actual name for a group principal (stripped of the
+   * group prefix).
+   */
+  public static String getGroupName(String aclKey) {
+    if (!isGroupPrincipal(aclKey)) {
+      return aclKey;
+    }
+
+    return aclKey.substring(GROUP_PREFIX.length());
+  }
+
+  /**
+   * Returns the group entry with the group prefix for a group principal.
+   */
+  public static String toGroupEntry(String name) {
+    return GROUP_PREFIX + name;
   }
 }

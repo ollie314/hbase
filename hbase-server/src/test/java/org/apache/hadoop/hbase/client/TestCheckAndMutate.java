@@ -19,9 +19,10 @@
 package org.apache.hadoop.hbase.client;
 
 import org.apache.hadoop.hbase.HBaseTestingUtility;
-import org.apache.hadoop.hbase.MediumTests;
+import org.apache.hadoop.hbase.testclassification.MediumTests;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.filter.CompareFilter;
+import org.apache.hadoop.hbase.regionserver.NoSuchColumnFamilyException;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -29,6 +30,7 @@ import org.junit.Test;
 import org.junit.experimental.categories.Category;
 
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 @Category(MediumTests.class)
 public class TestCheckAndMutate {
@@ -51,7 +53,7 @@ public class TestCheckAndMutate {
   }
 
   @Test
-  public void testCheckAndMutate() throws Exception {
+  public void testCheckAndMutate() throws Throwable {
     final TableName tableName = TableName.valueOf("TestPutWithDelete");
     final byte[] rowKey = Bytes.toBytes("12345");
     final byte[] family = Bytes.toBytes("cf");
@@ -96,6 +98,23 @@ public class TestCheckAndMutate {
           Bytes.toString(result.getValue(family, Bytes.toBytes("B"))).equals("b"));
       assertTrue("Column C should not exist",
           result.getValue(family, Bytes.toBytes("C")) == null);
+
+      //Test that we get a region level exception
+      try {
+        Put p = new Put(rowKey);
+        p.add(new byte[]{'b', 'o', 'g', 'u', 's'}, new byte[]{'A'},  new byte[0]);
+        rm = new RowMutations(rowKey);
+        rm.add(p);
+        table.checkAndMutate(rowKey, family, Bytes.toBytes("A"), CompareFilter.CompareOp.EQUAL,
+            Bytes.toBytes("a"), rm);
+        fail("Expected NoSuchColumnFamilyException");
+      } catch (RetriesExhaustedWithDetailsException e) {
+        try {
+          throw e.getCause(0);
+        } catch (NoSuchColumnFamilyException e1) {
+          // expected
+        }
+      }
     } finally {
       table.close();
     }
